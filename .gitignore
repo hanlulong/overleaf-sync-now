@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+build/
+dist/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Runtime data (cookies, state, project index — never commit)
+cookies.json
+state.json
+projects.json
+.overleaf-sync/
+.overleaf-data/
+
+# Test artifacts
+test_*.json
+test_*.py
+.playwright-mcp/
+
+# Claude Code project-local settings
+.claude/
+
+# Session continuation file (local notes, not for the repo)
+SESSION.md
+
+# Internal error reports / user testing notes
+*-error-report.md
+*-test-report.md

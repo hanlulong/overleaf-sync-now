@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "overleaf-sync-now: instant Overleaf-to-Dropbox sync for AI coding agents"
+authors:
+  - family-names: Han
+    given-names: Lu
+    website: "https://luhan.io/"
+abstract: >
+  A command-line tool and AI-agent skill that triggers Overleaf's hidden
+  POST /project/{id}/dropbox/sync-now endpoint on demand, so AI coding agents
+  (Claude Code, OpenAI Codex CLI) always edit the latest version of a LaTeX
+  paper instead of a stale local Dropbox copy lagging 10–20 minutes behind
+  Overleaf's polling-based sync. Includes a PreToolUse hook for Claude Code
+  and a Playwright-managed browser login flow that works around Chrome 130+
+  App-Bound Encryption.
+keywords:
+  - overleaf
+  - latex
+  - dropbox
+  - sync
+  - claude-code
+  - codex
+  - ai-tools
+  - agent-skill
+  - mcp
+  - academic-writing
+  - paper-writing
+  - scientific-writing
+license: MIT
+repository-code: "https://github.com/hanlulong/overleaf-sync-now"
+url: "https://github.com/hanlulong/overleaf-sync-now"

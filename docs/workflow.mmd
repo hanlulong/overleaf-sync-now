@@ -1,0 +1,16 @@
+%% Source for ../README.md "How it works" figure.
+%% Regenerate after editing:
+%%   npx -y @mermaid-js/mermaid-cli -i docs/workflow.mmd -o docs/workflow.svg --backgroundColor transparent
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif","fontSize":"15px"}}}%%
+flowchart LR
+    AI(["<b>AI agent</b><br/><i>about to edit .tex</i>"]):::agent
+    Hook["<b>PreToolUse hook</b><br/>POST /sync-now"]:::proc
+    Cloud["<b>Overleaf → Dropbox</b><br/>fresh file pulled locally"]:::cloud
+    Edit(["<b>AI edits</b><br/><i>fresh local file</i>"]):::agent
+
+    AI ==> Hook ==> Cloud ==> Edit
+
+    classDef agent fill:#dbeafe,color:#1e3a8a,stroke:#2563eb,stroke-width:2px
+    classDef proc  fill:#fef3c7,color:#78350f,stroke:#d97706,stroke-width:2px
+    classDef cloud fill:#e0e7ff,color:#312e81,stroke:#4338ca,stroke-width:2px
+    linkStyle default stroke:#6b7280,stroke-width:2px
