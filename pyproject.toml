@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "overleaf-sync-now"
-version = "0.0.1"
+version = "0.1.0"
 description = "Trigger Overleaf's hidden 'Sync this project now' endpoint instantly so AI coding agents (Claude Code, Codex CLI) edit fresh local Dropbox copies instead of stale ones lagging 10-20 minutes behind."
 readme = "README.md"
 # Old-form license metadata. Don't switch to PEP 639 SPDX (`license = "MIT"`

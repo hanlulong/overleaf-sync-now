@@ -8,7 +8,11 @@ Subcommands:
   setup                         Auth setup (auto-detect from existing browsers/profiles)
   save-cookie <value>           Persist a manually-pasted overleaf_session2 cookie value
   link <project_id> [folder]    Mark a folder as belonging to an Overleaf project (override)
-  sync [folder]                 Trigger sync for the linked folder (or current dir)
+  sync [folder] [--force] [--legacy]
+                                Refresh the linked folder. Default: version-match via
+                                /project/<id>/updates; download zip only when web-origin
+                                edits have happened. --force: always re-extract. --legacy:
+                                fall back to POST /dropbox/sync-now (old pre-0.1 path).
   status [folder]               Show data dir, cookie validity, and link/sync state
   projects [--refresh]          List your Overleaf projects (name + ID)
   doctor                        Verbose diagnostic dump of the auth chain
@@ -21,7 +25,21 @@ Claude Code Playwright profile, interactive paste prompt.
 Project-folder mapping: auto-discovered when a file lives under
   <anywhere>/Apps/Overleaf/<project>/.
 Override: drop a `.overleaf-project` JSON file with the project ID in any folder.
+
+Refresh strategy (default, as of 0.1.0):
+  1. GET /project/<id>/updates  — cheap probe (~0.3s, ~30 KB) that returns the
+     version history with per-update pathnames and origin.
+  2. If latest toV == our cached toV for this project: no-op.
+  3. Else walk updates back to cached toV; skip updates with origin.kind="dropbox"
+     (those are the local->Dropbox->Overleaf round-trips of our own saves).
+  4. If anything web-origin remains, GET /project/<id>/download/zip and extract
+     only the affected pathnames, writing atomically and only when content
+     actually differs from local (to minimize Dropbox echo).
+  5. /sync-now is the --legacy fallback. Avoid it: it enqueues a heavy per-user
+     Dropbox poll in Overleaf's tpdsworker queue, starving webhook-triggered
+     local->Overleaf updates of queue slots.
 """
+import io
 import json
 import os
 import pathlib
@@ -31,6 +49,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 
 
 def _data_dir():
@@ -47,12 +66,15 @@ def _data_dir():
 CACHE_DIR = _data_dir()
 CACHE_FILE = CACHE_DIR / "cookies.json"
 STATE_FILE = CACHE_DIR / "state.json"
+VERSIONS_FILE = CACHE_DIR / "versions.json"
 INDEX_FILE = CACHE_DIR / "projects.json"
 INDEX_TTL = 86400
 PLAYWRIGHT_PROFILE = pathlib.Path.home() / ".claude" / "playwright-profile"
 PROJECT_MARKER = ".overleaf-project"
 DEBOUNCE_SECONDS = 30
-HOOK_WAIT_SECONDS = 3
+# Only used by the --legacy path: how long to wait after POST /sync-now
+# for Dropbox to settle. The default path writes files directly and
+# doesn't need to wait.
 MANUAL_WAIT_SECONDS = 10
 BASE = "https://www.overleaf.com"
 SESSION_COOKIE = "overleaf_session2"
@@ -385,6 +407,243 @@ def trigger_sync(project_id):
         raise RuntimeError(f"sync-now returned HTTP {r.status_code}: {r.text!r}")
 
 
+# -------- version-match refresh (/updates + /download/zip) --------
+#
+# Replaces the old `POST /dropbox/sync-now` approach. Rationale:
+#   - /sync-now enqueues a per-user "poll Dropbox" job in Overleaf's tpdsworker
+#     queue, which is serialized with webhook-triggered per-file updates.
+#     Frequent /sync-now calls starved the reverse-direction (local->Overleaf)
+#     sync of queue slots.
+#   - /updates is a read-only history probe, doesn't touch that queue, and
+#     reports exactly which files changed and whether each change came from
+#     Dropbox (round-trip we triggered) or from a web edit (content local
+#     doesn't have yet).
+
+
+def fetch_updates(project_id):
+    """GET /project/<id>/updates. Returns the parsed JSON history."""
+    import requests
+    s = get_session()
+    try:
+        r = s.get(f"{BASE}/project/{project_id}/updates", timeout=15)
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Network error on /updates: {e}") from e
+    if r.status_code in (401, 403):
+        raise AuthExpired(
+            f"Overleaf rejected /updates (HTTP {r.status_code}). "
+            "Cookies likely expired; re-auth via `overleaf-sync-now login`."
+        )
+    if r.status_code == 429:
+        try:
+            retry_after = int(r.headers.get("Retry-After", "60") or "60")
+        except (TypeError, ValueError):
+            retry_after = 60
+        raise RateLimited(retry_after)
+    if r.status_code != 200:
+        raise RuntimeError(f"/updates returned HTTP {r.status_code}")
+    try:
+        return r.json()
+    except ValueError as e:
+        raise RuntimeError(f"/updates returned invalid JSON: {e}") from e
+
+
+def download_zip(project_id):
+    """GET /project/<id>/download/zip. Returns raw zip bytes."""
+    import requests
+    s = get_session()
+    try:
+        r = s.get(
+            f"{BASE}/project/{project_id}/download/zip", timeout=120, stream=False
+        )
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Network error on /download/zip: {e}") from e
+    if r.status_code in (401, 403):
+        raise AuthExpired(f"Overleaf rejected /download/zip (HTTP {r.status_code}).")
+    if r.status_code == 429:
+        try:
+            retry_after = int(r.headers.get("Retry-After", "60") or "60")
+        except (TypeError, ValueError):
+            retry_after = 60
+        raise RateLimited(retry_after)
+    if r.status_code != 200:
+        raise RuntimeError(f"/download/zip returned HTTP {r.status_code}")
+    return r.content
+
+
+def _load_versions():
+    if VERSIONS_FILE.exists():
+        try:
+            with open(VERSIONS_FILE) as f:
+                return json.load(f)
+        except Exception as e:
+            print(
+                f"[overleaf-sync-now] WARNING: versions file corrupt ({VERSIONS_FILE}): {e}",
+                file=sys.stderr,
+            )
+    return {}
+
+
+def _save_versions(versions):
+    _atomic_write_text(VERSIONS_FILE, json.dumps(versions, indent=2))
+
+
+def refresh_project(project_id, folder, *, force=False):
+    """Version-match refresh. Probes /updates, decides whether a zip download
+    is actually needed, and if so extracts only the changed files into folder.
+
+    Returns a short human-readable status string. Raises AuthExpired,
+    RateLimited, or RuntimeError for the caller to handle.
+    """
+    data = fetch_updates(project_id)
+    updates = data.get("updates", [])
+    if not updates:
+        return "empty_history"
+
+    latest_toV = updates[0].get("toV")
+    if latest_toV is None:
+        raise RuntimeError("/updates response missing toV on latest entry")
+
+    versions = _load_versions()
+    cached_toV = versions.get(project_id)
+    bootstrap = cached_toV is None
+
+    # Defensive: if our cache claims we've synced to a future version, it's
+    # either corrupted, seeded from another machine, or Overleaf's history
+    # got rewound. Either way, treat it as a first-run bootstrap so we
+    # re-anchor against what Overleaf actually has now.
+    if not bootstrap and latest_toV < cached_toV:
+        bootstrap = True
+        cached_toV = None
+
+    if not force and not bootstrap and latest_toV == cached_toV:
+        return "no_change"
+
+    # Decide what to extract. On bootstrap or force, pull everything (hash
+    # compare will skip any file that already matches). Otherwise walk the
+    # update history back to cached_toV and collect pathnames from web-origin
+    # edits only — dropbox-origin updates are local's own round-trip.
+    if force or bootstrap:
+        need_paths = None  # sentinel: extract all
+    else:
+        need_paths = set()
+        all_covered = False
+        for u in updates:
+            toV = u.get("toV")
+            if toV is not None and toV <= cached_toV:
+                all_covered = True
+                break
+            origin_kind = (u.get("meta", {}).get("origin") or {}).get("kind")
+            if origin_kind == "dropbox":
+                continue
+            for p in u.get("pathnames", []):
+                need_paths.add(p)
+        if not all_covered:
+            # Cached version is older than the oldest update we received in
+            # the first page. Rather than paginate and risk missing a
+            # web-origin edit, just pull the full zip and hash-diff.
+            need_paths = None
+
+    if need_paths is not None and not need_paths:
+        # All changes were dropbox-origin. Local already has this content
+        # (or Dropbox will deliver it within seconds via multi-device sync).
+        versions[project_id] = latest_toV
+        _save_versions(versions)
+        return f"dropbox_echo (toV {cached_toV}->{latest_toV})"
+
+    zip_bytes = download_zip(project_id)
+    # --force implies "user explicitly asked to overwrite" — disable the
+    # recent-mtime guard. Otherwise protect files the user just saved from
+    # being clobbered before their save has propagated Dropbox -> Overleaf.
+    protect = 0 if force else 30
+    n_written, n_unchanged, n_protected = _extract_files(
+        zip_bytes, folder, need_paths, protect_recent_seconds=protect
+    )
+    versions[project_id] = latest_toV
+    _save_versions(versions)
+    label = "bootstrap" if bootstrap else ("forced" if force else "refreshed")
+    parts = [f"toV -> {latest_toV}", f"wrote {n_written}", f"unchanged {n_unchanged}"]
+    if n_protected:
+        parts.append(f"protected {n_protected} (recent local edits; pass --force to override)")
+    return f"{label} (" + ", ".join(parts) + ")"
+
+
+def _extract_files(zip_bytes, folder, paths, protect_recent_seconds=30):
+    """Extract files from zip into folder. `paths` is either a set of relative
+    pathnames (no leading slash) or None to extract every entry.
+
+    Writes only when file contents differ from what's on disk — keeps Dropbox
+    upload pressure (and Overleaf's resulting merge-queue load) at zero when
+    the zip content matches local.
+
+    Also skips files whose local mtime is within `protect_recent_seconds`
+    (0 to disable). This is the guard against clobbering a user's in-progress
+    local save that hasn't yet propagated Dropbox -> Overleaf, so the zip
+    still has old content while local has fresh content. Pass 0 when the
+    caller explicitly wants to overwrite (e.g. --force).
+
+    Returns (n_written, n_unchanged, n_protected).
+    """
+    folder = pathlib.Path(folder).resolve()
+    n_written = 0
+    n_unchanged = 0
+    n_protected = 0
+    now = time.time()
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        for info in z.infolist():
+            if info.is_dir():
+                continue
+            rel = info.filename.lstrip("/")
+            if paths is not None and rel not in paths:
+                continue
+            target = (folder / rel).resolve()
+            try:
+                target.relative_to(folder)
+            except ValueError:
+                print(
+                    f"[overleaf-sync-now] WARNING: skipping zip entry outside folder: {info.filename}",
+                    file=sys.stderr,
+                )
+                continue
+
+            new_content = z.read(info)
+
+            if target.exists():
+                try:
+                    if target.read_bytes() == new_content:
+                        n_unchanged += 1
+                        continue
+                except OSError:
+                    pass
+                # Content differs. If the local file was modified very
+                # recently, the user is probably mid-save and our write
+                # would clobber a local edit Dropbox hasn't yet pushed
+                # up to Overleaf. Leave it alone and warn.
+                if protect_recent_seconds > 0:
+                    try:
+                        age = now - target.stat().st_mtime
+                    except OSError:
+                        age = None
+                    if age is not None and age < protect_recent_seconds:
+                        n_protected += 1
+                        print(
+                            f"[overleaf-sync-now] SKIP {rel}: local modified {age:.0f}s ago "
+                            f"(< {protect_recent_seconds}s protection window). "
+                            f"Pass --force to overwrite.",
+                            file=sys.stderr,
+                        )
+                        continue
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_name(target.name + f".tmp-{os.getpid()}")
+            with open(tmp, "wb") as f:
+                f.write(new_content)
+            os.replace(str(tmp), str(target))
+            n_written += 1
+
+    return n_written, n_unchanged, n_protected
+
+
 # -------- project lookup --------
 
 def find_linked_folder(start):
@@ -596,6 +855,8 @@ def cmd_link(args):
 
 
 def cmd_sync(args):
+    legacy = "--legacy" in args
+    force = "--force" in args
     no_wait = "--no-wait" in args
     args = [a for a in args if not a.startswith("--")]
     folder = pathlib.Path(args[0] if args else ".")
@@ -608,30 +869,54 @@ def cmd_sync(args):
             file=sys.stderr,
         )
         sys.exit(1)
-    print(f"Triggering Overleaf sync for project {project_id} (folder: {linked})")
-    t0 = time.time()
-    try:
-        trigger_sync(project_id)
-    except RateLimited as e:
-        wait = min(e.retry_after, 120)  # cap so we don't sleep forever
-        print(f"Rate-limited by Overleaf. Waiting {wait}s and retrying once...")
-        time.sleep(wait)
+
+    if legacy:
+        # Old path: POST /dropbox/sync-now + wait for Dropbox settle.
+        # Kept as an escape hatch in case /updates or /download/zip ever
+        # misbehave. This path pollutes Overleaf's per-user tpdsworker queue
+        # and is slower; prefer the default.
+        print(f"[--legacy] Triggering Overleaf sync for project {project_id} (folder: {linked})")
+        t0 = time.time()
         try:
             trigger_sync(project_id)
-        except RateLimited as e2:
-            print(f"ERROR: still rate-limited after retry. Wait ~{e2.retry_after}s and try again.", file=sys.stderr)
+        except RateLimited as e:
+            wait = min(e.retry_after, 120)
+            print(f"Rate-limited by Overleaf. Waiting {wait}s and retrying once...")
+            time.sleep(wait)
+            try:
+                trigger_sync(project_id)
+            except RateLimited as e2:
+                print(f"ERROR: still rate-limited after retry. Wait ~{e2.retry_after}s and try again.", file=sys.stderr)
+                sys.exit(1)
+        except AuthExpired as e:
+            print(f"ERROR: {e}", file=sys.stderr)
             sys.exit(1)
+        if no_wait:
+            print(f"Sync triggered ({time.time() - t0:.2f}s). Skipping settle wait (--no-wait).")
+        else:
+            print(f"Sync triggered ({time.time() - t0:.2f}s). Waiting {MANUAL_WAIT_SECONDS}s for Dropbox to settle "
+                  f"(use --no-wait to skip)...")
+            time.sleep(MANUAL_WAIT_SECONDS)
+        mark_synced(project_id)
+        print("Done.")
+        return
+
+    print(f"Refreshing project {project_id} (folder: {linked})")
+    t0 = time.time()
+    try:
+        status = refresh_project(project_id, linked, force=force)
+    except RateLimited as e:
+        print(
+            f"ERROR: rate-limited ({e}). Try again in ~{e.retry_after}s, "
+            f"or use --legacy to fall back to /sync-now.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     except AuthExpired as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
-    if no_wait:
-        print(f"Sync triggered ({time.time() - t0:.2f}s). Skipping settle wait (--no-wait).")
-    else:
-        print(f"Sync triggered ({time.time() - t0:.2f}s). Waiting {MANUAL_WAIT_SECONDS}s for Dropbox to settle "
-              f"(use --no-wait to skip)...")
-        time.sleep(MANUAL_WAIT_SECONDS)
     mark_synced(project_id)
-    print("Done.")
+    print(f"{status} ({time.time() - t0:.2f}s)")
 
 
 def cmd_projects(args):
@@ -702,6 +987,11 @@ def cmd_status(args):
         print(f"Last sync: {ago:.0f}s ago (debounce: {DEBOUNCE_SECONDS}s)")
     else:
         print("Last sync: never")
+    cached_toV = _load_versions().get(project_id)
+    if cached_toV is not None:
+        print(f"Cached toV: {cached_toV} (bootstrap will re-run if Overleaf reports an older version)")
+    else:
+        print("Cached toV: none (next sync will bootstrap)")
 
 
 def cmd_hook(args):
@@ -712,10 +1002,12 @@ def cmd_hook(args):
         # Claude Code hook-payload changes don't make us silently no-op.
         print(f"[overleaf-sync-now] hook stdin not valid JSON ({e}); skipping.", file=sys.stderr)
         sys.exit(0)
-    # Only the file-mutating tools need a sync. (Read used to be in this list
-    # but adding it would mean a network round-trip on every file Claude Code
-    # peeks at — far too aggressive.)
-    if data.get("tool_name", "") not in ("Edit", "Write", "MultiEdit"):
+    # Since 0.1.0 Read is included: the /updates probe is cheap (~0.3s),
+    # debounced (30s per project), and refreshing on Read keeps Claude's
+    # downstream decisions grounded in current content. Under the old
+    # /sync-now path this was too aggressive (heavy queue job per peek);
+    # the new version-match probe makes it free enough to be worth it.
+    if data.get("tool_name", "") not in ("Read", "Edit", "Write", "MultiEdit"):
         sys.exit(0)
     fp = data.get("tool_input", {}).get("file_path", "")
     if not fp or not re.search(r"\.(tex|bib|cls|sty|bst)$", fp, re.IGNORECASE):
@@ -731,8 +1023,7 @@ def cmd_hook(args):
     if not project_id or is_debounced(project_id):
         sys.exit(0)
     try:
-        trigger_sync(project_id)
-        time.sleep(HOOK_WAIT_SECONDS)
+        refresh_project(project_id, linked)
         mark_synced(project_id)
         sys.exit(0)
     except RateLimited as e:
@@ -753,12 +1044,13 @@ def cmd_hook(args):
         )
         sys.exit(2)
     except Exception as e:
-        # Unknown error (network, etc.): don't block the edit, warn loudly,
-        # and mark synced so the NEXT edit doesn't immediately retry the same
-        # failing call within the debounce window. User can rerun manually
-        # via `overleaf-sync-now sync` for an explicit retry.
+        # Unknown error (network, zip parse, etc.): don't block the edit,
+        # warn loudly, and mark synced so the NEXT edit doesn't immediately
+        # retry the same failing call within the debounce window. User can
+        # rerun manually via `overleaf-sync-now sync` for an explicit retry,
+        # or `overleaf-sync-now sync --legacy` to force the old /sync-now path.
         mark_synced(project_id)
-        print(f"[overleaf-sync-now] sync failed: {e}; will retry after debounce.", file=sys.stderr)
+        print(f"[overleaf-sync-now] refresh failed: {e}; will retry after debounce.", file=sys.stderr)
         sys.exit(0)
 
 
@@ -873,7 +1165,7 @@ def cmd_install(args):
                 cleaned.append(entry)
         hook_cmd = _hook_command()
         cleaned.append({
-            "matcher": "Edit|Write|MultiEdit",
+            "matcher": "Read|Edit|Write|MultiEdit",
             "hooks": [{"type": "command", "command": hook_cmd}],
         })
         settings["hooks"]["PreToolUse"] = cleaned
@@ -1240,6 +1532,33 @@ def cmd_doctor(args):
         print("  2. Take their pasted value as <COOKIE>.")
         print("  3. Run: overleaf-sync-now save-cookie \"<COOKIE>\"")
         print("  4. Verify: overleaf-sync-now status")
+    print()
+
+    # [5] Version-match endpoint health (the new default refresh path).
+    # Only probe if we have working auth — otherwise it's guaranteed to fail.
+    print(f"[5] Version-match endpoint (/updates):")
+    print(f"    Versions cache: {VERSIONS_FILE} ({'present' if VERSIONS_FILE.exists() else 'MISSING'})")
+    if best:
+        folder = pathlib.Path(args[0] if args else ".").resolve() if args else pathlib.Path(".").resolve()
+        linked, project_id = find_linked_folder(folder)
+        if project_id:
+            try:
+                t = time.time()
+                data = fetch_updates(project_id)
+                updates = data.get("updates") or []
+                latest = updates[0].get("toV") if updates else None
+                cached = _load_versions().get(project_id)
+                print(f"    Project: {project_id}  ({linked})")
+                print(f"    Probe:   OK  ({time.time()-t:.2f}s, {len(updates)} updates in first page)")
+                print(f"    Latest Overleaf toV: {latest}")
+                print(f"    Cached   local  toV: {cached if cached is not None else '(none - next sync bootstraps)'}")
+            except Exception as e:
+                print(f"    Probe:   FAILED ({type(e).__name__}: {e})")
+                print(f"    Fallback: `overleaf-sync-now sync --legacy` uses /dropbox/sync-now.")
+        else:
+            print(f"    Folder {folder} is not under any Overleaf project; can't probe /updates without a project ID.")
+    else:
+        print(f"    Skipped (auth resolution failed above; fix auth first)")
 
 
 def cmd_uninstall(args):

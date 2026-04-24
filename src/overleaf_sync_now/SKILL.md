@@ -1,7 +1,7 @@
 ---
 name: overleaf
-description: "Trigger Overleaf's server-side Dropbox sync on demand so local .tex/.bib files are fresh before AI edits (default Overleaf-to-Dropbox sync lags 10-20 min). WHEN: (1) before editing .tex/.bib/.cls/.sty/.bst under Apps/Overleaf/<project>/ run `overleaf-sync-now sync`; (2) on user request to refresh; (3) for first-time auth run `overleaf-sync-now login`. Claude Code: a PreToolUse hook auto-runs sync; manual invocation rarely needed. Codex CLI: invoke sync explicitly. AUTH RECOVERY when sync/setup fails: run `overleaf-sync-now login` (browser-assisted, works on Chrome 130+). Do NOT tell the user to 'log into Overleaf' in their daily browser — on Chrome 130+ app-bound encryption blocks on-disk cookie extraction regardless of login state. See body for full recovery flow."
-argument-hint: "setup | sync [folder] | status [folder] | link <project_id> [folder] | install | save-cookie <value> | doctor"
+description: "Refresh local .tex/.bib files against Overleaf before AI edits, so the agent never edits a stale copy (default Overleaf-to-Dropbox sync lags 10-20 min). Since 0.1.0 the refresh path is: probe `/project/<id>/updates` (read-only), skip if nothing changed, skip if all changes were our own Dropbox round-trips, else download-zip and extract only the web-origin changed files. WHEN: (1) before editing .tex/.bib/.cls/.sty/.bst under Apps/Overleaf/<project>/ run `overleaf-sync-now sync`; (2) on user request to refresh; (3) for first-time auth run `overleaf-sync-now login`. Claude Code: a PreToolUse hook auto-runs sync; manual invocation rarely needed. Codex CLI: invoke sync explicitly. AUTH RECOVERY when sync/setup fails: run `overleaf-sync-now login` (browser-assisted, works on Chrome 130+). Do NOT tell the user to 'log into Overleaf' in their daily browser — on Chrome 130+ app-bound encryption blocks on-disk cookie extraction regardless of login state. See body for full recovery flow."
+argument-hint: "setup | sync [folder] [--force] [--legacy] | status [folder] | link <project_id> [folder] | install | save-cookie <value> | doctor"
 user-invocable: true
 ---
 
@@ -15,7 +15,9 @@ If the user is on Windows with Chrome 130 or later, **logging into Overleaf in t
 
 ## The problem
 
-Overleaf's Dropbox bridge polls in one direction (Overleaf → Dropbox) every 10–20 minutes, so a local Dropbox-mirrored `.tex` file can be stale by that long. This skill calls Overleaf's internal "Sync this project now" endpoint (`POST /project/{id}/dropbox/sync-now`) so the local file is fresh within seconds — without changing the user's existing Dropbox-bridge setup, so cross-device Dropbox sync still works as before.
+Overleaf's Dropbox bridge polls in one direction (Overleaf → Dropbox) every 10–20 minutes, so a local Dropbox-mirrored `.tex` file can be stale by that long. This skill fixes it by probing Overleaf's version history (`GET /project/{id}/updates`) and, on an actual web-origin change, downloading the project zip (`GET /project/{id}/download/zip`) and extracting only the files that changed — without changing the user's existing Dropbox-bridge setup, so cross-device Dropbox sync still works as before.
+
+Before 0.1.0 the skill used `POST /project/{id}/dropbox/sync-now`, but that enqueued a heavy per-user "poll Dropbox" job in Overleaf's serialized tpdsworker queue, starving local→Overleaf propagation. The new version-match path never touches that queue.
 
 ## How project lookup works
 
