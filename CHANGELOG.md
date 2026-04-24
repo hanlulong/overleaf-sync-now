@@ -2,6 +2,38 @@
 
 All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://semver.org/).
 
+## 0.1.1 — 2026-04-24
+
+Diagnostic polish. Surfaces the right error when the host shell blocks the
+outbound socket (sandboxed Codex CLI, some CI runners), instead of letting
+the failure masquerade as an auth problem.
+
+- **Sandbox-block detection**: `fetch_updates`, `download_zip`, and
+  `trigger_sync` now recognize `WinError 10013` / `forbidden by its access
+  permissions` / `EACCES` / `EPERM` / "Permission denied" at the socket
+  layer and raise a specific hint ("Outbound HTTPS to Overleaf was blocked
+  by the host environment ... approve the command in your sandbox policy")
+  instead of a generic network error.
+- `get_session` probes connectivity before raising "No valid Overleaf
+  cookies" so a sandbox block doesn't steer the AI agent into a pointless
+  `setup` / `login` / `doctor` loop (they all hit the same blocked socket).
+- `status` now prints `Cookie auth: UNKNOWN — outbound HTTPS is blocked ...`
+  instead of a misleading `INVALID` verdict when the probe can't run.
+- `sync` (both default and `--legacy`) catches `RuntimeError` cleanly — the
+  sandbox hint reaches the user as a one-line `ERROR:` message, not a
+  Python traceback.
+- The PreToolUse hook distinguishes sandbox errors from transient failures:
+  it no longer says "will retry after debounce" for errors that won't
+  self-heal.
+
+**SKILL.md refreshed**: the subcommand descriptions had drifted — `sync`
+still said "waits 10s for Dropbox to settle" (the pre-0.1.0 `/sync-now`
+behavior), and `login`/`save-cookie`/`doctor`/`projects` weren't listed.
+Rewrote the subcommand block to match 0.1.0+ behavior, documented
+`--force`/`--legacy`, and added a new **Sandbox notes** section explicitly
+telling the AI playbook-reader not to reach for auth-recovery commands
+when the error is an outbound-socket permission problem.
+
 ## 0.1.0 — 2026-04-24
 
 Switch default refresh from `POST /dropbox/sync-now` to a version-match path.

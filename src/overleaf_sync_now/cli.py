@@ -312,6 +312,16 @@ def get_session(force_refresh=False):
     if not _validate_cookies(cookies):
         cookies = _resolve_cookies(interactive=False)
     if not cookies:
+        # Before declaring "cookies bad" (which steers agents toward re-auth),
+        # probe connectivity. If the outbound socket is blocked by the host
+        # shell, auth is probably fine and re-auth would fail identically.
+        cached = _load_cache()
+        if cached and SESSION_COOKIE in cached:
+            try:
+                requests.get(f"{BASE}/", timeout=5, allow_redirects=False)
+            except requests.exceptions.RequestException as probe_e:
+                if _is_sandbox_block(probe_e):
+                    raise RuntimeError(_SANDBOX_HINT) from probe_e
         raise RuntimeError(
             f"No valid Overleaf cookies (cache: {CACHE_FILE}).\n"
             f"\n"
@@ -351,21 +361,56 @@ class RateLimited(RuntimeError):
         super().__init__(f"Overleaf rate-limited; wait ~{retry_after}s and retry.")
 
 
+def _is_sandbox_block(exc):
+    """True if `exc` looks like the host shell blocking an outbound socket
+    (sandboxed shell, firewall policy) rather than a generic network failure.
+    Distinguishing these matters: retrying doesn't help here, and the tool
+    should stop reaching for auth-recovery commands (setup/login/doctor) that
+    would hit the same block."""
+    msg = str(exc).lower()
+    markers = (
+        "winerror 10013",                          # Windows WSAEACCES
+        "forbidden by its access permissions",     # Windows human-readable form
+        "eacces",                                  # POSIX symbolic
+        "eperm",
+        "[errno 13]",                              # POSIX numeric EACCES
+        "permission denied",
+    )
+    return any(m in msg for m in markers)
+
+
+_SANDBOX_HINT = (
+    "Outbound HTTPS to Overleaf was blocked by the host environment "
+    "(likely a sandboxed shell -- Codex CLI, some CI runners). Auth is "
+    "probably fine; running setup/login/doctor will fail the same way. "
+    "Approve the `overleaf-sync-now` command prefix in your sandbox "
+    "policy, or re-run outside the sandbox."
+)
+
+
+def _wrap_network_error(e, context):
+    """Convert a requests exception into a RuntimeError with a specific
+    sandbox-block message when applicable, or a generic one otherwise."""
+    if _is_sandbox_block(e):
+        return RuntimeError(_SANDBOX_HINT)
+    return RuntimeError(f"Network error {context}: {e}")
+
+
 def trigger_sync(project_id):
     import requests
     s = get_session()
     try:
         csrf = fetch_csrf(s, project_id)
     except requests.exceptions.RequestException as e:
-        # Network-layer failure (DNS, timeout, connection reset). Distinct from
-        # auth — caller may want to back off and retry rather than re-auth.
-        raise RuntimeError(f"Network error reaching Overleaf: {e}") from e
+        # Network-layer failure (DNS, timeout, connection reset, or a
+        # sandboxed shell blocking the socket). Distinct from auth.
+        raise _wrap_network_error(e, "reaching Overleaf for CSRF") from e
     except RuntimeError:
         s = get_session(force_refresh=True)
         try:
             csrf = fetch_csrf(s, project_id)
         except requests.exceptions.RequestException as e:
-            raise RuntimeError(f"Network error reaching Overleaf: {e}") from e
+            raise _wrap_network_error(e, "reaching Overleaf for CSRF (retry)") from e
         except RuntimeError as e:
             raise AuthExpired(
                 "Overleaf cookies invalid. Re-auth by opening overleaf.com in your "
@@ -379,7 +424,7 @@ def trigger_sync(project_id):
             timeout=30,
         )
     except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Network error during sync-now POST: {e}") from e
+        raise _wrap_network_error(e, "during sync-now POST") from e
     if r.status_code == 429:
         # Retry-After can be either delta-seconds OR an HTTP-date per RFC 7231.
         # We only handle the integer form; fall back to 60s otherwise.
@@ -427,7 +472,7 @@ def fetch_updates(project_id):
     try:
         r = s.get(f"{BASE}/project/{project_id}/updates", timeout=15)
     except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Network error on /updates: {e}") from e
+        raise _wrap_network_error(e, "on /updates") from e
     if r.status_code in (401, 403):
         raise AuthExpired(
             f"Overleaf rejected /updates (HTTP {r.status_code}). "
@@ -456,7 +501,7 @@ def download_zip(project_id):
             f"{BASE}/project/{project_id}/download/zip", timeout=120, stream=False
         )
     except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Network error on /download/zip: {e}") from e
+        raise _wrap_network_error(e, "on /download/zip") from e
     if r.status_code in (401, 403):
         raise AuthExpired(f"Overleaf rejected /download/zip (HTTP {r.status_code}).")
     if r.status_code == 429:
@@ -888,7 +933,15 @@ def cmd_sync(args):
             except RateLimited as e2:
                 print(f"ERROR: still rate-limited after retry. Wait ~{e2.retry_after}s and try again.", file=sys.stderr)
                 sys.exit(1)
+            except (AuthExpired, RuntimeError) as e2:
+                print(f"ERROR: {e2}", file=sys.stderr)
+                sys.exit(1)
         except AuthExpired as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+        except RuntimeError as e:
+            # Network / sandbox block / other unexpected failure. Print clean
+            # message (no traceback) so the actionable hint is visible.
             print(f"ERROR: {e}", file=sys.stderr)
             sys.exit(1)
         if no_wait:
@@ -913,6 +966,11 @@ def cmd_sync(args):
         )
         sys.exit(1)
     except AuthExpired as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    except RuntimeError as e:
+        # Network failure, sandbox block, malformed response, etc. Print
+        # clean message (no traceback) so the actionable hint is visible.
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
     mark_synced(project_id)
@@ -964,16 +1022,31 @@ def cmd_status(args):
     cache_ok = _validate_cookies(cached, use_cache=False)
     if cache_ok:
         print("Cookie auth: OK (cache valid, sync would succeed)")
-    elif quick:
-        print("Cookie auth: cache INVALID (chain not checked; pass without --quick for full check, or run `doctor`).")
     else:
-        # Cache failed; walk the full chain to predict sync behavior.
-        resolved = _resolve_cookies(interactive=False)
-        if resolved:
-            print("Cookie auth: OK (cache stale, but chain resolved; sync would succeed and refresh cache)")
+        # Differentiate "cookies bad" from "network blocked" so a sandboxed
+        # shell doesn't make status print a misleading INVALID verdict.
+        sandboxed = False
+        if cached and SESSION_COOKIE in cached:
+            import requests
+            try:
+                requests.get(f"{BASE}/", timeout=5, allow_redirects=False)
+            except requests.exceptions.RequestException as e:
+                if _is_sandbox_block(e):
+                    sandboxed = True
+        if sandboxed:
+            print("Cookie auth: UNKNOWN — outbound HTTPS is blocked by the host "
+                  "shell (sandbox / firewall). Auth is probably fine. Approve "
+                  "the `overleaf-sync-now` command prefix or run outside the sandbox.")
+        elif quick:
+            print("Cookie auth: cache INVALID (chain not checked; pass without --quick for full check, or run `doctor`).")
         else:
-            print("Cookie auth: INVALID — sync would FAIL. Run `doctor` for details, "
-                  "or run `overleaf-sync-now login` (or `save-cookie <value>`).")
+            # Cache failed; walk the full chain to predict sync behavior.
+            resolved = _resolve_cookies(interactive=False)
+            if resolved:
+                print("Cookie auth: OK (cache stale, but chain resolved; sync would succeed and refresh cache)")
+            else:
+                print("Cookie auth: INVALID — sync would FAIL. Run `doctor` for details, "
+                      "or run `overleaf-sync-now login` (or `save-cookie <value>`).")
     print()
     if not project_id:
         print(f"Folder: {folder.resolve()}")
@@ -1044,13 +1117,20 @@ def cmd_hook(args):
         )
         sys.exit(2)
     except Exception as e:
-        # Unknown error (network, zip parse, etc.): don't block the edit,
-        # warn loudly, and mark synced so the NEXT edit doesn't immediately
-        # retry the same failing call within the debounce window. User can
-        # rerun manually via `overleaf-sync-now sync` for an explicit retry,
-        # or `overleaf-sync-now sync --legacy` to force the old /sync-now path.
+        # Unknown error (network, zip parse, sandbox block, etc.): don't
+        # block the edit; mark synced so the next edit doesn't retry
+        # inside the debounce window.
         mark_synced(project_id)
-        print(f"[overleaf-sync-now] refresh failed: {e}; will retry after debounce.", file=sys.stderr)
+        msg = str(e)
+        if _is_sandbox_block(e) or "Outbound HTTPS to Overleaf was blocked" in msg:
+            # Permanent until the user/shell config changes. "Retry after
+            # debounce" would be misleading.
+            print(f"[overleaf-sync-now] {e}", file=sys.stderr)
+        else:
+            print(
+                f"[overleaf-sync-now] refresh failed: {e}; will retry after debounce.",
+                file=sys.stderr,
+            )
         sys.exit(0)
 
 

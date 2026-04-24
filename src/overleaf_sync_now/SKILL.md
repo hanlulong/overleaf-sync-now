@@ -45,30 +45,61 @@ When `setup` reports "AUTO-DETECT FAILED" or `sync` returns a "No valid Overleaf
 
 ## Subcommands
 
-The CLI is `overleaf-sync-now` (installed globally via `uv tool install` or `pip install`).
+The CLI is `overleaf-sync-now` (installed globally via `uv tool install`).
 
 ### `setup`
-Runs the auth wizard. Walks the auto-detect chain; in interactive mode also prompts for manual paste. Run once; cached for weeks afterward.
+Auth wizard. Walks the auto-detect chain; in interactive mode also prompts for manual paste. Run once; cached for weeks afterward.
 
-### `sync [folder]`
-Triggers Overleaf-side sync for the project that owns `folder` (or current dir). Waits ~10s for Dropbox to settle. Use this:
-- Manually when the user says "I edited on Overleaf, pull please".
-- Automatically before editing in Codex CLI (where PreToolUse hooks don't apply).
+### `login`
+Browser-assisted login (Playwright + Chromium). The proper fix when `setup` can't auto-detect — including the Chrome 130+ app-bound encryption case on Windows. See the recovery flow above.
+
+### `save-cookie <value>`
+Last-resort: persist an `overleaf_session2` cookie value pasted from the browser's F12 → Application → Cookies pane. Use only when `login` can't run (no display / CI / server).
+
+### `sync [folder] [--force] [--legacy]`
+Refresh the project that owns `folder` (or current dir) against Overleaf.
+
+- **Default path** (0.1.0+): probe `/project/<id>/updates`; skip if no change or if all new updates are Dropbox-origin round-trips of our own saves; otherwise download the zip and extract only the files whose web-origin updates aren't yet on local. No Dropbox-queue load, no 10-second wait.
+- `--force`: always download the zip and re-extract. Hash-compare still skips files whose bytes already match local. Also disables the 30-second recent-mtime guard (see below).
+- `--legacy`: fall back to `POST /dropbox/sync-now` + 10-second Dropbox settle. Kept as an escape hatch; prefer the default — the legacy path pollutes Overleaf's per-user `tpdsworker` queue, which can slow down *local → Overleaf* propagation.
+
+Data-safety: by default, `sync` refuses to overwrite a local file modified within the last 30 seconds, and prints `SKIP <path>` to stderr. This protects an in-progress local save that hasn't yet propagated Dropbox → Overleaf. Pass `--force` to override.
+
+When to invoke: manually when the user says "pull latest from Overleaf," or automatically before editing in Codex CLI (PreToolUse hooks aren't reliable on Windows in Codex).
 
 ### `status [folder]`
-Reports the linked project ID and time since last triggered sync.
+Reports data dir, cookie validity, linked project, last-sync time, and cached Overleaf version (`toV`). Distinguishes sandbox-blocked network from real auth failures.
+
+### `projects [--refresh]`
+List the user's Overleaf projects (name + ID). `--refresh` forces re-fetch of the index.
+
+### `doctor [folder]`
+Diagnostic dump: cookie cache state, per-browser cookie extraction, Playwright profile, auth-chain resolution, and a live `/updates` probe against the given folder's linked project.
 
 ### `link <project_id> [folder]`
-Writes a `.overleaf-project` marker. Only needed for non-standard folder layouts (i.e., not `Apps/Overleaf/<name>`).
+Writes a `.overleaf-project` marker. Only needed for non-standard folder layouts (i.e., not `Apps/Overleaf/<name>/`).
 
 ### `hook`
 PreToolUse hook entrypoint for Claude Code. Reads JSON from stdin. **Not for manual use.**
 
 ### `install`
-Idempotent post-install setup: copies SKILL.md into `~/.claude/skills/overleaf/` and `~/.codex/skills/overleaf/` (whichever exists), adds the Claude Code PreToolUse hook, runs the auth chain. Run after `uv tool install`.
+Idempotent post-install setup: copies `SKILL.md` into `~/.claude/skills/overleaf/` and `~/.codex/skills/overleaf/` (whichever exists), installs / updates the Claude Code PreToolUse hook (matcher `Read|Edit|Write|MultiEdit`), runs the auth chain. Re-run after upgrading to 0.1.0 so the expanded matcher takes effect.
 
 ### `uninstall`
 Removes skill installs and the hook. Cookies are preserved.
+
+## Sandbox notes (Codex CLI, restricted shells)
+
+If any network-using subcommand (`sync`, `status`, `login`, `doctor`, `setup`) fails with a socket-permission error — **Windows** `WinError 10013` / `forbidden by its access permissions`, **POSIX** `EACCES` / `EPERM` / "Permission denied" — the host shell is blocking the outbound HTTPS call. **This is not an auth problem.**
+
+0.1.1+ detects this case specifically and prints:
+
+> Outbound HTTPS to Overleaf was blocked by the host environment (likely a sandboxed shell — Codex CLI, some CI runners). Auth is probably fine; running setup/login/doctor will fail the same way. Approve the `overleaf-sync-now` command prefix in your sandbox policy, or re-run outside the sandbox.
+
+When you see that message (or any of the above errno markers):
+- Do **not** run `setup` / `login` / `doctor` — each hits the same blocked socket.
+- Tell the user to approve the `overleaf-sync-now` command prefix in their sandbox (Codex CLI's always-approve list), or re-run from an unsandboxed shell.
+- `status` will print `Cookie auth: UNKNOWN — outbound HTTPS is blocked ...` rather than `INVALID` in this case, so you don't have to guess.
 
 ## When to invoke this skill
 
