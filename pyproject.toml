@@ -8,8 +8,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "overleaf-sync-now"
-version = "0.2.0"
-description = "Keep local Dropbox-mirrored Overleaf files fresh before AI edits, so AI coding agents (Claude Code, Codex CLI) edit fresh local copies instead of stale ones lagging 10-20 minutes behind Overleaf's polling sync."
+version = "0.2.1"
+description = "Overleaf sync skill for Claude Code and Codex CLI. Keeps local Dropbox-mirrored .tex/.bib files fresh before every AI Read/Edit, so AI coding agents stop overwriting Overleaf web edits with stale local content."
 readme = "README.md"
 # Old-form license metadata. Don't switch to PEP 639 SPDX (`license = "MIT"`
 # + `license-files = [...]`) without first dropping Python 3.8 support — see
@@ -19,10 +19,18 @@ authors = [{ name = "Lu Han", email = "hanlulong@gmail.com" }]
 maintainers = [{ name = "OpenEcon.ai" }]
 requires-python = ">=3.8"
 keywords = [
-    "overleaf", "latex", "dropbox", "sync", "claude-code", "codex",
-    "ai-tools", "agent-skill", "mcp", "anthropic", "openai", "ai-agent",
+    # skill-discovery keywords (high-intent search terms in agent ecosystems)
+    "overleaf-skill", "claude-skill", "claude-code-skill", "codex-skill",
+    "agent-skill", "ai-skill",
+    # platform / brand
+    "claude-code", "codex", "anthropic", "openai", "mcp",
+    # category
+    "ai-tools", "ai-agent", "cli",
+    # domain
+    "overleaf", "latex", "latex-editor", "dropbox", "sync",
+    # audience
     "academic-writing", "paper-writing", "scientific-writing",
-    "automation", "productivity", "cli", "latex-editor",
+    "automation", "productivity",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",

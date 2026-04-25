@@ -1,12 +1,12 @@
 # overleaf-sync-now
 
-> Keep your local Overleaf files fresh before every AI edit.
+> **Overleaf sync skill for Claude Code & Codex CLI** — keep local `.tex` / `.bib` files fresh before every AI edit.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 [![Install: uv](https://img.shields.io/badge/install-uv-orange.svg)](https://github.com/astral-sh/uv)
 
-A CLI and AI-agent skill that keeps your local Overleaf files in sync with the web side, on demand, before every AI edit. Works with **Claude Code** (automatic PreToolUse hook) and **Codex CLI** (skill-driven). Your local Dropbox-mirrored project stays current instead of lagging 10–20 minutes behind Overleaf's polling sync — and your existing Overleaf-Dropbox setup keeps running unchanged.
+An **agent skill** (plus a CLI and a Claude Code PreToolUse hook) that fixes a specific failure mode: when you edit a paper on overleaf.com and then ask Claude Code or Codex CLI to keep working, the AI agent reads the *stale* local Dropbox copy and silently overwrites your fresh web edits. This package keeps the local `.tex` / `.bib` / `.cls` / `.sty` / `.bst` files in sync with Overleaf, on demand, before every AI Read / Edit / Write — without changing your existing Overleaf-Dropbox setup.
 
 ### Is this for you?
 

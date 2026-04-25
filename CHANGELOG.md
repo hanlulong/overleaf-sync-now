@@ -2,6 +2,16 @@
 
 All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://semver.org/).
 
+## 0.2.1 — 2026-04-25
+
+Discoverability metadata. No functional change.
+
+- `pyproject.toml` description reframed as "Overleaf sync skill for Claude Code and Codex CLI" (previously led with the implementation detail). Lifts "skill" / "Claude Code" / "Codex CLI" into the first line — these are the high-intent search terms users actually type, and PyPI / Google index that field heavily.
+- `pyproject.toml` keywords reorganized and expanded: added `overleaf-skill`, `claude-skill`, `claude-code-skill`, `codex-skill`, `ai-skill`. Existing keywords preserved.
+- `README.md` opening: H1 subtitle and lede paragraph now lead with "Overleaf sync skill for Claude Code & Codex CLI" and explicitly name the failure mode it fixes ("AI agent reads stale local Dropbox copy and silently overwrites fresh web edits"). Front-loads the search terms users actually type.
+- GitHub topics expanded to include `overleaf-skill`, `claude-skill`, `claude-code-skill`, `codex-skill` (set via API, not in the repo).
+- GitHub repo description updated to match the new positioning.
+
 ## 0.2.0 — 2026-04-25
 
 Cleanup release. The codebase, CLI surface, and docs are now exclusively the version-match refresh path.
