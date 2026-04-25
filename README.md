@@ -6,7 +6,7 @@
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 [![Install: uv](https://img.shields.io/badge/install-uv-orange.svg)](https://github.com/astral-sh/uv)
 
-A CLI and AI-agent skill that calls Overleaf's *"Sync this project now"* endpoint on demand. Works with **Claude Code** (automatic PreToolUse hook) and **Codex CLI** (skill-driven). Your local Dropbox-mirrored project stays current instead of lagging 10–20 minutes behind Overleaf's polling sync — and your existing Overleaf-Dropbox setup keeps running unchanged.
+A CLI and AI-agent skill that keeps your local Overleaf files in sync with the web side, on demand, before every AI edit. Works with **Claude Code** (automatic PreToolUse hook) and **Codex CLI** (skill-driven). Your local Dropbox-mirrored project stays current instead of lagging 10–20 minutes behind Overleaf's polling sync — and your existing Overleaf-Dropbox setup keeps running unchanged.
 
 ### Is this for you?
 
@@ -68,28 +68,34 @@ You use Dropbox with Overleaf because it gives you **free multi-device sync** �
 
 The problem: Overleaf's Dropbox sync polls the **Overleaf-web → local** direction every 10–20 minutes. So if you've edited the paper on overleaf.com and then ask the AI to keep working, it reads a stale local file and silently overwrites the changes you just made — restoring deleted paragraphs, undoing fresh edits, all while reporting a successful tool call.
 
-`overleaf-sync-now` triggers Overleaf's instant sync immediately before each AI edit. Dropbox keeps doing its multi-device job; the AI loop stops clobbering your work. Nothing else in your setup changes.
+`overleaf-sync-now` checks Overleaf for fresh content immediately before each AI edit and pulls only what changed. Dropbox keeps doing its multi-device job; the AI loop stops clobbering your work. Nothing else in your setup changes.
 
 | Sync direction | Stock Overleaf + Dropbox | With `overleaf-sync-now` |
 |---|---|---|
 | Local edit → Overleaf | a few seconds | a few seconds *(unchanged)* |
-| **Overleaf web edit → local Dropbox** | **10–20 minutes** (next poll) | **5–10 seconds** (on-demand trigger) |
+| **Overleaf web edit → local Dropbox** | **10–20 minutes** (next poll) | **~1 s probe; ~5–10 s if a real change must be pulled** |
 | AI agent reads a stale local file | yes, often | **no** |
 
-End-to-end latency on a fresh hook-triggered sync is 5–10 seconds. Repeat edits within 30 seconds are debounced down to ~0.3 s.
+When nothing changed on the Overleaf side, the hot path is ~0.3–1 s (a single read-only probe, no zip download). When something changed, the tool downloads the project zip once and writes only the files whose content differs from local — typically 5–10 s for a normal paper.
 
 ---
 
 ## How it works
 
 <p align="center">
-  <img src="docs/workflow.svg" alt="Workflow: AI agent edit triggers PreToolUse hook, which POSTs /sync-now, Overleaf pushes to Dropbox, the fresh file is pulled locally, then the AI edits the up-to-date file." width="100%">
+  <img src="docs/workflow.svg" alt="Workflow: AI agent edit triggers PreToolUse hook, which probes Overleaf's version history (/updates), and only when web-side edits exist does it download the zip and extract changed files. Then the AI edits the fresh local file." width="100%">
 </p>
 
-1. The **PreToolUse hook** intercepts every `Edit` / `Write` / `MultiEdit` of `.tex` / `.bib` / `.cls` / `.sty` / `.bst` files. Other tools and other file types pass through.
+1. The **PreToolUse hook** intercepts every `Read` / `Edit` / `Write` / `MultiEdit` of `.tex` / `.bib` / `.cls` / `.sty` / `.bst` files. Other tools and other file types pass through.
 2. **Auto-link** maps `…/Apps/Overleaf/<name>/` to its Overleaf project ID via a 24-hour-cached project list. No per-project setup; override with `overleaf-sync-now link <id>` when names differ.
-3. **POST** `/project/<id>/dropbox/sync-now`, then wait 3 s for Dropbox to pull (10 s for the manual `sync` command).
-4. **Debounce** skips redundant triggers within any 30-second window, so a flurry of AI edits share one sync.
+3. **Version-match probe**: `GET /project/<id>/updates` returns Overleaf's history (`fromV` / `toV` / changed pathnames / origin). The tool caches the latest `toV` per project.
+   - Latest `toV` matches cached → skip, no download.
+   - Updates exist but are all Dropbox-origin (echoes of our own local saves round-tripping through Dropbox) → skip, no download.
+   - A web-origin update exists → `GET /project/<id>/download/zip` and extract only the changed pathnames, hash-compared so unchanged files aren't rewritten.
+4. **Data-safety guard**: extraction never overwrites a local file modified in the last 30 seconds — protects an in-progress local save that hasn't yet propagated Dropbox → Overleaf. Override with `sync --force`.
+5. **Debounce**: 30 s per project. A flurry of AI edits share one probe.
+
+The pre-0.1.0 `POST /project/<id>/dropbox/sync-now` path is kept as `sync --legacy` only — it enqueues a heavy per-user job in Overleaf's serialized `tpdsworker` queue, which can slow down *your own* local→Overleaf propagation. The version-match path doesn't touch that queue.
 
 For deeper details, see [`docs/architecture.md`](docs/architecture.md).
 
@@ -98,17 +104,17 @@ For deeper details, see [`docs/architecture.md`](docs/architecture.md).
 ## Subcommands
 
 ```
-overleaf-sync-now --version            # print package version
-overleaf-sync-now install              # one-shot setup (idempotent)
-overleaf-sync-now login                # browser-assisted login (Chrome 130+ Windows)
-overleaf-sync-now setup                # auth wizard (auto-detect from existing browsers)
-overleaf-sync-now save-cookie <value>  # paste a cookie value directly (last-resort)
-overleaf-sync-now sync [folder] [--no-wait]
-overleaf-sync-now status [--quick]
-overleaf-sync-now projects [--refresh]
-overleaf-sync-now doctor               # full diagnostic dump of the auth chain
-overleaf-sync-now link <id> .          # override auto-link with a marker file
-overleaf-sync-now uninstall            # remove skill + hook (keeps cookies)
+overleaf-sync-now --version                              # print package version
+overleaf-sync-now install                                # one-shot setup (idempotent)
+overleaf-sync-now login                                  # browser-assisted login (Chrome 130+ Windows)
+overleaf-sync-now setup                                  # auth wizard (auto-detect from existing browsers)
+overleaf-sync-now save-cookie <value>                    # paste a cookie value directly (last-resort)
+overleaf-sync-now sync [folder] [--force] [--legacy]     # version-match refresh; --force re-extracts; --legacy uses old /sync-now
+overleaf-sync-now status [folder] [--quick]              # cookie validity + linked project + cached toV
+overleaf-sync-now projects [--refresh]                   # list Overleaf projects (name + ID)
+overleaf-sync-now doctor [folder]                        # full diagnostic, including a /updates probe
+overleaf-sync-now link <id> .                            # override auto-link with a marker file
+overleaf-sync-now uninstall                              # remove skill + hook (keeps cookies)
 ```
 
 `sync` and `status` default to the current directory. Run `overleaf-sync-now --help` for full usage.
