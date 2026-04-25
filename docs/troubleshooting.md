@@ -4,7 +4,10 @@
 |---|---|
 | `No valid Overleaf cookies` | Run `overleaf-sync-now doctor` to see which auth source failed. On Chrome 130+ Windows, run `overleaf-sync-now login`. Otherwise, log into overleaf.com in any [supported browser](authentication.md#auth-chain). |
 | `[overleaf-sync-now] Overleaf cookies invalid. Re-auth ...` (Claude blocked the edit) | Same as above. After re-auth, retry the edit. |
-| Hook not firing in Claude Code | Restart Claude Code. Verify `~/.claude/settings.json` contains the hook entry, and `which overleaf-sync-now` returns a path. |
+| `Outbound HTTPS to Overleaf was blocked by the host environment ...` | The shell is sandboxed (Codex CLI, some CI runners) and blocked the socket. Auth is fine. Approve the `overleaf-sync-now` command prefix in your sandbox policy, or re-run from an unsandboxed shell. **Don't** run `setup`/`login`/`doctor` — they'll hit the same block. |
+| `status` reports `Cookie auth: UNKNOWN — outbound HTTPS is blocked` | Same as above — sandbox / firewall is blocking. |
+| `[overleaf-sync-now] SKIP <file>: local modified Ns ago (< 30s protection window)` | Working as intended. The recent-mtime guard refuses to overwrite a local file you may still be editing. Either wait until the file is older than 30 s and rerun `sync`, or pass `sync --force` to override. |
+| Hook not firing in Claude Code | Restart Claude Code. Verify `~/.claude/settings.json` contains the hook entry with matcher `Read\|Edit\|Write\|MultiEdit`, and `which overleaf-sync-now` returns a path. After upgrading from 0.0.x, re-run `overleaf-sync-now install` so the matcher is rewritten to include `Read`. |
 | Auto-link failed | Folder name doesn't match the Overleaf project name. Run `overleaf-sync-now link <project_id>` inside the folder to write a marker file. |
 | `HTTP 429 (rate limited)` | Wait ~60 s. Manual `sync` will auto-retry once with `Retry-After`. |
 | `uv tool upgrade` says *"Nothing to upgrade"* but you want the latest commit | See [operations → upgrading](operations.md#upgrading) — use the `--reinstall --refresh` form. |
@@ -20,7 +23,7 @@
 
 | Command | What it shows |
 |---|---|
-| `overleaf-sync-now status` | Data dir, cookie validity, linked project. Walks the full auth chain. |
-| `overleaf-sync-now status --quick` | Cookie-cache-only check. Skips Playwright. Fast. |
-| `overleaf-sync-now doctor` | Every auth source it tried plus the exact error from each. |
+| `overleaf-sync-now status [folder]` | Data dir, cookie validity, linked project, last-sync time, **cached `toV`**. Distinguishes sandbox-blocked network from real auth failures. |
+| `overleaf-sync-now status --quick` | Skips the chain-fallback step (only checks the cached cookie's network probe). Faster, but can't predict whether sync would still succeed via a stale-cache-then-refresh path. |
+| `overleaf-sync-now doctor [folder]` | Every auth source it tried plus the exact error from each, plus a live `/updates` probe of the linked project. |
 | `overleaf-sync-now projects` | Lists every Overleaf project the current session can see (name + ID). |
