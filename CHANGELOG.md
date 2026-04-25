@@ -2,6 +2,18 @@
 
 All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://semver.org/).
 
+## 0.2.2 — 2026-04-25
+
+Positioning. Lead with the failure mode this tool actually solves, instead of with a category label ("agent skill") that the search results show is now table stakes.
+
+- **README opener**: subtitle is now a single literal sentence describing the failure — *"Stops Claude Code and Codex CLI from silently overwriting your Overleaf web edits with a stale local Dropbox copy."* New "The failure mode" section above the install block walks through the bug concretely (10–20 min Dropbox poll, AI reads stale file, edits round-trip, web edits vanish, success reported).
+- **`pyproject.toml description`** rewritten to lead with the same failure-mode sentence. PyPI search and AI assistants weight this field heavily.
+- **`CITATION.cff title`** reframed: *"stop AI coding agents from overwriting Overleaf web edits with a stale local Dropbox copy"* — replaces the older "instant Overleaf-to-Dropbox sync" wording.
+- **GitHub repo description** updated via API to match.
+- **README's "Related projects"** section is now a comparison table including `aloth/overleaf-skill` (the namesake collision on npm/Homebrew), the major Overleaf MCP servers, and olsync. Lays out who keeps Dropbox vs. replaces it, and who fires automatically vs. manually. We're the only row with ✅ on both.
+
+No code change.
+
 ## 0.2.1 — 2026-04-25
 
 Discoverability metadata. No functional change.

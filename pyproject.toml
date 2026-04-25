@@ -8,8 +8,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "overleaf-sync-now"
-version = "0.2.1"
-description = "Overleaf sync skill for Claude Code and Codex CLI. Keeps local Dropbox-mirrored .tex/.bib files fresh before every AI Read/Edit, so AI coding agents stop overwriting Overleaf web edits with stale local content."
+version = "0.2.2"
+description = "Stops Claude Code and Codex CLI from silently overwriting Overleaf web edits with a stale local Dropbox copy. PreToolUse hook + CLI + agent skill that probes Overleaf's version history and refreshes local .tex/.bib files before every AI Read/Edit."
 readme = "README.md"
 # Old-form license metadata. Don't switch to PEP 639 SPDX (`license = "MIT"`
 # + `license-files = [...]`) without first dropping Python 3.8 support — see

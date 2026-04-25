@@ -1,12 +1,16 @@
 # overleaf-sync-now
 
-> **Overleaf sync skill for Claude Code & Codex CLI** — keep local `.tex` / `.bib` files fresh before every AI edit.
+> **Stops Claude Code and Codex CLI from silently overwriting your Overleaf web edits with a stale local Dropbox copy.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 [![Install: uv](https://img.shields.io/badge/install-uv-orange.svg)](https://github.com/astral-sh/uv)
 
-An **agent skill** (plus a CLI and a Claude Code PreToolUse hook) that fixes a specific failure mode: when you edit a paper on overleaf.com and then ask Claude Code or Codex CLI to keep working, the AI agent reads the *stale* local Dropbox copy and silently overwrites your fresh web edits. This package keeps the local `.tex` / `.bib` / `.cls` / `.sty` / `.bst` files in sync with Overleaf, on demand, before every AI Read / Edit / Write — without changing your existing Overleaf-Dropbox setup.
+## The failure mode
+
+You write a paper in Overleaf with Dropbox sync enabled. You edit on overleaf.com from another device, then come back to your laptop and ask Claude Code (or Codex CLI) to keep working on the paper. The AI agent reads the local `.tex` file — but Overleaf only pushes web edits to Dropbox **every 10–20 minutes**, so the local copy is stale. The AI proceeds to edit the stale file and saves it back, **silently overwriting your fresh web edits**. The tool call reports success. Paragraphs you wrote on the web vanish.
+
+`overleaf-sync-now` is an **agent skill** (plus a CLI and a Claude Code PreToolUse hook) that closes this gap. Before every AI Read / Edit / Write of a `.tex` / `.bib` / `.cls` / `.sty` / `.bst` file under `Apps/Overleaf/`, it probes Overleaf's version history and pulls down anything new — without changing your existing Dropbox setup, so cross-device sync still works exactly as before.
 
 ### Is this for you?
 
@@ -133,12 +137,17 @@ overleaf-sync-now uninstall                              # remove skill + hook (
 
 ## Related projects
 
-Each of these solves part of the same problem, but trades away either **multi-device Dropbox sync** or **AI-native automation** (or both):
+The Overleaf-AI integration space is crowded. Each of these solves a different slice of the problem:
 
-- **[Overleaf Git integration](https://www.overleaf.com/learn/how-to/Using_Git_and_GitHub)** (built into Overleaf Premium) — clone the project locally, then `git pull` / `git push` by hand. Replaces Dropbox with a one-machine clone, and every sync is manual.
-- **[overleaf-sync (olsync)](https://github.com/moritzgloeckl/overleaf-sync)** — Python script that mirrors an Overleaf project to a local folder. Replaces Dropbox; you run `olsync download` before each AI session yourself.
-- **[Overleaf Workshop (VS Code)](https://github.com/overleaf-workshop/Overleaf-Workshop)** — true real-time WebSocket editing inside VS Code. Beautiful for solo human use, but takes you out of your AI agent's editor and gives up the multi-device Dropbox story.
-- **[pyoverleaf](https://github.com/jkulhanek/pyoverleaf)** — general Python API for Overleaf. A library, not a fix; useful if you want to script your own integration.
+| Tool | Keeps Dropbox? | Fires automatically before AI edits? | Solves the stale-file failure mode? |
+|---|---|---|---|
+| **`overleaf-sync-now`** *(this repo)* | ✅ keeps it | ✅ Claude Code PreToolUse hook | ✅ |
+| [`aloth/overleaf-skill`](https://github.com/aloth/overleaf-skill) (npm `@aloth/olcli`) | ❌ replaces it | ❌ manual `olcli sync` | partial — only when user remembers |
+| [`overleaf-sync` (olsync)](https://github.com/moritzgloeckl/overleaf-sync) | ❌ replaces it | ❌ manual `olsync download` | partial — same as above |
+| [Overleaf Git integration](https://www.overleaf.com/learn/how-to/Using_Git_and_GitHub) (Premium) | ❌ replaces it | ❌ manual `git pull` | partial — same as above |
+| [Overleaf Workshop (VS Code)](https://github.com/overleaf-workshop/Overleaf-Workshop) | ❌ no Dropbox | ❌ different model (live WebSocket) | n/a — you're not editing local files |
+| MCP servers ([OverleafMCP](https://github.com/mjyoo2/OverleafMCP), [overleaf-claude-mcp](https://github.com/Junfei-Z/overleaf-claude-mcp), [Overleaf-mcp](https://github.com/GhoshSrinjoy/Overleaf-mcp), [overleafMCP-rw](https://github.com/hiufungleung/overleafMCP-rw)) | ❌ go via Git | ❌ Claude calls a tool | n/a — different model |
+| [`pyoverleaf`](https://github.com/jkulhanek/pyoverleaf) | n/a | n/a | a library, not a product |
 
 `overleaf-sync-now` is the only tool that **keeps Dropbox** (so all your devices and collaborators stay in sync the way they already do) **and fires automatically** (so the AI agent loop never reads a stale file). Smaller, narrower, invisible.
 
