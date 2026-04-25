@@ -1,6 +1,6 @@
 # Authentication
 
-`overleaf-sync-now` needs an `overleaf_session2` session cookie to call Overleaf's project endpoints — `/project/<id>/updates` and `/project/<id>/download/zip` for the default refresh path, plus `/project/<id>/dropbox/sync-now` for the `--legacy` path. It walks an **auth chain** in priority order — first hit wins, and the cookie is cached for subsequent runs.
+`overleaf-sync-now` needs an `overleaf_session2` session cookie to call Overleaf's project endpoints — `/project/<id>/updates` (the version-history probe) and `/project/<id>/download/zip` (the conditional zip pull). It walks an **auth chain** in priority order — first hit wins, and the cookie is cached for subsequent runs.
 
 ## Auth chain
 

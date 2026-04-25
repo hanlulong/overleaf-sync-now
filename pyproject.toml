@@ -8,8 +8,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "overleaf-sync-now"
-version = "0.1.1"
-description = "Trigger Overleaf's hidden 'Sync this project now' endpoint instantly so AI coding agents (Claude Code, Codex CLI) edit fresh local Dropbox copies instead of stale ones lagging 10-20 minutes behind."
+version = "0.2.0"
+description = "Keep local Dropbox-mirrored Overleaf files fresh before AI edits, so AI coding agents (Claude Code, Codex CLI) edit fresh local copies instead of stale ones lagging 10-20 minutes behind Overleaf's polling sync."
 readme = "README.md"
 # Old-form license metadata. Don't switch to PEP 639 SPDX (`license = "MIT"`
 # + `license-files = [...]`) without first dropping Python 3.8 support — see

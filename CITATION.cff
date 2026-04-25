@@ -9,8 +9,8 @@ authors:
 abstract: >
   A command-line tool and AI-agent skill that keeps a local Dropbox-mirrored
   Overleaf project in sync with the web side, on demand, before every AI
-  edit. The default refresh path probes Overleaf's per-project version
-  history (GET /project/{id}/updates) and downloads the project zip
+  edit. Probes Overleaf's per-project version history
+  (GET /project/{id}/updates) and downloads the project zip
   (GET /project/{id}/download/zip) only when a web-origin change has
   actually occurred, then writes only the files whose contents differ.
   AI coding agents (Claude Code, OpenAI Codex CLI) always edit the latest
@@ -19,9 +19,7 @@ abstract: >
   for Claude Code, a Playwright-managed browser login flow that works
   around Chrome 130+ App-Bound Encryption, a recent-mtime guard that
   prevents clobbering in-progress local saves, and sandbox-block detection
-  for restricted shells (Codex CLI, CI runners). The pre-0.1.0 hidden
-  POST /project/{id}/dropbox/sync-now endpoint is retained as a legacy
-  fallback.
+  for restricted shells (Codex CLI, CI runners).
 keywords:
   - overleaf
   - latex

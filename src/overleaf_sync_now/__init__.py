@@ -1,5 +1,5 @@
-"""overleaf-sync-now: trigger Overleaf's Dropbox sync on demand."""
-__version__ = "0.1.1"
+"""overleaf-sync-now: keep local Overleaf files fresh before AI edits."""
+__version__ = "0.2.0"
 
 from .cli import main
 

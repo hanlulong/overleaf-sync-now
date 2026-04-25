@@ -1,7 +1,7 @@
 ---
 name: overleaf
-description: "Refresh local .tex/.bib files against Overleaf before AI edits, so the agent never edits a stale copy (default Overleaf-to-Dropbox sync lags 10-20 min). Since 0.1.0 the refresh path is: probe `/project/<id>/updates` (read-only), skip if nothing changed, skip if all changes were our own Dropbox round-trips, else download-zip and extract only the web-origin changed files. WHEN: (1) before editing .tex/.bib/.cls/.sty/.bst under Apps/Overleaf/<project>/ run `overleaf-sync-now sync`; (2) on user request to refresh; (3) for first-time auth run `overleaf-sync-now login`. Claude Code: a PreToolUse hook auto-runs sync; manual invocation rarely needed. Codex CLI: invoke sync explicitly. AUTH RECOVERY when sync/setup fails: run `overleaf-sync-now login` (browser-assisted, works on Chrome 130+). Do NOT tell the user to 'log into Overleaf' in their daily browser — on Chrome 130+ app-bound encryption blocks on-disk cookie extraction regardless of login state. See body for full recovery flow."
-argument-hint: "setup | sync [folder] [--force] [--legacy] | status [folder] | link <project_id> [folder] | install | save-cookie <value> | doctor"
+description: "Refresh local .tex/.bib files against Overleaf before AI edits, so the agent never edits a stale copy (default Overleaf-to-Dropbox sync lags 10-20 min). Refresh path: probe `/project/<id>/updates` (read-only), skip if nothing changed, skip if all changes were our own Dropbox round-trips, else download-zip and extract only the web-origin changed files. WHEN: (1) before editing .tex/.bib/.cls/.sty/.bst under Apps/Overleaf/<project>/ run `overleaf-sync-now sync`; (2) on user request to refresh; (3) for first-time auth run `overleaf-sync-now login`. Claude Code: a PreToolUse hook auto-runs sync; manual invocation rarely needed. Codex CLI: invoke sync explicitly. AUTH RECOVERY when sync/setup fails: run `overleaf-sync-now login` (browser-assisted, works on Chrome 130+). Do NOT tell the user to 'log into Overleaf' in their daily browser — on Chrome 130+ app-bound encryption blocks on-disk cookie extraction regardless of login state. See body for full recovery flow."
+argument-hint: "setup | sync [folder] [--force] | status [folder] | link <project_id> [folder] | install | save-cookie <value> | doctor"
 user-invocable: true
 ---
 
@@ -16,8 +16,6 @@ If the user is on Windows with Chrome 130 or later, **logging into Overleaf in t
 ## The problem
 
 Overleaf's Dropbox bridge polls in one direction (Overleaf → Dropbox) every 10–20 minutes, so a local Dropbox-mirrored `.tex` file can be stale by that long. This skill fixes it by probing Overleaf's version history (`GET /project/{id}/updates`) and, on an actual web-origin change, downloading the project zip (`GET /project/{id}/download/zip`) and extracting only the files that changed — without changing the user's existing Dropbox-bridge setup, so cross-device Dropbox sync still works as before.
-
-Before 0.1.0 the skill used `POST /project/{id}/dropbox/sync-now`, but that enqueued a heavy per-user "poll Dropbox" job in Overleaf's serialized tpdsworker queue, starving local→Overleaf propagation. The new version-match path never touches that queue.
 
 ## How project lookup works
 
@@ -56,12 +54,11 @@ Browser-assisted login (Playwright + Chromium). The proper fix when `setup` can'
 ### `save-cookie <value>`
 Last-resort: persist an `overleaf_session2` cookie value pasted from the browser's F12 → Application → Cookies pane. Use only when `login` can't run (no display / CI / server).
 
-### `sync [folder] [--force] [--legacy]`
+### `sync [folder] [--force]`
 Refresh the project that owns `folder` (or current dir) against Overleaf.
 
-- **Default path** (0.1.0+): probe `/project/<id>/updates`; skip if no change or if all new updates are Dropbox-origin round-trips of our own saves; otherwise download the zip and extract only the files whose web-origin updates aren't yet on local. No Dropbox-queue load, no 10-second wait.
+- Probes `/project/<id>/updates`; skips if no change or if all new updates are Dropbox-origin round-trips of our own saves; otherwise downloads the zip and extracts only the files whose web-origin updates aren't yet on local.
 - `--force`: always download the zip and re-extract. Hash-compare still skips files whose bytes already match local. Also disables the 30-second recent-mtime guard (see below).
-- `--legacy`: fall back to `POST /dropbox/sync-now` + 10-second Dropbox settle. Kept as an escape hatch; prefer the default — the legacy path pollutes Overleaf's per-user `tpdsworker` queue, which can slow down *local → Overleaf* propagation.
 
 Data-safety: by default, `sync` refuses to overwrite a local file modified within the last 30 seconds, and prints `SKIP <path>` to stderr. This protects an in-progress local save that hasn't yet propagated Dropbox → Overleaf. Pass `--force` to override.
 
@@ -83,7 +80,7 @@ Writes a `.overleaf-project` marker. Only needed for non-standard folder layouts
 PreToolUse hook entrypoint for Claude Code. Reads JSON from stdin. **Not for manual use.**
 
 ### `install`
-Idempotent post-install setup: copies `SKILL.md` into `~/.claude/skills/overleaf/` and `~/.codex/skills/overleaf/` (whichever exists), installs / updates the Claude Code PreToolUse hook (matcher `Read|Edit|Write|MultiEdit`), runs the auth chain. Re-run after upgrading to 0.1.0 so the expanded matcher takes effect.
+Idempotent post-install setup: copies `SKILL.md` into `~/.claude/skills/overleaf/` and `~/.codex/skills/overleaf/` (whichever exists), installs / updates the Claude Code PreToolUse hook (matcher `Read|Edit|Write|MultiEdit`), runs the auth chain. Re-run after upgrading.
 
 ### `uninstall`
 Removes skill installs and the hook. Cookies are preserved.
@@ -92,7 +89,7 @@ Removes skill installs and the hook. Cookies are preserved.
 
 If any network-using subcommand (`sync`, `status`, `login`, `doctor`, `setup`) fails with a socket-permission error — **Windows** `WinError 10013` / `forbidden by its access permissions`, **POSIX** `EACCES` / `EPERM` / "Permission denied" — the host shell is blocking the outbound HTTPS call. **This is not an auth problem.**
 
-0.1.1+ detects this case specifically and prints:
+The tool detects this case specifically and prints:
 
 > Outbound HTTPS to Overleaf was blocked by the host environment (likely a sandboxed shell — Codex CLI, some CI runners). Auth is probably fine; running setup/login/doctor will fail the same way. Approve the `overleaf-sync-now` command prefix in your sandbox policy, or re-run outside the sandbox.
 
@@ -112,7 +109,6 @@ When you see that message (or any of the above errno markers):
 
 - **"No valid Overleaf cookies found. Run setup"**: cookies expired or never set. Run `overleaf-sync-now setup`. The chain will try cached → browsers → Playwright; falls through to manual paste in interactive mode.
 - **`setup` can't find browser cookies**: user may not be logged into overleaf.com in Chrome/Edge/Firefox. Either log in there, or paste cookie manually when prompted.
-- **`sync` returns "Project page returned HTTP 302"**: cookies invalidated. Run `setup` again.
 - **Auto-link can't find the project**: folder name doesn't match Overleaf project name. Use `link <project_id> .` inside the folder.
 
 ## Security note

@@ -31,7 +31,7 @@ uv tool install --reinstall --from . overleaf-sync-now
 
 - Python 3.8+ compatible. Avoid 3.10+ syntax (`match`, `|` type unions, etc.).
 - Standard library where possible. New runtime deps need a justification in the PR.
-- Errors raised by `trigger_sync` and friends should be one of: `AuthExpired`, `RateLimited`, or a `RuntimeError` with a user-actionable message including the path / URL / next step.
+- Errors raised by `refresh_project` / `fetch_updates` / `download_zip` should be one of: `AuthExpired`, `RateLimited`, or a `RuntimeError` with a user-actionable message including the path / URL / next step.
 - Anything written to disk should go through `_atomic_write_text` (writes to `.tmp` + `os.replace`) — particularly `~/.claude/settings.json`.
 - Anything that reads cookies / makes HTTP calls should be skippable (try/except around imports of optional deps; cheap-existence checks before expensive operations).
 - Hot paths (the hook, anything called from it) must avoid network calls when avoidable. Use the validation cache (`_cookies_recently_validated`) rather than calling `_validate_cookies` with `use_cache=False`.

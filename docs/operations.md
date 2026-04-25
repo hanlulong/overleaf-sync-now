@@ -10,13 +10,11 @@ If the entire auth chain fails, the PreToolUse hook **blocks the edit** with `ex
 
 ## Rate limiting
 
-Overleaf rate-limits its project endpoints per account (HTTP 429). In the default 0.1.0+ refresh path, the version-match probe (`GET /project/<id>/updates`) is read-only and cheap, so it rarely triggers a limit; the heavier `GET /project/<id>/download/zip` only fires when something actually changed. The 30-second debounce keeps frequency low in normal use.
+Overleaf rate-limits its project endpoints per account (HTTP 429). The version-match probe (`GET /project/<id>/updates`) is read-only and cheap, so it rarely triggers a limit; the heavier `GET /project/<id>/download/zip` only fires when something actually changed. The 30-second debounce keeps frequency low in normal use.
 
 - The **PreToolUse hook** handles 429 silently — no point blocking edits over a transient server limit; the next non-debounced sync will succeed.
-- The **manual `sync`** command honors the `Retry-After` header and retries once after waiting.
+- The **manual `sync`** command honors the `Retry-After` header.
 - If you keep hitting 429, slow down. Wait a minute or two between manual syncs.
-
-The `--legacy` path (`POST /sync-now`) is more rate-limit-prone because it enqueues a heavy job in Overleaf's per-user `tpdsworker` queue. Prefer the default.
 
 ## Upgrading
 

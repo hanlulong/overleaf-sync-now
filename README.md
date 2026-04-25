@@ -95,8 +95,6 @@ When nothing changed on the Overleaf side, the hot path is ~0.3–1 s (a single 
 4. **Data-safety guard**: extraction never overwrites a local file modified in the last 30 seconds — protects an in-progress local save that hasn't yet propagated Dropbox → Overleaf. Override with `sync --force`.
 5. **Debounce**: 30 s per project. A flurry of AI edits share one probe.
 
-The pre-0.1.0 `POST /project/<id>/dropbox/sync-now` path is kept as `sync --legacy` only — it enqueues a heavy per-user job in Overleaf's serialized `tpdsworker` queue, which can slow down *your own* local→Overleaf propagation. The version-match path doesn't touch that queue.
-
 For deeper details, see [`docs/architecture.md`](docs/architecture.md).
 
 ---
@@ -109,7 +107,7 @@ overleaf-sync-now install                                # one-shot setup (idemp
 overleaf-sync-now login                                  # browser-assisted login (Chrome 130+ Windows)
 overleaf-sync-now setup                                  # auth wizard (auto-detect from existing browsers)
 overleaf-sync-now save-cookie <value>                    # paste a cookie value directly (last-resort)
-overleaf-sync-now sync [folder] [--force] [--legacy]     # version-match refresh; --force re-extracts; --legacy uses old /sync-now
+overleaf-sync-now sync [folder] [--force]                # refresh against Overleaf; --force re-extracts
 overleaf-sync-now status [folder] [--quick]              # cookie validity + linked project + cached toV
 overleaf-sync-now projects [--refresh]                   # list Overleaf projects (name + ID)
 overleaf-sync-now doctor [folder]                        # full diagnostic, including a /updates probe

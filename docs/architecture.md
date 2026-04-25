@@ -35,8 +35,6 @@ The hook intercepts every `Read` / `Edit` / `Write` / `MultiEdit` of `.tex`, `.b
 | **7. Conditional zip pull** | `GET /project/<id>/download/zip`, hash-compare each entry against local, write only the files whose contents actually differ. |
 | **8. Recent-mtime guard** | Files modified locally in the last 30 s are skipped (with a `SKIP <path>` warning to stderr) — protects an in-progress local save not yet propagated Dropbox → Overleaf. `--force` disables. |
 
-The pre-0.1.0 `POST /project/<id>/dropbox/sync-now` path is still in the codebase as `sync --legacy`. It enqueues a heavy "poll Dropbox for user X" job in Overleaf's serialized `tpdsworker` queue, which competes with webhook-triggered local→Overleaf updates and was making local saves *slower* to appear on overleaf.com. The version-match path doesn't touch that queue. Avoid `--legacy` unless you specifically need it.
-
 ## Exit codes (hook)
 
 | Code | Meaning | Effect on the AI agent |
@@ -58,17 +56,9 @@ overleaf-sync-now link <project_id> .
 
 This writes a `.overleaf-project` file in the folder. The marker takes priority over the auto-link.
 
-## Reverse-engineering history
+## How the endpoints were found
 
-Overleaf's `/project/{id}/...` endpoints aren't publicly documented. Discovery came in two rounds:
-
-**0.0.1 — `POST /project/{id}/dropbox/sync-now`** (now legacy). Found by opening Overleaf in Microsoft's [Playwright MCP](https://github.com/microsoft/playwright-mcp)-controlled browser, clicking the "Sync this project now" button in the project's Integrations panel, and capturing the resulting POST in the Network tab. The CSRF token comes from `<meta name="ol-csrfToken">` on any project page; auth is the standard `overleaf_session2` cookie.
-
-**0.1.0 — `GET /project/{id}/updates` + `GET /project/{id}/download/zip`** (current default). Found by reading Overleaf's open-source web service, specifically `services/web/app/src/Features/ThirdPartyDataStore/TpdsUpdateSender.mjs`, where a comment makes the queue serialization explicit:
-
-> Queue poll requests in the user queue along with file updates, in order to avoid race conditions between polling and updates.
-
-That confirmed the serial-queue starvation hypothesis behind the slowness reports, and surfaced `/updates` as a read-only probe that doesn't touch the queue at all. `/download/zip` was already known but had been avoided as too coarse — the version-match probe makes it conditional and selective.
+Overleaf's `/project/{id}/...` endpoints aren't publicly documented. The two used by this tool — `GET /project/{id}/updates` and `GET /project/{id}/download/zip` — were identified by reading Overleaf's open-source web service. `/updates` is the read-only history endpoint the editor uses for the changes panel; it returns per-update `{fromV, toV, pathnames, meta.origin}`, and the `meta.origin.kind == "dropbox"` field is what lets us cleanly tell apart our own Dropbox-bridge round-trips from genuine web edits. `/download/zip` is the project-export endpoint surfaced in the editor's Menu.
 
 `/download/zip` does **not** support HTTP `Range` requests (tested: returns `200` with the full body regardless of the `Range` header; `Transfer-Encoding: chunked`, no `Accept-Ranges`). So the zip is always full-project. The version-match probe is what stops us from downloading unless something genuinely changed.
 
@@ -80,4 +70,4 @@ That confirmed the serial-queue starvation hypothesis behind the slowness report
 | Walk + zip + extract (typical paper) | ~5–10 s | A real web-origin edit happened. Bandwidth dominates. |
 | Bootstrap on first edit per project | ~10–30 s | No cached `toV` yet. Full zip + hash-compare against local. One-time. |
 
-Repeat fires within the 30-second debounce window cost nothing (debounce check + exit 0). Manual `sync --force` always pulls the zip; manual `sync --legacy` enqueues `POST /sync-now` and waits ~10 s for Dropbox to settle (the 0.0.x default).
+Repeat fires within the 30-second debounce window cost nothing (debounce check + exit 0). Manual `sync --force` always pulls the zip and re-extracts.
