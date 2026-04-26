@@ -180,6 +180,40 @@ class FingerprintTests(unittest.TestCase):
         hits = cli._fingerprint_hits(self.folder, updates)
         self.assertLessEqual(hits, cli.FINGERPRINT_MAX_PATHS)
 
+    def test_basename_fallback_for_renamed_files(self):
+        # Real-world false-positive class (v0.3.1): a file that lived at the
+        # project root historically (`Paper-New.tex`) was renamed/moved to a
+        # subdirectory (`Archive/Paper-New.tex`). The historic /updates entry
+        # still has the old root path, so direct-path check misses, but the
+        # basename still exists locally — Layer 6b should NOT warn.
+        self._touch("Archive/Paper-New.tex")
+        updates = [{
+            "meta": {"origin": {"kind": "dropbox"}},
+            "pathnames": ["Paper-New.tex"],
+        }]
+        self.assertEqual(cli._fingerprint_hits(self.folder, updates), 1)
+
+    def test_basename_fallback_does_not_match_when_basename_absent(self):
+        # The actual wrong-project case: project's recent files have basenames
+        # that don't appear ANYWHERE under the local folder. Layer 6b should
+        # still report 0 hits (warning fires).
+        self._touch("main.tex")
+        updates = [{
+            "meta": {"origin": {"kind": "dropbox"}},
+            "pathnames": ["someone_elses_unique_filename.tex"],
+        }]
+        self.assertEqual(cli._fingerprint_hits(self.folder, updates), 0)
+
+    def test_basename_index_skips_dotdirs(self):
+        # Don't wander into .git/, .vscode/, etc. when building the basename
+        # index. (A target.tex in .git/something would produce a false hit.)
+        self._touch(".git/objects/target.tex")
+        updates = [{
+            "meta": {"origin": {"kind": "dropbox"}},
+            "pathnames": ["target.tex"],
+        }]
+        self.assertEqual(cli._fingerprint_hits(self.folder, updates), 0)
+
     def test_only_first_n_dropbox_entries_inspected(self):
         # Older dropbox-origin entries beyond FINGERPRINT_RECENT_DBX_ENTRIES
         # should be ignored.
@@ -221,6 +255,24 @@ class MarkerTests(unittest.TestCase):
         self.assertIn("linked_at", data)
         # No leftover .tmp sibling.
         self.assertFalse((self.folder / (cli.PROJECT_MARKER + ".tmp")).exists())
+
+    def test_shared_level_detection(self):
+        # A marker placed at .../Apps/Overleaf/ shadows every project. The
+        # detector flags this so find_linked_folder skips that marker.
+        self.assertTrue(cli._is_marker_at_shared_level(
+            pathlib.Path("/home/user/Dropbox/Apps/Overleaf")))
+        self.assertTrue(cli._is_marker_at_shared_level(
+            pathlib.Path("C:/Users/u/Dropbox/Apps/Overleaf")))
+        # Case-insensitive
+        self.assertTrue(cli._is_marker_at_shared_level(
+            pathlib.Path("/home/user/Dropbox/apps/overleaf")))
+        # An actual project subfolder is fine, even if it happens to be
+        # named "overleaf" itself.
+        self.assertFalse(cli._is_marker_at_shared_level(
+            pathlib.Path("/home/user/Dropbox/Apps/Overleaf/MyProject")))
+        # Bare names (root, single-component) — not shared level.
+        self.assertFalse(cli._is_marker_at_shared_level(
+            pathlib.Path("/Overleaf")))
 
     def test_marker_old_format_still_resolvable(self):
         # An existing marker without metadata fields should still work.

@@ -18,12 +18,21 @@ Subcommands:
   hook                          PreToolUse hook entrypoint (reads JSON from stdin)
   uninstall                     Remove skill links and hook (cookies preserved)
 
-Auth chain (first hit wins): cached cookies, regular browser via browser_cookie3,
-Claude Code Playwright profile, interactive paste prompt.
+Auth chain (first hit wins): cached cookies -> persistent `login` browser
+profile (the proper Chrome 130+ Windows fix) -> rookiepy (Rust cookie reader,
+Chrome 127+ friendly) -> browser_cookie3 (legacy DPAPI) -> Claude Code's
+Playwright profile -> interactive paste prompt (setup/login only).
 
-Project-folder mapping: auto-discovered when a file lives under
-  <anywhere>/Apps/Overleaf/<project>/.
-Override: drop a `.overleaf-project` JSON file with the project ID in any folder.
+Project-folder mapping (since 0.3.0):
+  1. `.overleaf-project` marker file in the folder, or any parent up to the
+     filesystem root, takes priority. Validated against the cached projects
+     index (warns on trashed/archived/missing-from-account).
+  2. Else, if the file lives under <anywhere>/Apps/Overleaf/<project>/, the
+     resolver looks up <project> in the cached project records (filtering
+     trashed/archived; refusing to guess when two living projects share a
+     name; auto-resolving via fingerprint match against /updates Dropbox-
+     origin pathnames when ambiguous; auto-writing the marker on success).
+  3. Else, no link — the hook exits 0 (other tools pass through).
 
 Refresh flow:
   1. GET /project/<id>/updates -- cheap probe (~0.3s, ~30 KB) that returns the
@@ -771,8 +780,25 @@ def find_linked_folder(start, *, verbose=True, allow_disambig_network=True, read
             except Exception:
                 pid = None
             if pid:
-                _validate_marker_id_against_index(pid, cur, verbose=verbose)
-                return cur, pid
+                # Reject markers placed at the shared `Apps/Overleaf/` level.
+                # A marker there would silently shadow every project under it
+                # (every project would resolve to the same ID). Easy footgun
+                # if a user ran `link <id>` from the wrong cwd. Warn + skip
+                # so the parent walk falls through to auto-link, which will
+                # find the correct per-project mapping.
+                if _is_marker_at_shared_level(cur):
+                    if verbose:
+                        print(
+                            f"[overleaf-sync-now] WARN: ignoring {marker} — a marker "
+                            f"in the shared Apps/Overleaf/ folder would shadow every "
+                            f"project under it. Move it into a specific project "
+                            f"subfolder (e.g. {cur / 'YourProject' / PROJECT_MARKER}), "
+                            f"or delete it and let auto-link handle each project.",
+                            file=sys.stderr,
+                        )
+                else:
+                    _validate_marker_id_against_index(pid, cur, verbose=verbose)
+                    return cur, pid
         if cur.parent == cur:
             break
         cur = cur.parent
@@ -881,6 +907,22 @@ def _autolink_resolve(name, folder, *, verbose=True, allow_disambig_network=True
             )
         return None
     return None  # unknown status
+
+
+def _is_marker_at_shared_level(folder):
+    """True if `folder` is the shared Apps/Overleaf/ directory itself (the
+    parent of all per-project folders). A marker placed there would shadow
+    every project; we refuse such markers so the parent walk falls through
+    to per-project auto-link.
+
+    Case-insensitive on both components to match macOS/Windows folder casing
+    quirks. Anything else (including a project subfolder named `overleaf`
+    that just happens to live under an `apps` parent) is fine."""
+    folder = pathlib.Path(folder)
+    parts = folder.parts
+    if len(parts) < 2:
+        return False
+    return parts[-1].lower() == "overleaf" and parts[-2].lower() == "apps"
 
 
 def _validate_marker_id_against_index(project_id, folder, *, verbose=True):
@@ -1033,45 +1075,94 @@ def _path_exists_under(folder, rel):
         return False
 
 
+def _collect_local_basenames(folder, cap=5000):
+    """Walk `folder` collecting file basenames into a set, bounded by `cap`
+    to keep cost trivial on huge projects (1000-file paper folder is ~50 ms;
+    we stop early once we have plenty of signal). Skips dotdirs to avoid
+    wandering into `.git`, IDE caches, etc.
+
+    Used by the fingerprint check to handle the file-rename/move case: a
+    historic dropbox-origin /updates entry references `Paper-New.tex`, but
+    the file now lives at `Archive/Paper-New.tex`. Basename match still
+    confirms the project is the right one even though the exact path drifted.
+    """
+    folder = pathlib.Path(folder)
+    seen = set()
+    try:
+        for root, dirs, files in os.walk(folder):
+            for f in files:
+                seen.add(f)
+                if len(seen) >= cap:
+                    return seen
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+    except OSError:
+        pass
+    return seen
+
+
+def _count_pathname_hits(folder, pathnames):
+    """How many of `pathnames` (Overleaf-style forward-slash relative paths)
+    map to local files under `folder`. A path matches if either:
+      (a) the exact path exists under `folder` (strong signal: same path), or
+      (b) its basename appears anywhere under `folder` (rename/move tolerance).
+
+    The basename index is built lazily — only paid when at least one direct
+    match failed, so the common all-paths-match case stays free.
+    """
+    folder = pathlib.Path(folder)
+    hits = 0
+    basenames = None  # built lazily on first miss
+    for rel in pathnames:
+        if _path_exists_under(folder, rel):
+            hits += 1
+            continue
+        if basenames is None:
+            basenames = _collect_local_basenames(folder)
+        base = (rel or "").rstrip("/").rsplit("/", 1)[-1]
+        if base and base in basenames:
+            hits += 1
+    return hits
+
+
 def _fingerprint_hits(folder, updates):
-    """How many of the recent dropbox-origin pathnames exist locally.
+    """How many of the recent dropbox-origin pathnames map to local files.
 
     Returns 0 when there are no dropbox-origin entries or no pathnames —
     a "no signal" outcome, distinct from "negative signal." Callers should
     treat 0 as indeterminate, not as "wrong project."
     """
-    folder = pathlib.Path(folder)
     seen = _collect_recent_dbx_pathnames(updates)
     if not seen:
         return 0
-    return sum(1 for rel in seen if _path_exists_under(folder, rel))
+    return _count_pathname_hits(folder, seen)
 
 
 def _fingerprint_sanity_warn(folder, updates, project_id):
     """Layer 6b: print a one-line WARN to stderr when recent dropbox-origin
-    updates name pathnames that don't exist locally. This catches the only
-    failure class the earlier layers can't: right account, valid non-trashed
-    project, but the wrong project (typo'd manual link, fork, etc.).
+    updates name pathnames whose exact paths AND basenames are absent from
+    the local folder. This catches the only failure class the earlier
+    layers can't: right account, valid non-trashed project, but the wrong
+    project (typo'd manual link, fork, etc.).
 
     Silent on indeterminate signals (no dropbox-origin entries, no pathnames
-    on the entries, file lookups fail). Never raises.
+    on the entries, file lookups fail). Silent on file rename/move (basename
+    fallback in _count_pathname_hits). Never raises.
     """
     try:
-        folder = pathlib.Path(folder)
         seen = _collect_recent_dbx_pathnames(updates)
         if not seen:
             return  # no signal — never warn
-        hits = sum(1 for rel in seen if _path_exists_under(folder, rel))
-        if hits == 0:
-            sample = ", ".join(seen[:3])
-            print(
-                f"[overleaf-sync-now] WARN: project {project_id} has recent Dropbox-origin "
-                f"updates touching files not present in {folder} (e.g. {sample}). The link "
-                f"may point to the wrong project (a duplicate, a fork, or a typo). Run "
-                f"`overleaf-sync-now status` and `overleaf-sync-now projects` to verify, then "
-                f"`overleaf-sync-now link <correct_id> {folder}` to fix.",
-                file=sys.stderr,
-            )
+        if _count_pathname_hits(folder, seen) > 0:
+            return  # at least one path or basename matched — looks like the right project
+        sample = ", ".join(seen[:3])
+        print(
+            f"[overleaf-sync-now] WARN: project {project_id} has recent Dropbox-origin "
+            f"updates touching files not present in {folder} (e.g. {sample}). The link "
+            f"may point to the wrong project (a duplicate, a fork, or a typo). Run "
+            f"`overleaf-sync-now status` and `overleaf-sync-now projects` to verify, then "
+            f"`overleaf-sync-now link <correct_id> {folder}` to fix.",
+            file=sys.stderr,
+        )
     except Exception:
         # The sanity gate must never crash a sync. Swallow anything unexpected.
         return

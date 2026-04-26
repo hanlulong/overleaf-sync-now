@@ -2,6 +2,51 @@
 
 All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://semver.org/).
 
+## 0.3.1 — 2026-04-26
+
+Patch release. Three fixes uncovered by post-0.3.0 testing and code review.
+
+**1. Layer 6b fingerprint sanity gate: stop false-positive-warning on
+file renames or moves.** In 0.3.0 the warning fired any time recent
+dropbox-origin pathnames in `/updates` didn't exist at the *exact* path
+locally. That misfires on the common rename/move case: a historic entry
+for `Paper-New.tex` still references the project root, but the file now
+lives at `Archive/Paper-New.tex`. The link is correct and sync did the
+right thing — but the warning cried wolf, eroding trust for the real
+wrong-project case it's meant to catch. Fix: add a **basename fallback**.
+If the exact path isn't there, look for the file's basename anywhere
+under the folder (one bounded `os.walk`, built lazily and only when at
+least one direct match failed; dotdirs like `.git/` skipped). The
+wrong-project case is still caught — an unrelated project almost never
+shares basenames across all of its recent activity, and Layers 2 and 4
+already cover the vast majority of wrong-project scenarios. The same
+basename-fallback logic is shared by Layer 6a's ambiguity disambiguator,
+so it too becomes lenient on renamed-file scenarios.
+
+**2. Marker shadowing at the `Apps/Overleaf/` level.** If a user dropped
+`.overleaf-project` directly inside `~/Dropbox/Apps/Overleaf/` (instead
+of inside a specific project subfolder, easy to do by running `link`
+from the wrong cwd), the parent walk in `find_linked_folder` would
+silently bind every project under that folder to the same project ID.
+Fix: `find_linked_folder` now detects when a marker is at the shared
+`Apps/Overleaf/` level (case-insensitive, `Apps`/`apps`,
+`Overleaf`/`overleaf`), prints a one-line WARN with the suggested
+correct location, and skips that marker so the parent walk falls
+through to per-project auto-link.
+
+**3. Module docstring caught up to current behavior.** The auth chain
+section listed the wrong order and was missing both `_try_login_profile`
+(the load-bearing Chrome 130+ Windows path, FIRST after cached cookies)
+and `rookiepy`. The project-folder-mapping section described the v0.0.x
+"manual marker only" model rather than the v0.3.0 auto-link/auto-write
+flow with policy resolution and fingerprint disambiguation. Both
+rewritten to match the code.
+
+4 new unit tests (3 for basename fallback in the fingerprint check,
+1 for marker-shadowing detection). Total suite: 32 tests.
+
+No CLI surface change. No data format change. Drop-in upgrade.
+
 ## 0.3.0 — 2026-04-26
 
 Robust project resolution. Fixes a class of silent-wrong-project bugs whose
