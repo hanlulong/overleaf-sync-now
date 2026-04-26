@@ -19,8 +19,15 @@ Overleaf's Dropbox bridge polls in one direction (Overleaf → Dropbox) every 10
 
 ## How project lookup works
 
-- **Auto-link** (zero-config, preferred): if a file lives under any `…/Apps/Overleaf/<project-name>/`, the skill looks up `<project-name>` in the user's Overleaf project list (cached 24h) and uses its ID. No marker file needed.
-- **Manual link** (override): a `.overleaf-project` JSON file containing `{"project_id": "..."}` in any folder takes priority. Use this when the local folder name doesn't match the Overleaf project name.
+- **Auto-link** (zero-config, preferred): if a file lives under any `…/Apps/Overleaf/<project-name>/`, the skill looks up `<project-name>` in the user's Overleaf project list (cached 24 h, projects.json v2 since 0.3.0). The cached list keeps `trashed`/`archived`/`lastUpdated`/`ownerId`, so the resolver filters out trashed and archived projects by default and refuses to guess when two living projects share a name.
+- **Marker auto-write** (since 0.3.0): on a successful auto-link the resolver writes a tiny `.overleaf-project` JSON marker into the project folder so future resolution skips the index lookup entirely. The marker carries `project_id` + provenance (`source`, `linked_at`, `name_at_link_time`).
+- **Manual link** (override): if the user has two living projects with the same name (or the local folder name doesn't match), the resolver refuses to guess and prints all candidates with the exact `overleaf-sync-now link <id> <folder>` command to copy-paste. Run that command to write the marker explicitly. Old marker files containing only `{"project_id": "..."}` keep working.
+
+### When `sync` warns or refuses
+
+- **`auto-link: N non-trashed Overleaf projects named <name>. Refusing to guess.`** — Two or more live projects share the folder name. The skill lists candidates with IDs, last-updated timestamps, and any archived flag. Tell the user to pick one and run the printed `link` command. *Do NOT pick a project ID for them.*
+- **`WARN: marker at <folder> -> <id> is trashed/archived on Overleaf`** — User explicitly linked a stale project. Sync proceeds but the user probably wants `overleaf-sync-now link <other_id> <folder>` to relink to the active project.
+- **`WARN: project <id> has recent Dropbox-origin updates touching files not present in <folder>`** — Strong signal the link points at the wrong project entirely (a typo'd manual link, a fork, or a same-name duplicate that earlier defenses didn't catch). Have the user run `overleaf-sync-now status` and `overleaf-sync-now projects` to verify, then `link` to fix.
 
 ## Auth — DO NOT ask the user which method to use
 
