@@ -25,10 +25,15 @@ projects.json
 .overleaf-sync/
 .overleaf-data/
 
-# Test artifacts
-test_*.json
-test_*.py
+# Test artifacts (one-off test scripts in the repo root, not the unit-test
+# suite under tests/ — keep that committed).
+/test_*.json
+/test_*.py
 .playwright-mcp/
+
+# Don't commit the bug-report markdown the user feeds in for triage; it's
+# input, not release content.
+overleaf-sync-now-bug-report.md
 
 # Claude Code project-local settings
 .claude/

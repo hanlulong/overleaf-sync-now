@@ -67,11 +67,17 @@ STATE_FILE = CACHE_DIR / "state.json"
 VERSIONS_FILE = CACHE_DIR / "versions.json"
 INDEX_FILE = CACHE_DIR / "projects.json"
 INDEX_TTL = 86400
+INDEX_FORMAT_VERSION = 2
 PLAYWRIGHT_PROFILE = pathlib.Path.home() / ".claude" / "playwright-profile"
 PROJECT_MARKER = ".overleaf-project"
 DEBOUNCE_SECONDS = 30
 BASE = "https://www.overleaf.com"
 SESSION_COOKIE = "overleaf_session2"
+# Layer 6b: how many recent dropbox-origin update entries to use as a
+# fingerprint of "this project is the local folder". Bounded to keep the
+# extra stat() calls negligible on a Dropbox folder (which can be slow).
+FINGERPRINT_RECENT_DBX_ENTRIES = 5
+FINGERPRINT_MAX_PATHS = 10
 
 PACKAGE_DIR = pathlib.Path(__file__).resolve().parent
 SKILL_MD_SRC = PACKAGE_DIR / "SKILL.md"
@@ -79,25 +85,109 @@ SKILL_MD_SRC = PACKAGE_DIR / "SKILL.md"
 
 # -------- auth chain --------
 
+def _unique_tmp_path(target):
+    """Build a sibling tempfile name unique across processes AND threads.
+
+    Two writers (e.g. PreToolUse hooks fired by two Codex CLI windows on the
+    same project at once) must not race on the same tmp filename — each
+    `open(tmp, "w")` would truncate the other's content. PID + 8 random hex
+    chars makes collisions astronomically unlikely even across rapid PID
+    reuse or in-process threading."""
+    target = pathlib.Path(target)
+    return target.with_name(f"{target.name}.tmp-{os.getpid()}-{os.urandom(4).hex()}")
+
+
+def _replace_with_retry(src, dst):
+    """os.replace, retrying transient Windows ACCESS_DENIED.
+
+    On Windows, os.replace is implemented via MoveFileEx and can briefly
+    fail with PermissionError if another process/thread is in the middle of
+    its own ReplaceFile call against the same target — or if a virus
+    scanner / Dropbox / OneDrive client momentarily has the target open.
+    Exponential backoff with jitter breaks thread-herding under contention.
+    Cross-platform: a no-op extra wrapper on POSIX where replace doesn't
+    exhibit this behavior."""
+    import random
+    last_err = None
+    for attempt in range(15):
+        try:
+            os.replace(str(src), str(dst))
+            return
+        except PermissionError as e:
+            last_err = e
+            # Cap per-sleep ~50ms; total worst-case ~700ms across all
+            # retries. Jitter avoids two contending threads waking up in
+            # lockstep on every retry.
+            delay = min(0.05, 0.001 * (2 ** attempt)) * (0.5 + random.random())
+            time.sleep(delay)
+    raise last_err
+
+
 def _atomic_write_text(path, text):
-    """Write `text` to `path` atomically: write to a sibling tempfile, then
-    os.replace. Avoids leaving the destination in a half-written state if the
-    process is killed (which would corrupt e.g. ~/.claude/settings.json)."""
+    """Write `text` to `path` atomically: write to a unique sibling tempfile,
+    then os.replace. Avoids leaving the destination in a half-written state
+    if the process is killed (which would corrupt e.g. ~/.claude/settings.json).
+    Concurrency-safe across processes and threads (see _unique_tmp_path and
+    _replace_with_retry).
+
+    On POSIX, files written under our data dir get 0o600 (user-only read+write)
+    so cookie values, project IDs, and ownership metadata don't leak to other
+    local users. Files outside the data dir (e.g. ~/.claude/settings.json,
+    `.overleaf-project` markers in user folders) keep system defaults — those
+    are deliberately readable by whatever process consumes them."""
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w") as f:
-        f.write(text)
-    os.replace(str(tmp), str(path))
+    tmp = _unique_tmp_path(path)
+    try:
+        with open(tmp, "w") as f:
+            f.write(text)
+        # Restrict perms BEFORE the atomic replace so the target file never
+        # exists with permissive perms — even briefly. POSIX-only; on Windows
+        # ACL inheritance from the parent dir is the relevant control.
+        if os.name == "posix":
+            try:
+                if _is_under_data_dir(path):
+                    os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+        _replace_with_retry(tmp, path)
+    except Exception:
+        # Best-effort cleanup of the tmp file if anything between open and
+        # replace failed. The exception is re-raised so the caller still sees
+        # the failure; we just don't want orphaned .tmp-PID-XXXX files
+        # accumulating in the data dir.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _is_under_data_dir(path):
+    """True if `path` is inside our data dir. Used to gate POSIX 0o600 perms
+    in _atomic_write_text — we restrict perms on files we own (cookies,
+    state, versions, projects, validated-at) but not on user-facing files
+    like the .overleaf-project marker (which Dropbox needs to read)."""
+    try:
+        path = pathlib.Path(path).resolve()
+        data = pathlib.Path(CACHE_DIR).resolve()
+        # Path.is_relative_to is 3.9+; emulate for 3.8 compat.
+        try:
+            return path.is_relative_to(data)  # type: ignore[attr-defined]
+        except AttributeError:
+            try:
+                path.relative_to(data)
+                return True
+            except ValueError:
+                return False
+    except OSError:
+        return False
 
 
 def _save_cache(cookies):
+    # POSIX 0o600 is applied by _atomic_write_text (CACHE_FILE is under
+    # CACHE_DIR; see _is_under_data_dir).
     _atomic_write_text(CACHE_FILE, json.dumps(cookies))
-    if os.name == "posix":
-        try:
-            os.chmod(CACHE_FILE, 0o600)
-        except OSError:
-            pass
     # Successful save => fresh cookies. Skip re-validation for the next minute.
     _mark_cookies_validated()
 
@@ -477,6 +567,15 @@ def refresh_project(project_id, folder, *, force=False):
         bootstrap = True
         cached_toV = None
 
+    # Layer 6b: fingerprint sanity gate. If the recent dropbox-origin updates
+    # touch pathnames that don't exist locally at all, we're almost certainly
+    # syncing the wrong project (right account, valid project, just not the
+    # one matching this folder — e.g. a typo'd manual link, a fork, or a
+    # name-collision survivor that earlier defenses didn't catch). Warn but
+    # proceed. Indeterminate outcomes (no dropbox-origin entries, no
+    # pathnames) stay silent.
+    _fingerprint_sanity_warn(folder, updates, project_id)
+
     if not force and not bootstrap and latest_toV == cached_toV:
         return "no_change"
 
@@ -558,6 +657,13 @@ def _extract_files(zip_bytes, folder, paths, protect_recent_seconds=30):
             rel = info.filename.lstrip("/")
             if paths is not None and rel not in paths:
                 continue
+            # Never let a round-tripped .overleaf-project marker (uploaded
+            # to Overleaf via Dropbox sync, then re-downloaded in the zip)
+            # overwrite the local marker. The local marker is the source of
+            # truth for this machine's link, and Overleaf's copy may be from
+            # a different machine that picked a different project.
+            if pathlib.PurePosixPath(rel).name == PROJECT_MARKER:
+                continue
             target = (folder / rel).resolve()
             try:
                 target.relative_to(folder)
@@ -597,18 +703,61 @@ def _extract_files(zip_bytes, folder, paths, protect_recent_seconds=30):
                         continue
 
             target.parent.mkdir(parents=True, exist_ok=True)
-            tmp = target.with_name(target.name + f".tmp-{os.getpid()}")
-            with open(tmp, "wb") as f:
-                f.write(new_content)
-            os.replace(str(tmp), str(target))
+            # Same concurrency contract as _atomic_write_text: per-process,
+            # per-thread unique tmp name plus retry on Windows transient
+            # ACCESS_DENIED. Two agents extracting the same file at once
+            # (rare, but possible when neither has reached `mark_synced`
+            # yet) must not stomp each other or fail spuriously.
+            tmp = _unique_tmp_path(target)
+            try:
+                with open(tmp, "wb") as f:
+                    f.write(new_content)
+                _replace_with_retry(tmp, target)
+            except Exception:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise
             n_written += 1
 
     return n_written, n_unchanged, n_protected
 
 
 # -------- project lookup --------
+#
+# Project resolution flow:
+#   1. Walk parents looking for a `.overleaf-project` marker file. If found,
+#      return its project_id (and validate against the cached index — see
+#      Layer 4 in _validate_marker_id_against_index).
+#   2. If the path is under .../Apps/Overleaf/<name>/, resolve <name> against
+#      the cached projects index using the policy resolver (filter trashed/
+#      archived; refuse to guess on ambiguity). On a unique match, write a
+#      marker so subsequent calls take the fast path above.
+#
+# The previous implementation used a `{name: id}` dict that silently overwrote
+# duplicates and didn't filter trashed projects. That caused trashed projects
+# to shadow the active one when both shared a name (the cross-folder dedupe
+# bug). The new path keeps the full project record list and decides via
+# explicit policy.
 
-def find_linked_folder(start):
+
+def find_linked_folder(start, *, verbose=True, allow_disambig_network=True, read_only=False):
+    """Resolve `start` (a file or folder path) to (linked_folder, project_id).
+
+    Returns (None, None) when nothing resolves. `verbose` controls whether
+    diagnostic messages are printed to stderr — the hook passes False so
+    repeated keystrokes don't spam.
+
+    `allow_disambig_network` controls whether ambiguity may be resolved by
+    fingerprinting candidates' /updates against local files (Layer 6a, costs
+    one HTTP per candidate). Hook callers should leave this True since
+    auto-link runs at most once per folder before a marker is written.
+
+    `read_only` suppresses the side-effect marker write on a successful
+    auto-link. Used by `status` so a diagnostic command doesn't surprise
+    the user by creating files.
+    """
     p = pathlib.Path(start).resolve()
     if p.is_file():
         p = p.parent
@@ -618,9 +767,12 @@ def find_linked_folder(start):
         if marker.exists():
             try:
                 with open(marker) as f:
-                    return cur, json.load(f).get("project_id")
+                    pid = json.load(f).get("project_id")
             except Exception:
-                pass
+                pid = None
+            if pid:
+                _validate_marker_id_against_index(pid, cur, verbose=verbose)
+                return cur, pid
         if cur.parent == cur:
             break
         cur = cur.parent
@@ -630,78 +782,432 @@ def find_linked_folder(start):
             if i + 1 < len(parts):
                 name = parts[i + 1]
                 folder = pathlib.Path(*parts[: i + 2])
-                pid = lookup_project_id(name)
+                pid = _autolink_resolve(
+                    name, folder, verbose=verbose,
+                    allow_disambig_network=allow_disambig_network,
+                    write_marker=not read_only,
+                )
                 if pid:
                     return folder, pid
+                return None, None
     return None, None
 
 
-def lookup_project_id(name):
-    index = _load_index()
-    if name in index:
-        return index[name]
-    index = _refresh_index()
-    return index.get(name)
+def _autolink_resolve(name, folder, *, verbose=True, allow_disambig_network=True, write_marker=True):
+    """Auto-link `folder` (an .../Apps/Overleaf/<name>/ directory) to a
+    project ID. Writes a `.overleaf-project` marker on success so future
+    resolution skips the index lookup entirely (unless write_marker=False).
+
+    Returns the project_id on success, None on no-match or unresolved
+    ambiguity. When verbose, prints a clear error to stderr listing the
+    candidates and the exact `link` command to run.
+    """
+    # Broad except: get_session can raise RuntimeError for auth/network/sandbox
+    # issues, and requests can raise its own exceptions on top. We never want
+    # an auto-link probe to crash the calling command (esp. the hook) — at
+    # worst it should fail closed and let the user run `setup`/`login`.
+    try:
+        records = _load_projects_records()
+    except Exception as e:
+        if verbose:
+            print(f"[overleaf-sync-now] auto-link: could not fetch project list: {e}", file=sys.stderr)
+        return None
+    outcome = _resolve_by_name(name, records)
+    status = outcome[0]
+    if status == "ok":
+        pid = outcome[1]
+        if write_marker:
+            try:
+                _write_marker(folder, pid, project_name=name, source="auto-link")
+                if verbose:
+                    print(
+                        f"[overleaf-sync-now] auto-linked {folder} -> {pid} ({PROJECT_MARKER} written)",
+                        file=sys.stderr,
+                    )
+            except OSError as e:
+                # Don't fail resolution just because we can't drop the marker
+                # (read-only filesystem, permission issue, etc.). Auto-link will
+                # just have to re-run on the next call.
+                if verbose:
+                    print(f"[overleaf-sync-now] auto-link: marker write failed ({e}); proceeding without marker", file=sys.stderr)
+        return pid
+    if status == "none":
+        if verbose:
+            print(
+                f"[overleaf-sync-now] auto-link: no Overleaf project named {name!r}.\n"
+                f"  Run `overleaf-sync-now projects --refresh` to re-fetch the list, "
+                f"or `overleaf-sync-now link <project_id> {folder}` to link explicitly.",
+                file=sys.stderr,
+            )
+        return None
+    if status == "ambiguous":
+        candidates = outcome[1]
+        # Layer 6a: probe /updates for each candidate and pick the unique
+        # one whose recent dropbox-origin pathnames map to local files.
+        if allow_disambig_network and len(candidates) <= 5:
+            picked = _disambiguate_by_fingerprint(candidates, folder, verbose=verbose)
+            if picked:
+                pid = picked["id"]
+                if write_marker:
+                    try:
+                        _write_marker(folder, pid, project_name=name, source="auto-link-fingerprint")
+                        if verbose:
+                            print(
+                                f"[overleaf-sync-now] auto-linked {folder} -> {pid} via fingerprint match "
+                                f"({PROJECT_MARKER} written)",
+                                file=sys.stderr,
+                            )
+                    except OSError as e:
+                        if verbose:
+                            print(f"[overleaf-sync-now] auto-link: marker write failed ({e}); proceeding without marker", file=sys.stderr)
+                return pid
+        if verbose:
+            print(
+                f"[overleaf-sync-now] auto-link: {len(candidates)} non-trashed Overleaf projects "
+                f"named {name!r}. Refusing to guess. Candidates:",
+                file=sys.stderr,
+            )
+            for c in candidates:
+                last = c.get("lastUpdated") or "?"
+                tags = []
+                if c.get("archived"):
+                    tags.append("archived")
+                tag_s = f"  [{', '.join(tags)}]" if tags else ""
+                print(f"    {c['id']}  lastUpdated={last}{tag_s}", file=sys.stderr)
+            print(
+                f"  Pick one and run:\n"
+                f"    overleaf-sync-now link <project_id> {folder}",
+                file=sys.stderr,
+            )
+        return None
+    return None  # unknown status
 
 
-def _load_index():
-    if INDEX_FILE.exists():
+def _validate_marker_id_against_index(project_id, folder, *, verbose=True):
+    """Layer 4: cheap sanity check that a marker's project_id is still a
+    sensible target. Looks up the ID in the cached projects index (no extra
+    network call when the cache is warm).
+
+    Warns but never refuses — the user explicitly wrote the marker, so we
+    proceed with sync regardless. The point is to stop being silent when
+    the marker points at a stale, trashed, or wrong-account project.
+    """
+    if not verbose:
+        return
+    records = _load_cached_projects_records()
+    if not records:
+        return
+    rec = _index_record_by_id(records, project_id)
+    if rec is None:
+        print(
+            f"[overleaf-sync-now] WARN: marker at {folder} -> {project_id} is not in your "
+            f"Overleaf account (trashed long ago, deleted, or cookies are from a different "
+            f"account). Sync will likely fail. Run `overleaf-sync-now projects --refresh` "
+            f"and verify with `overleaf-sync-now status`.",
+            file=sys.stderr,
+        )
+        return
+    flags = []
+    if rec.get("trashed"):
+        flags.append("trashed")
+    if rec.get("archived"):
+        flags.append("archived")
+    if flags:
+        print(
+            f"[overleaf-sync-now] WARN: marker at {folder} -> {project_id} ({rec.get('name','?')!r}) "
+            f"is {'/'.join(flags)} on Overleaf. Syncing anyway since you explicitly linked it. "
+            f"To switch, edit {folder/PROJECT_MARKER} or run "
+            f"`overleaf-sync-now link <other_project_id> {folder}`.",
+            file=sys.stderr,
+        )
+
+
+def _resolve_by_name(name, records):
+    """Policy-driven name resolver. Returns one of:
+      ("ok", project_id)
+      ("none",)
+      ("ambiguous", [candidate_records])
+
+    Filters trashed and archived projects out by default. Tries case-sensitive
+    exact match first; only if that yields zero results does it fall back to
+    case-insensitive (covers macOS/Windows case-insensitive filesystems where
+    the local folder name may differ in case from Overleaf's project name).
+    """
+    candidates = [r for r in records
+                  if not r.get("trashed") and not r.get("archived")
+                  and r.get("name") and r.get("id")]
+    exact = [r for r in candidates if r["name"] == name]
+    if not exact:
+        exact = [r for r in candidates if r["name"].lower() == name.lower()]
+    if not exact:
+        return ("none",)
+    if len(exact) == 1:
+        return ("ok", exact[0]["id"])
+    # Sort ambiguous candidates by lastUpdated desc so the user-facing
+    # error lists the most-recently-touched first.
+    exact.sort(key=lambda r: r.get("lastUpdated") or "", reverse=True)
+    return ("ambiguous", exact)
+
+
+def _disambiguate_by_fingerprint(candidates, folder, *, verbose=True):
+    """Layer 6a: fetch each candidate's /updates top page and count how many
+    of its recent dropbox-origin pathnames exist as local files in `folder`.
+    If exactly one candidate has any matches and the others have zero,
+    return that candidate; otherwise return None (caller falls back to
+    refusal).
+
+    Cost: one HTTPS request per candidate (typical ambiguity = 2-3). Only
+    runs when the resolver is ambiguous, which is rare.
+    """
+    folder = pathlib.Path(folder)
+    matchers = []  # list of (candidate, hits)
+    for c in candidates:
+        try:
+            data = fetch_updates(c["id"])
+        except Exception as e:
+            if verbose:
+                print(
+                    f"[overleaf-sync-now] auto-link: fingerprint probe failed for {c['id']} "
+                    f"({type(e).__name__}); skipping that candidate",
+                    file=sys.stderr,
+                )
+            matchers.append((c, 0))
+            continue
+        hits = _fingerprint_hits(folder, data.get("updates", []))
+        matchers.append((c, hits))
+    matched = [(c, h) for c, h in matchers if h > 0]
+    if len(matched) == 1:
+        if verbose:
+            picked, hits = matched[0]
+            print(
+                f"[overleaf-sync-now] auto-link: fingerprint resolved ambiguity "
+                f"({hits} recent Dropbox-origin file(s) of {picked['id']} exist locally; "
+                f"the other {len(candidates)-1} candidate(s) have zero local matches)",
+                file=sys.stderr,
+            )
+        return matched[0][0]
+    return None
+
+
+def _collect_recent_dbx_pathnames(updates):
+    """Return the deduplicated list of pathnames from the most recent
+    dropbox-origin entries in `updates`, bounded to FINGERPRINT_MAX_PATHS
+    to keep downstream stat() calls cheap on slow Dropbox folders.
+
+    An empty list means "no signal" — either no dropbox-origin entries in
+    the window, or those entries had no pathnames. Callers must treat
+    that as indeterminate, never as "wrong project."
+    """
+    seen = []
+    dbx_count = 0
+    for u in updates:
+        if dbx_count >= FINGERPRINT_RECENT_DBX_ENTRIES:
+            break
+        origin_kind = (u.get("meta", {}).get("origin") or {}).get("kind")
+        if origin_kind != "dropbox":
+            continue
+        dbx_count += 1
+        for p in u.get("pathnames", []):
+            if p and p not in seen:
+                seen.append(p)
+            if len(seen) >= FINGERPRINT_MAX_PATHS:
+                break
+    return seen
+
+
+def _path_exists_under(folder, rel):
+    """Best-effort check that the Overleaf-style relative path `rel` exists
+    as a file under `folder`. Forward-slashes normalized to native separators.
+    Refuses anything that would resolve outside `folder` (absolute paths,
+    `..` components, current/parent-dir aliases) — these never come from
+    real Overleaf payloads but the cost of guarding is trivial."""
+    rel = (rel or "").lstrip("/")
+    if not rel:
+        return False
+    parts = rel.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        return False
+    try:
+        return folder.joinpath(*parts).exists()
+    except (OSError, ValueError):
+        return False
+
+
+def _fingerprint_hits(folder, updates):
+    """How many of the recent dropbox-origin pathnames exist locally.
+
+    Returns 0 when there are no dropbox-origin entries or no pathnames —
+    a "no signal" outcome, distinct from "negative signal." Callers should
+    treat 0 as indeterminate, not as "wrong project."
+    """
+    folder = pathlib.Path(folder)
+    seen = _collect_recent_dbx_pathnames(updates)
+    if not seen:
+        return 0
+    return sum(1 for rel in seen if _path_exists_under(folder, rel))
+
+
+def _fingerprint_sanity_warn(folder, updates, project_id):
+    """Layer 6b: print a one-line WARN to stderr when recent dropbox-origin
+    updates name pathnames that don't exist locally. This catches the only
+    failure class the earlier layers can't: right account, valid non-trashed
+    project, but the wrong project (typo'd manual link, fork, etc.).
+
+    Silent on indeterminate signals (no dropbox-origin entries, no pathnames
+    on the entries, file lookups fail). Never raises.
+    """
+    try:
+        folder = pathlib.Path(folder)
+        seen = _collect_recent_dbx_pathnames(updates)
+        if not seen:
+            return  # no signal — never warn
+        hits = sum(1 for rel in seen if _path_exists_under(folder, rel))
+        if hits == 0:
+            sample = ", ".join(seen[:3])
+            print(
+                f"[overleaf-sync-now] WARN: project {project_id} has recent Dropbox-origin "
+                f"updates touching files not present in {folder} (e.g. {sample}). The link "
+                f"may point to the wrong project (a duplicate, a fork, or a typo). Run "
+                f"`overleaf-sync-now status` and `overleaf-sync-now projects` to verify, then "
+                f"`overleaf-sync-now link <correct_id> {folder}` to fix.",
+                file=sys.stderr,
+            )
+    except Exception:
+        # The sanity gate must never crash a sync. Swallow anything unexpected.
+        return
+
+
+def _write_marker(folder, project_id, *, project_name=None, source="auto-link"):
+    """Layer 3: write the .overleaf-project marker with provenance metadata.
+    Only `project_id` is load-bearing for resolution; the rest is for
+    debuggability when the user (or future-us) inspects a marker file.
+    """
+    folder = pathlib.Path(folder)
+    payload = {"project_id": project_id}
+    if project_name:
+        payload["name_at_link_time"] = project_name
+    payload["source"] = source
+    payload["linked_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _atomic_write_text(folder / PROJECT_MARKER, json.dumps(payload, indent=2))
+
+
+def _index_record_by_id(records, project_id):
+    for r in records:
+        if r.get("id") == project_id:
+            return r
+    return None
+
+
+def _load_projects_records(*, force_refresh=False):
+    """Return the list of project records, refreshing from Overleaf when
+    the cache is missing/expired/wrong-version. May make a network call;
+    use `_load_cached_projects_records` for the no-network variant."""
+    if not force_refresh and INDEX_FILE.exists():
         try:
             with open(INDEX_FILE) as f:
                 cached = json.load(f)
-            if time.time() - cached.get("ts", 0) < INDEX_TTL:
-                return cached.get("index", {})
+            if (
+                cached.get("version") == INDEX_FORMAT_VERSION
+                and time.time() - cached.get("ts", 0) < INDEX_TTL
+            ):
+                return cached.get("projects", []) or []
         except Exception:
             pass
-    return _refresh_index()
+    return _refresh_projects_records()
 
 
-def _refresh_index():
+def _load_cached_projects_records():
+    """Return the cached projects records without network. Returns [] on
+    missing/corrupt/v1 file. Used by validation paths that must stay cheap
+    (every find_linked_folder call hits this)."""
+    if not INDEX_FILE.exists():
+        return []
+    try:
+        with open(INDEX_FILE) as f:
+            cached = json.load(f)
+    except Exception:
+        return []
+    if cached.get("version") != INDEX_FORMAT_VERSION:
+        return []
+    return cached.get("projects", []) or []
+
+
+def _refresh_projects_records():
+    """Fetch /project, parse ol-prefetchedProjectsBlob, and persist a v2
+    record list with the disambiguating fields (id, name, trashed, archived,
+    lastUpdated, ownerId). Falls back to whatever's on disk when Overleaf
+    is unhappy so we don't lose a previously-good index.
+    """
+    import requests
     s = get_session()
-    r = s.get(f"{BASE}/project")
+    try:
+        r = s.get(f"{BASE}/project", timeout=15)
+        if r.status_code != 200:
+            s = get_session(force_refresh=True)
+            r = s.get(f"{BASE}/project", timeout=15)
+    except requests.exceptions.RequestException as e:
+        # Network failure / sandbox block during the project-list fetch.
+        # Don't poison the cache; fall back to whatever we have.
+        if _is_sandbox_block(e):
+            raise RuntimeError(_SANDBOX_HINT) from e
+        return _load_cached_projects_records()
     if r.status_code != 200:
-        s = get_session(force_refresh=True)
-        r = s.get(f"{BASE}/project")
-    # Don't poison the cache with an empty/garbage index when Overleaf is
-    # unhappy. Return whatever we have without writing.
-    if r.status_code != 200:
-        return _load_index_raw()
+        return _load_cached_projects_records()
     m = re.search(r'name="ol-prefetchedProjectsBlob"[^>]*\scontent="([^"]+)"', r.text)
-    index = {}
+    records = []
     if m:
         import html
         try:
             blob = json.loads(html.unescape(m.group(1)))
             for proj in blob.get("projects", []):
-                if proj.get("id") and proj.get("name"):
-                    index[proj["name"]] = proj["id"]
+                pid = proj.get("id")
+                name = proj.get("name")
+                if not pid or not name:
+                    continue
+                owner = proj.get("owner") or {}
+                records.append({
+                    "id": pid,
+                    "name": name,
+                    "trashed": bool(proj.get("trashed")),
+                    "archived": bool(proj.get("archived")),
+                    "lastUpdated": proj.get("lastUpdated"),
+                    "ownerId": owner.get("id") if isinstance(owner, dict) else None,
+                })
         except (ValueError, KeyError, TypeError):
             pass
-    if not index:
-        # Fallback: only match anchors whose href is the project root, not
-        # /project/<id>/clone, /project/<id>/download, etc., which would map
-        # the wrong link text (e.g. "Download") to the project ID.
+    if not records:
+        # HTML fallback: only match anchors whose href is the project root,
+        # not /project/<id>/clone, /project/<id>/download, etc., which would
+        # map the wrong link text (e.g. "Download") to the project ID.
+        # This path can't recover trashed/archived/lastUpdated; the resolver
+        # will treat them as non-trashed/non-archived, which is the safest
+        # default when we lack signal.
+        seen = set()
         for pid, name in re.findall(
             r'/project/([0-9a-f]{24})"[^>]*>\s*([^<\n][^<]*?)\s*<', r.text
         ):
-            index.setdefault(name.strip(), pid)
-    if not index:
+            n = name.strip()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            records.append({"id": pid, "name": n, "trashed": False,
+                            "archived": False, "lastUpdated": None, "ownerId": None})
+    if not records:
         # Don't overwrite a previously-good cached index with an empty one.
-        return _load_index_raw()
-    _atomic_write_text(INDEX_FILE, json.dumps({"ts": time.time(), "index": index}, indent=2))
-    return index
+        return _load_cached_projects_records()
+    _atomic_write_text(INDEX_FILE, json.dumps(
+        {"version": INDEX_FORMAT_VERSION, "ts": time.time(), "projects": records},
+        indent=2,
+    ))
+    return records
 
 
-def _load_index_raw():
-    """Return the cached index dict (possibly empty/stale). Used as a fallback
-    when refresh fails so we don't lose a previously-good index."""
-    if INDEX_FILE.exists():
-        try:
-            with open(INDEX_FILE) as f:
-                return json.load(f).get("index", {}) or {}
-        except Exception:
-            return {}
-    return {}
+# Back-compat helper kept for any external callers / tests that imported the
+# old name. New code should call _resolve_by_name on _load_projects_records().
+def lookup_project_id(name):
+    records = _load_projects_records()
+    outcome = _resolve_by_name(name, records)
+    return outcome[1] if outcome[0] == "ok" else None
 
 
 # -------- state --------
@@ -811,8 +1317,34 @@ def cmd_link(args):
     if not folder.is_dir():
         print(f"ERROR: {folder} is not a directory", file=sys.stderr)
         sys.exit(1)
-    with open(folder / PROJECT_MARKER, "w") as f:
-        json.dump({"project_id": project_id}, f, indent=2)
+    # Look up the project name from the cached index for the marker's
+    # name_at_link_time field (debug aid; not load-bearing). Also surface
+    # trashed/archived/missing-from-account state up front so the user can
+    # cancel before the wrong link gets written.
+    rec = _index_record_by_id(_load_cached_projects_records(), project_id)
+    if rec is None:
+        print(
+            f"WARN: project {project_id} not found in cached projects index. "
+            f"Linking anyway, but verify with `overleaf-sync-now projects --refresh`.",
+            file=sys.stderr,
+        )
+    else:
+        flags = []
+        if rec.get("trashed"):
+            flags.append("trashed")
+        if rec.get("archived"):
+            flags.append("archived")
+        if flags:
+            print(
+                f"WARN: project {project_id} ({rec.get('name','?')!r}) is "
+                f"{'/'.join(flags)} on Overleaf. Linking anyway since you asked.",
+                file=sys.stderr,
+            )
+    _write_marker(
+        folder, project_id,
+        project_name=(rec or {}).get("name"),
+        source="link",
+    )
     print(f"Linked {folder} -> Overleaf project {project_id}")
 
 
@@ -850,33 +1382,55 @@ def cmd_sync(args):
 
 
 def cmd_projects(args):
-    """List the user's Overleaf projects (name, ID, last folder match if any).
+    """List the user's Overleaf projects with disambiguating metadata.
 
     Useful when:
       - You want to know your project IDs without opening the web UI.
       - Auto-link is failing and you need to confirm which Overleaf project
         name corresponds to a local folder.
+      - Two projects share a name and you need to see trashed/archived flags
+        and last-updated timestamps to pick the right one.
     """
     refresh = "--refresh" in args
-    if refresh and INDEX_FILE.exists():
-        try:
-            INDEX_FILE.unlink()
-        except OSError:
-            pass
     try:
-        index = _load_index()
+        records = _load_projects_records(force_refresh=refresh)
     except RuntimeError as e:
         print(f"ERROR: could not fetch project list: {e}", file=sys.stderr)
         sys.exit(1)
-    if not index:
+    if not records:
         print("(No projects found. Run with --refresh to force a re-fetch from Overleaf.)")
         return
-    name_w = max(len(n) for n in index)
-    print(f"{'NAME'.ljust(name_w)}  PROJECT_ID")
-    print(f"{'-' * name_w}  {'-' * 24}")
-    for name in sorted(index):
-        print(f"{name.ljust(name_w)}  {index[name]}")
-    print(f"\n{len(index)} project(s). Cached at {INDEX_FILE}.")
+    # Sort by lastUpdated desc so the most-recently-touched projects appear
+    # first — matches the Overleaf dashboard's default ordering and helps
+    # users debugging same-name ambiguity see the active duplicate at the top.
+    records = sorted(records, key=lambda r: r.get("lastUpdated") or "", reverse=True)
+    name_w = max(len(r.get("name", "")) for r in records)
+    name_w = max(name_w, len("NAME"))
+    print(f"{'NAME'.ljust(name_w)}  PROJECT_ID                FLAGS  LAST_UPDATED")
+    print(f"{'-' * name_w}  {'-' * 24}  -----  ------------")
+    # Surface name collisions inline so users debugging the cross-folder dedupe
+    # bug can see at a glance which entries they need to disambiguate with link.
+    name_counts = {}
+    for r in records:
+        name_counts[r.get("name", "")] = name_counts.get(r.get("name", ""), 0) + 1
+    for r in records:
+        flags = []
+        if r.get("trashed"):
+            flags.append("T")
+        if r.get("archived"):
+            flags.append("A")
+        if name_counts.get(r.get("name", ""), 0) > 1:
+            flags.append("DUP")
+        flag_s = ",".join(flags) if flags else "-"
+        last = (r.get("lastUpdated") or "?")[:19]  # trim ms / timezone
+        print(f"{r.get('name','').ljust(name_w)}  {r.get('id','?'):24s}  {flag_s:5s}  {last}")
+    n_trashed = sum(1 for r in records if r.get("trashed"))
+    n_archived = sum(1 for r in records if r.get("archived"))
+    print(
+        f"\n{len(records)} project(s) "
+        f"({n_trashed} trashed, {n_archived} archived). Cached at {INDEX_FILE}."
+    )
+    print("Flags: T=trashed, A=archived, DUP=name shared with another project.")
 
 
 def cmd_status(args):
@@ -886,7 +1440,9 @@ def cmd_status(args):
     quick = "--quick" in args
     args = [a for a in args if not a.startswith("--")]
     folder = pathlib.Path(args[0] if args else ".")
-    linked, project_id = find_linked_folder(folder)
+    # read_only=True so a diagnostic command never writes a marker as a
+    # side effect. The next sync (or hook fire) will write the marker.
+    linked, project_id = find_linked_folder(folder, read_only=True)
     print(f"Data dir:    {CACHE_DIR}")
     print(f"Cookie file: {CACHE_FILE} ({'present' if CACHE_FILE.exists() else 'MISSING'})")
     cached = _load_cache()
@@ -925,7 +1481,42 @@ def cmd_status(args):
         print("Project: not under any Overleaf project (auto-link only works under .../Apps/Overleaf/<name>/)")
         return
     print(f"Folder:    {linked}")
+    # Resolution provenance: was the project ID supplied by an explicit
+    # marker, or guessed by auto-link from the folder name? Helps debug the
+    # "I thought I linked X but sync hits Y" class of confusion.
+    marker = linked / PROJECT_MARKER
+    if marker.exists():
+        try:
+            with open(marker) as f:
+                meta = json.load(f)
+            src = meta.get("source", "marker")
+            linked_at = meta.get("linked_at")
+            extra = f", linked_at={linked_at}" if linked_at else ""
+            print(f"Source:    {marker} ({src}{extra})")
+        except Exception:
+            print(f"Source:    {marker}")
+    else:
+        print("Source:    auto-link (no marker file; resolved via folder name)")
     print(f"Project:   {project_id}")
+    # Cross-reference against the cached projects index — surfaces the
+    # bug-class this fix is for: marker pointing at trashed/archived/missing
+    # project, or a name collision with a still-living duplicate.
+    rec = _index_record_by_id(_load_cached_projects_records(), project_id)
+    if rec is not None:
+        flags = []
+        if rec.get("trashed"):
+            flags.append("trashed")
+        if rec.get("archived"):
+            flags.append("archived")
+        flag_s = f"  [{'/'.join(flags)}]" if flags else ""
+        last_up = rec.get("lastUpdated") or "?"
+        print(f"Name:      {rec.get('name','?')}{flag_s}")
+        print(f"Updated:   {last_up} (Overleaf-side)")
+    else:
+        print(
+            "Name:      (project ID not in cached index — run `projects --refresh` "
+            "to verify it still exists in your account)"
+        )
     last = _state().get(project_id)
     if last:
         ago = time.time() - last
@@ -958,8 +1549,15 @@ def cmd_hook(args):
     # find_linked_folder can in principle raise (PermissionError on a network
     # share, OSError reading a marker, etc.). Don't let those crash the hook
     # and block the user's edit.
+    #
+    # verbose=False so repeated keystrokes don't spam stderr with the same
+    # auto-link warning. The first auto-link writes a marker; subsequent
+    # calls hit the marker fast path. Validation warnings (Layer 4) are also
+    # suppressed in the hook — the user sees them via interactive `status`
+    # / `sync`. Marker-write notice happens once per folder; that's the
+    # only thing the hook would have surfaced anyway.
     try:
-        linked, project_id = find_linked_folder(fp)
+        linked, project_id = find_linked_folder(fp, verbose=False)
     except Exception as e:
         print(f"[overleaf-sync-now] hook: could not resolve project for {fp}: {e}; skipping.", file=sys.stderr)
         sys.exit(0)
@@ -1490,7 +2088,14 @@ def cmd_doctor(args):
     print(f"    Versions cache: {VERSIONS_FILE} ({'present' if VERSIONS_FILE.exists() else 'MISSING'})")
     if best:
         folder = pathlib.Path(args[0] if args else ".").resolve() if args else pathlib.Path(".").resolve()
-        linked, project_id = find_linked_folder(folder)
+        # Doctor must be the most robust command — never crash on a bad cwd
+        # or auth blip. read_only=True avoids surprising the user with a
+        # marker file written by what's supposed to be a diagnostic.
+        try:
+            linked, project_id = find_linked_folder(folder, read_only=True)
+        except Exception as e:
+            print(f"    Folder resolve: FAILED ({type(e).__name__}: {e})")
+            linked, project_id = None, None
         if project_id:
             try:
                 t = time.time()

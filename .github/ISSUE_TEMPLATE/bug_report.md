@@ -38,3 +38,15 @@ labels: bug
 <paste here>
 ```
 </details>
+
+<details>
+<summary><code>overleaf-sync-now projects</code> output</summary>
+
+<!-- Especially useful if `status` flagged the linked project as trashed,
+archived, missing from your account, or DUP (name collision with another
+project). The full list shows what auto-link is choosing among. -->
+
+```
+<paste here>
+```
+</details>

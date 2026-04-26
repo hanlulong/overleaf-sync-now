@@ -12,11 +12,13 @@ Everything is **user-global**. Nothing is written into your project directory.
 | `~/.claude/skills/overleaf/SKILL.md` | Skill description for Claude Code |
 | `~/.codex/skills/overleaf/SKILL.md` | Skill description for Codex CLI |
 | `~/.claude/settings.json` | PreToolUse hook entry (Claude Code only) |
-| `~/.claude/overleaf-data/cookies.json` *(or `~/.overleaf-sync/cookies.json`)* | Cached `overleaf_session2` cookie |
-| `~/.claude/overleaf-data/state.json` | Per-project debounce timestamps |
-| `~/.claude/overleaf-data/versions.json` | Per-project last-synced Overleaf `toV` (since 0.1.0) |
-| `~/.claude/overleaf-data/projects.json` | 24-hour-cached `<name>` → project-ID index for auto-link |
-| `~/.claude/overleaf-data/browser-profile/` | Persistent Playwright profile created by `login` (Chromium with the Overleaf session) |
+| `<DATA_DIR>/cookies.json` | Cached `overleaf_session2` cookie (POSIX `0o600`) |
+| `<DATA_DIR>/state.json` | Per-project debounce timestamps (POSIX `0o600`) |
+| `<DATA_DIR>/versions.json` | Per-project last-synced Overleaf `toV` (since 0.1.0; POSIX `0o600`) |
+| `<DATA_DIR>/projects.json` | 24-hour-cached project records (id, name, trashed, archived, lastUpdated, ownerId — since 0.3.0; POSIX `0o600`) |
+| `<DATA_DIR>/browser-profile/` | Persistent Playwright profile created by `login` (Chromium with the Overleaf session) |
+
+`<DATA_DIR>` resolution order: (1) `$OVERLEAF_SYNC_DATA_DIR` if set; (2) `~/.claude/overleaf-data/` if it exists (legacy installs); (3) `~/.overleaf-sync/` (default for new installs).
 
 `install` is idempotent — re-running it refreshes the skill files and hook in place. The auto-link logic walks each edited file's path upward to find `…/Apps/Overleaf/<name>/`, so the same install applies to every Overleaf project under your Dropbox.
 
@@ -46,15 +48,17 @@ The choice to exit 0 on transient errors (network blip, 429, 500, sandbox-blocke
 
 ## Auto-link
 
-The mapping `…/Apps/Overleaf/<name>/` → Overleaf project ID uses a **24-hour-cached project index** fetched once per day from `https://www.overleaf.com/project`. The index lives at `~/.claude/overleaf-data/projects.json`.
+The mapping `…/Apps/Overleaf/<name>/` → Overleaf project ID uses a **24-hour-cached project index** fetched once per day from `https://www.overleaf.com/project`. The index lives at `<DATA_DIR>/projects.json` and stores the full record per project (id, name, trashed, archived, lastUpdated, ownerId) so the resolver can apply policy (filter trashed/archived; refuse to guess on duplicate names; tie-break ambiguity by fingerprinting which project's recent Dropbox-origin files exist locally).
 
-If the auto-link is wrong (folder name differs from the Overleaf project name), drop a marker file:
+On a successful auto-link, the resolver writes a `.overleaf-project` marker into the project folder so subsequent syncs skip the index lookup entirely. The marker carries `project_id`, `linked_at`, `name_at_link_time`, and `source` (`auto-link` / `auto-link-fingerprint` / `link`); only `project_id` is load-bearing for resolution.
+
+If the auto-link is wrong (folder name differs from the Overleaf project name, or two projects share a name) drop the marker explicitly:
 
 ```bash
 overleaf-sync-now link <project_id> .
 ```
 
-This writes a `.overleaf-project` file in the folder. The marker takes priority over the auto-link.
+The marker takes priority over the auto-link. `_extract_files` skips any zip entry named `.overleaf-project` so a marker that round-trips through Overleaf's Dropbox bridge can never overwrite the local marker.
 
 ## How the endpoints were found
 

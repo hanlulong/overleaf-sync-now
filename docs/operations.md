@@ -34,7 +34,8 @@ uv tool install --reinstall --force --refresh \
 ```bash
 overleaf-sync-now uninstall          # removes skill + hook (keeps cookies/cache)
 uv tool uninstall overleaf-sync-now  # removes the binary
-rm -r ~/.claude/overleaf-data        # optional: also remove cached cookies
+rm -r ~/.overleaf-sync               # optional: also remove cached cookies
+                                     # (legacy installs: ~/.claude/overleaf-data)
 ```
 
 ## Multiple Overleaf accounts
@@ -42,9 +43,11 @@ rm -r ~/.claude/overleaf-data        # optional: also remove cached cookies
 The cache holds one session at a time. To switch accounts:
 
 ```bash
-rm ~/.claude/overleaf-data/cookies.json
-overleaf-sync-now setup     # or `login` on Chrome 130+ Windows
+rm ~/.overleaf-sync/cookies.json     # legacy: ~/.claude/overleaf-data/cookies.json
+overleaf-sync-now setup              # or `login` on Chrome 130+ Windows
 ```
+
+Run `overleaf-sync-now status` to confirm which data dir your install uses (resolved from `$OVERLEAF_SYNC_DATA_DIR` → `~/.claude/overleaf-data/` → `~/.overleaf-sync/`, in that order).
 
 ## Self-hosted Overleaf / Server Pro
 

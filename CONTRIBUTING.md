@@ -27,6 +27,16 @@ To install the changes back into your everyday `uv tool` install (so the Claude 
 uv tool install --reinstall --from . overleaf-sync-now
 ```
 
+## Running the unit tests
+
+The project has a small unit test suite under `tests/` covering the project resolver, marker handling, atomic write concurrency, and POSIX file perms. No external dependencies — just `unittest`:
+
+```bash
+python -m unittest discover tests
+```
+
+Tests must pass before opening a PR. Anything touching `_atomic_write_text`, `_extract_files`, the resolver (`_resolve_by_name`, `_autolink_resolve`, `_disambiguate_by_fingerprint`), or the index format should add a test.
+
 ## Style
 
 - Python 3.8+ compatible. Avoid 3.10+ syntax (`match`, `|` type unions, etc.).

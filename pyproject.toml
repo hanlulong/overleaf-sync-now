@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "overleaf-sync-now"
-version = "0.2.2"
+version = "0.3.0"
 description = "Stops Claude Code and Codex CLI from silently overwriting Overleaf web edits with a stale local Dropbox copy. PreToolUse hook + CLI + agent skill that probes Overleaf's version history and refreshes local .tex/.bib files before every AI Read/Edit."
 readme = "README.md"
 # Old-form license metadata. Don't switch to PEP 639 SPDX (`license = "MIT"`

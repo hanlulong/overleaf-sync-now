@@ -2,6 +2,8 @@ cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 type: software
 title: "overleaf-sync-now: stop AI coding agents from overwriting Overleaf web edits with a stale local Dropbox copy"
+version: "0.3.0"
+date-released: "2026-04-26"
 authors:
   - family-names: Han
     given-names: Lu

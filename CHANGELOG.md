@@ -2,6 +2,143 @@
 
 All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://semver.org/).
 
+## 0.3.0 — 2026-04-26
+
+Robust project resolution. Fixes a class of silent-wrong-project bugs whose
+canonical instance was reported as: an Overleaf account with two projects of
+the same name (one trashed) silently auto-linked to the trashed one, so
+`sync` returned `no_change` while the active project had fresh edits.
+
+The single-line dict overwrite in `_refresh_index()` was the proximate cause,
+but the resolver was the architectural problem: it threw away every
+disambiguating field (`trashed`, `archived`, `lastUpdated`, `ownerId`) and
+had no read-side validation gate. This release rebuilds resolution as seven
+independent layers so that no single failure mode produces a wrong-project
+sync.
+
+**The seven layers:**
+
+1. **Richer project index format (v2).** `~/.overleaf-sync/projects.json` now
+   stores the full record per project (`id`, `name`, `trashed`, `archived`,
+   `lastUpdated`, `ownerId`) instead of a `{name: id}` dict. v1 files on
+   disk are treated as expired and re-fetched on first use.
+2. **Policy resolver, refuse on ambiguity.** Auto-link filters out trashed
+   and archived projects by default and tries case-sensitive exact match
+   before falling back to case-insensitive. When two non-trashed projects
+   share a name, the resolver refuses to guess and prints all candidates
+   (with IDs and `lastUpdated`) plus the exact `link <id> <folder>` command
+   to copy-paste. The previous behavior — silently picking whichever the
+   dict's last write wrote — was the proximate cause of the reported bug.
+3. **Auto-write `.overleaf-project` marker on successful auto-link.** Once
+   resolution is unambiguous, the marker is persisted in the folder so
+   subsequent syncs are immune to later renames, newly-trashed duplicates,
+   or anything else that mutates the projects list. Marker now carries
+   `linked_at`, `name_at_link_time`, and `source` (`auto-link` /
+   `auto-link-fingerprint` / `link`) for debuggability. Old markers
+   containing just `{"project_id": "..."}` still resolve identically.
+4. **Validate marker against the cached index on every resolution.** No
+   extra network call. Surfaces the cases the earlier layers can't reach
+   on their own: marker pointing at a project that's now trashed, archived,
+   deleted, or owned by a different account (e.g. cookies switched). Warns
+   to stderr but proceeds — the user explicitly wrote the marker, so we
+   never refuse to sync, we just stop being silent.
+5. **Better `status` and `projects` output.** `projects` now shows columns
+   `NAME | PROJECT_ID | FLAGS | LAST_UPDATED`, sorted by `lastUpdated`
+   desc, with inline flags `T` (trashed), `A` (archived), `DUP` (name
+   shared with another project). `status` shows resolution provenance
+   (marker file vs auto-link), the project's current name from the index,
+   `lastUpdated`, and any trashed/archived flag.
+6. **(a) Fingerprint-based ambiguity disambiguation.** When the policy
+   resolver returns "ambiguous," probes each candidate's `/updates` top
+   page (one HTTP request per candidate, only on ambiguity) and counts how
+   many recent dropbox-origin pathnames exist as local files. If exactly
+   one candidate has matches and the rest have zero, picks it
+   automatically — converting the reported bug into auto-resolved-correctly
+   even before the trashed filter would refuse. Falls back to the layer-2
+   refusal when fingerprints don't disambiguate.
+7. **(b) Fingerprint sanity gate on every sync.** Inside `refresh_project`,
+   before returning `no_change`, walks the top dropbox-origin entries from
+   `/updates` and warns to stderr if none of their pathnames map to local
+   files. Catches the only failure class the earlier layers can't: right
+   account, valid non-trashed project, but the wrong project (typo'd
+   manual `link`, fork, etc.). Cost: ~10 `Path.exists()` calls; no extra
+   network.
+
+**Other 0.3.0 changes:**
+
+- **Concurrency safety for atomic writes.** Both `_atomic_write_text`
+  (used for state, versions, projects index, cookie cache, marker, and
+  `~/.claude/settings.json`) and `_extract_files` (used to write zip
+  contents into the project folder) had concurrency bugs that triggered
+  when two PreToolUse hooks fired on the same project — e.g. two Codex
+  CLI windows editing the same paper:
+  - **Tempfile name collision.** The previous names were deterministic
+    (`<path>.tmp`) and PID-only (`<file>.tmp-<pid>`). Two writers in the
+    same process or across rapid PID-reuse could open the same tempfile
+    in `w` mode and stomp each other's writes.
+  - **Windows `ACCESS_DENIED` on contending `os.replace`.** When two
+    processes call `MoveFileEx` against the same target near-simultaneously,
+    one transiently fails. The original code would propagate this as a
+    "refresh failed" hook error even though the target was correctly
+    written by the other process.
+  Both helpers now share `_unique_tmp_path` (PID + 8 random hex chars)
+  and `_replace_with_retry` (jittered exponential backoff up to ~700ms).
+  New `ConcurrencyTests` exercise 20-thread contention on `_atomic_write_text`,
+  10-thread contention on `_extract_files`, and 10-thread contention on
+  marker writes — all stable across stress runs.
+- **Documented lost-update semantics.** `state.json` and `versions.json`
+  are read-modify-write — two processes updating *different* keys at
+  exactly the same moment can lose one update (last-writer-wins on the
+  whole file). Effect on `state.json` is debounce-timestamp drift
+  (harmless). Effect on `versions.json` is that the lost project's
+  cached `toV` reverts to absent, triggering a bootstrap on next sync —
+  bandwidth-wasteful (full zip download) but not destructive (the
+  hash-diff + `protect_recent_seconds` guards keep local edits safe).
+  Per-key locking would eliminate this but adds cross-platform
+  complexity for a benign loss; not implemented.
+- `_extract_files` now skips any zip entry whose basename is
+  `.overleaf-project`. Defense in depth: if Overleaf's Dropbox bridge
+  uploads a marker to the project, it can never overwrite a different
+  machine's local marker on the next zip download.
+- **POSIX `0o600` for every file under the data dir.** Previously only
+  `cookies.json` was permission-restricted; `versions.json`, `state.json`,
+  `projects.json`, and `.validated-at` all leaked project IDs, names,
+  and ownership metadata to other local users on shared POSIX boxes.
+  The atomic-write path now applies `0o600` to anything written under
+  `<DATA_DIR>` (per `_is_under_data_dir`), but leaves `.overleaf-project`
+  markers in user folders at default perms so Dropbox can still read
+  them. New POSIX-only `FilePermsTests` cover both halves.
+- **Hang-proof `/project` fetch.** `_refresh_projects_records` now passes
+  `timeout=15` (matching `fetch_updates`) and converts a sandbox-block
+  socket error into the existing `_SANDBOX_HINT` instead of letting the
+  `requests` exception propagate. Previously a network stall during the
+  daily project-list refresh could hang the hook indefinitely.
+- **`doctor` is crash-proof.** Wrapped `find_linked_folder` in `cmd_doctor`
+  with try/except so a malformed cwd or transient resolver error
+  produces a clean diagnostic line rather than a Python traceback.
+  Doctor must be the most robust command — it's what users run when
+  things are already broken.
+- Docs: `architecture.md` and `operations.md` now describe the data-dir
+  resolution order (`$OVERLEAF_SYNC_DATA_DIR` → `~/.claude/overleaf-data/`
+  → `~/.overleaf-sync/`) instead of hard-coding the legacy path.
+  Architecture page also documents the new auto-link / marker /
+  fingerprint flow.
+- `cmd_link` writes the marker via the new `_write_marker` helper (atomic
+  write, with metadata) and warns up front if the supplied project ID is
+  trashed, archived, or missing from the cached index.
+- The hook (which fires on every keystroke) suppresses Layer 4 marker
+  validation warnings to avoid spam. Layer 6b's sanity warning still
+  fires through the hook path. Interactive `status` and `sync` print
+  full diagnostics.
+- New unit tests under `tests/` cover the policy resolver, index
+  migration, fingerprint matcher, and marker round-trip behavior. Run
+  with `python -m unittest discover tests`.
+
+**Migration:** existing `~/.overleaf-sync/projects.json` files are detected
+as v1 and refreshed automatically on first use. Existing
+`.overleaf-project` markers (containing only `project_id`) keep working
+unchanged. No user action required.
+
 ## 0.2.2 — 2026-04-25
 
 Positioning. Lead with the failure mode this tool actually solves, instead of with a category label ("agent skill") that the search results show is now table stakes.

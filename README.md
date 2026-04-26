@@ -91,13 +91,14 @@ When nothing changed on the Overleaf side, the hot path is ~0.3–1 s (a single 
 </p>
 
 1. The **PreToolUse hook** intercepts every `Read` / `Edit` / `Write` / `MultiEdit` of `.tex` / `.bib` / `.cls` / `.sty` / `.bst` files. Other tools and other file types pass through.
-2. **Auto-link** maps `…/Apps/Overleaf/<name>/` to its Overleaf project ID via a 24-hour-cached project list. No per-project setup; override with `overleaf-sync-now link <id>` when names differ.
-3. **Version-match probe**: `GET /project/<id>/updates` returns Overleaf's history (`fromV` / `toV` / changed pathnames / origin). The tool caches the latest `toV` per project.
+2. **Auto-link** maps `…/Apps/Overleaf/<name>/` to its Overleaf project ID via a 24-hour-cached project list. On a unique match the tool drops a tiny `.overleaf-project` marker into the folder so future resolution is deterministic — no manual setup needed. Override or pre-seed it with `overleaf-sync-now link <id>` when names differ or two projects share a name.
+3. **Resolver safety net** (since 0.3.0): the cached project list keeps trashed/archived flags, lastUpdated, and ownerId. Trashed and archived projects are filtered out of auto-link, and if two living projects still share a name the tool refuses to guess — it lists the candidates and asks you to pick. A sync-time fingerprint check warns if the linked project's recent Dropbox-origin updates touch files not present locally (the "I linked the wrong project" smoke detector).
+4. **Version-match probe**: `GET /project/<id>/updates` returns Overleaf's history (`fromV` / `toV` / changed pathnames / origin). The tool caches the latest `toV` per project.
    - Latest `toV` matches cached → skip, no download.
    - Updates exist but are all Dropbox-origin (echoes of our own local saves round-tripping through Dropbox) → skip, no download.
    - A web-origin update exists → `GET /project/<id>/download/zip` and extract only the changed pathnames, hash-compared so unchanged files aren't rewritten.
-4. **Data-safety guard**: extraction never overwrites a local file modified in the last 30 seconds — protects an in-progress local save that hasn't yet propagated Dropbox → Overleaf. Override with `sync --force`.
-5. **Debounce**: 30 s per project. A flurry of AI edits share one probe.
+5. **Data-safety guard**: extraction never overwrites a local file modified in the last 30 seconds — protects an in-progress local save that hasn't yet propagated Dropbox → Overleaf. Override with `sync --force`.
+6. **Debounce**: 30 s per project. A flurry of AI edits share one probe.
 
 For deeper details, see [`docs/architecture.md`](docs/architecture.md).
 
@@ -112,10 +113,10 @@ overleaf-sync-now login                                  # browser-assisted logi
 overleaf-sync-now setup                                  # auth wizard (auto-detect from existing browsers)
 overleaf-sync-now save-cookie <value>                    # paste a cookie value directly (last-resort)
 overleaf-sync-now sync [folder] [--force]                # refresh against Overleaf; --force re-extracts
-overleaf-sync-now status [folder] [--quick]              # cookie validity + linked project + cached toV
-overleaf-sync-now projects [--refresh]                   # list Overleaf projects (name + ID)
+overleaf-sync-now status [folder] [--quick]              # cookie validity + linked project (source, name, trashed/archived flags, lastUpdated, cached toV)
+overleaf-sync-now projects [--refresh]                   # list projects with NAME | PROJECT_ID | FLAGS (T/A/DUP) | LAST_UPDATED, sorted by recency
 overleaf-sync-now doctor [folder]                        # full diagnostic, including a /updates probe
-overleaf-sync-now link <id> .                            # override auto-link with a marker file
+overleaf-sync-now link <id> .                            # override auto-link with a marker file (warns if id is trashed/archived)
 overleaf-sync-now uninstall                              # remove skill + hook (keeps cookies)
 ```
 
