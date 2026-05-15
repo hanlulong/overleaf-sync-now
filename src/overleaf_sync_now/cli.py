@@ -1846,26 +1846,71 @@ def cmd_install(args):
     print("Manual sync any time, from any directory:  overleaf-sync-now sync .")
 
 
-def _ensure_playwright_browser():
-    """Ensure Chromium is downloaded. Idempotent. ~150MB on first run.
+def _import_sync_playwright():
+    """Return (sync_playwright_callable, kind). Prefers patchright when installed.
 
-    Playwright the Python package is a regular pyproject.toml dep so it's
-    always available; only the browser binary is lazy-downloaded.
+    patchright is a maintained Playwright fork that patches the CDP
+    Runtime.Enable leak and command-flag fingerprints Google's anti-automation
+    gate detects (the "This browser or app may not be secure" page). It exposes
+    the same `sync_playwright` API, so it's a drop-in. Vanilla playwright is
+    the fallback for environments where the patchright wheel isn't available.
     """
     try:
-        import playwright.sync_api  # noqa: F401
+        from patchright.sync_api import sync_playwright as patchright_sync  # type: ignore
+        return patchright_sync, "patchright"
     except ImportError:
-        # This can only happen if user did `uv tool install --no-deps` or similar.
+        pass
+    try:
+        from playwright.sync_api import sync_playwright as playwright_sync  # type: ignore
+        return playwright_sync, "playwright"
+    except ImportError:
+        return None, None
+
+
+def _build_launch_kwargs(kind, profile_dir, *, headless, channel):
+    """kwargs for `chromium.launch_persistent_context`, tuned per backend.
+
+    patchright applies CDP-level stealth patches internally; passing our own
+    ignore_default_args would interfere. For vanilla playwright we strip
+    `--enable-automation` and disable AutomationControlled as a best-effort
+    baseline — it won't defeat every Google detector (the Runtime.Enable leak
+    remains) but it reduces the obvious signals.
+    """
+    kwargs = {"user_data_dir": str(profile_dir), "headless": headless}
+    if channel:
+        kwargs["channel"] = channel
+    if kind == "playwright":
+        kwargs["ignore_default_args"] = ["--enable-automation"]
+        kwargs["args"] = ["--disable-blink-features=AutomationControlled"]
+    return kwargs
+
+
+def _ensure_playwright_browser():
+    """Ensure Chromium is downloaded for whichever backend the adapter prefers.
+    Idempotent. ~150MB on first run.
+
+    Both patchright and playwright are pyproject.toml deps, so import is
+    guaranteed; only the browser binary is lazy-downloaded. We run the
+    `install chromium` step for the preferred backend only — no need to
+    download two Chromiums.
+    """
+    _, kind = _import_sync_playwright()
+    if not kind:
+        # Can only happen if user did `uv tool install --no-deps` or similar.
         print(
-            "[overleaf-sync-now] Playwright Python package missing. Reinstall the tool:\n"
+            "[overleaf-sync-now] Neither patchright nor playwright is installed.\n"
+            "  Reinstall the tool:\n"
             "  uv tool install --reinstall --from git+https://github.com/hanlulong/overleaf-sync-now overleaf-sync-now",
             file=sys.stderr,
         )
         sys.exit(1)
-    print("[overleaf-sync-now] Ensuring Chromium browser is available (one-time, ~150MB on first run)...", file=sys.stderr)
+    print(
+        f"[overleaf-sync-now] Ensuring Chromium is available via {kind} (one-time, ~150MB on first run)...",
+        file=sys.stderr,
+    )
     try:
         subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
+            [sys.executable, "-m", kind, "install", "chromium"],
             check=False, stdout=sys.stderr, stderr=sys.stderr,
         )
     except Exception as e:
@@ -1896,14 +1941,26 @@ def cmd_login(args):
         return
 
     _ensure_playwright_browser()
-    from playwright.sync_api import sync_playwright
+    sync_playwright, kind = _import_sync_playwright()
+    if sync_playwright is None:
+        print(
+            "ERROR: Neither patchright nor playwright Python package is importable.\n"
+            "Reinstall the tool.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     profile_dir = CACHE_DIR / "browser-profile"
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     print()
-    print("Opening a browser window. Log into https://www.overleaf.com when it appears.")
+    print(f"Opening a browser window (backend: {kind}). Log into https://www.overleaf.com when it appears.")
     print(f"(Login persists in {profile_dir}; you only do this once per several weeks.)")
+    print()
+    print("Tip: if your Overleaf account uses 'Sign in with Google' and Google blocks")
+    print("the sign-in here, set an Overleaf-specific password at")
+    print("  https://www.overleaf.com/user/password/reset")
+    print("and use email+password in this window. Google never sees that flow.")
     print()
 
     with sync_playwright() as p:
@@ -1911,9 +1968,7 @@ def cmd_login(args):
         # Prefer system Chrome (no download); fall back to bundled Chromium.
         for channel in ("chrome", "msedge", None):
             try:
-                kwargs = {"user_data_dir": str(profile_dir), "headless": False}
-                if channel:
-                    kwargs["channel"] = channel
+                kwargs = _build_launch_kwargs(kind, profile_dir, headless=False, channel=channel)
                 ctx = p.chromium.launch_persistent_context(**kwargs)
                 break
             except Exception:
@@ -1936,9 +1991,22 @@ def cmd_login(args):
         print("Waiting up to 5 minutes for you to log in. Will detect automatically; close the browser to abort.")
         deadline = time.time() + 300
         captured = None
+        google_blocked = False
         last_status = 0
         while time.time() < deadline:
             try:
+                # Detect Google's `disallowed_useragent` block page so we can
+                # surface a targeted recovery message instead of timing out
+                # silently. URLs to watch: `/signin/rejected`,
+                # `/disallowed_useragent`.
+                try:
+                    current_url = (page.url or "").lower()
+                    if "signin/rejected" in current_url or "disallowed_useragent" in current_url:
+                        google_blocked = True
+                        break
+                except Exception:
+                    pass
+
                 cookies = ctx.cookies("https://www.overleaf.com")
                 target = {c["name"]: c["value"] for c in cookies if "overleaf" in c.get("domain", "")}
                 if SESSION_COOKIE in target and _validate_cookies(target):
@@ -1957,6 +2025,27 @@ def cmd_login(args):
             ctx.close()
         except Exception:
             pass
+
+    if google_blocked:
+        print()
+        print("ERROR: Google blocked the sign-in with 'This browser or app may not be secure.'", file=sys.stderr)
+        print(file=sys.stderr)
+        print("This is Google's anti-automation gate, not an Overleaf issue. It fires against any", file=sys.stderr)
+        print("browser launched under remote-control protocols. The fix is to bypass Google entirely.", file=sys.stderr)
+        print(file=sys.stderr)
+        print("If your Overleaf account uses 'Sign in with Google':", file=sys.stderr)
+        print(file=sys.stderr)
+        print("  1. Visit  https://www.overleaf.com/user/password/reset", file=sys.stderr)
+        print("  2. Enter your account email. Overleaf will email you a password-set link.", file=sys.stderr)
+        print("  3. Set an Overleaf password. (Your Google sign-in still works in your normal", file=sys.stderr)
+        print("     browser; this just adds an alternate email+password login path.)", file=sys.stderr)
+        print("  4. Re-run `overleaf-sync-now login` and use email+password on the Overleaf form.", file=sys.stderr)
+        print("     Google never sees this flow and never blocks it.", file=sys.stderr)
+        print(file=sys.stderr)
+        print("Fallback if you can't change the account:", file=sys.stderr)
+        print("  Copy the `overleaf_session2` cookie from your normal browser's DevTools and run:", file=sys.stderr)
+        print("    overleaf-sync-now save-cookie \"<value>\"", file=sys.stderr)
+        sys.exit(1)
 
     if not captured:
         print("\nERROR: did not capture a valid Overleaf session cookie within 5 minutes.", file=sys.stderr)
@@ -2000,15 +2089,13 @@ def _try_login_profile():
         return None
     if _login_profile_in_cooldown():
         return None
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
+    sync_playwright, kind = _import_sync_playwright()
+    if sync_playwright is None:
         return None
     try:
         with sync_playwright() as p:
-            ctx = p.chromium.launch_persistent_context(
-                user_data_dir=str(profile_dir), headless=True
-            )
+            kwargs = _build_launch_kwargs(kind, profile_dir, headless=True, channel=None)
+            ctx = p.chromium.launch_persistent_context(**kwargs)
             try:
                 cookies = ctx.cookies("https://www.overleaf.com")
                 target = {c["name"]: c["value"] for c in cookies if "overleaf" in c.get("domain", "")}

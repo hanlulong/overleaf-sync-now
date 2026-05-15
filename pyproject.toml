@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "overleaf-sync-now"
-version = "0.3.1"
+version = "0.3.2"
 description = "Stops Claude Code and Codex CLI from silently overwriting Overleaf web edits with a stale local Dropbox copy. PreToolUse hook + CLI + agent skill that probes Overleaf's version history and refreshes local .tex/.bib files before every AI Read/Edit."
 readme = "README.md"
 # Old-form license metadata. Don't switch to PEP 639 SPDX (`license = "MIT"`
@@ -60,6 +60,14 @@ dependencies = [
     # tool venvs (which ship without pip and so can't lazy-install). The big
     # ~150MB Chromium download is still on-demand at first `login`.
     "playwright>=1.40",
+    # patchright is a maintained Playwright fork that patches the CDP
+    # Runtime.Enable leak and command-flag fingerprints that Google's
+    # `disallowed_useragent` gate detects. Same `sync_playwright` API, so the
+    # adapter in cli.py just prefers it when present. Vanilla playwright stays
+    # as a fallback. Conditional on Python >= 3.9 — patchright's wheel does
+    # not support 3.8, but the auth chain degrades gracefully to playwright
+    # for that minority install base.
+    "patchright>=1.40; python_version >= '3.9'",
 ]
 
 [project.urls]

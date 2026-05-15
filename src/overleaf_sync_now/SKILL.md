@@ -11,7 +11,7 @@ user-invocable: true
 
 If the user is on Windows with Chrome 130 or later, **logging into Overleaf in their daily browser will NOT fix auth failures.** Chrome 130 added App-Bound Encryption: the cookie database AES key is wrapped a second time with a key bound to `Chrome.exe` itself, brokered through Windows COM. Any process that isn't Chrome.exe (and isn't running as admin) can read the encrypted bytes but can't decrypt them. So `browser_cookie3` and `rookiepy` fail regardless of how recently the user logged in.
 
-**The proper fix is `overleaf-sync-now login`.** It launches a controlled browser (Playwright-managed Chromium), the user logs in there once, and we read the cookie via Chrome DevTools Protocol — which returns plaintext because the request comes from inside the browser. The login persists in our profile for weeks.
+**The proper fix is `overleaf-sync-now login`.** It launches a controlled browser (patchright-managed Chromium since 0.3.2; vanilla Playwright fallback), the user logs in there once, and we read the cookie via Chrome DevTools Protocol — which returns plaintext because the request comes from inside the browser. The login persists in our profile for weeks.
 
 ## The problem
 
@@ -47,6 +47,17 @@ When `setup` reports "AUTO-DETECT FAILED" or `sync` returns a "No valid Overleaf
 4. After they confirm login finished, run `overleaf-sync-now status` to verify, then retry the original sync.
 
 **Fallback for environments where `login` can't run** (no display, server, etc.): `save-cookie <value>`. Ask the user to copy their `overleaf_session2` value from F12 → Application → Cookies → overleaf.com, then run `overleaf-sync-now save-cookie "<value>"`. Don't rely on this when `login` is available — `login` is more reliable.
+
+### If Google blocks the `login` browser ("This browser or app may not be secure")
+
+If the user signs into Overleaf via **"Sign in with Google"** and the managed `login` browser hits Google's *"This browser or app may not be secure"* page, that's Google's anti-automation gate (`disallowed_useragent`). The `login` command since 0.3.2 detects this and prints a tailored recovery message. The supported escape hatch is to give the user's Overleaf account an email+password alternate login:
+
+1. Open https://www.overleaf.com/user/password/reset in any normal browser.
+2. Enter the Overleaf account email; Overleaf emails a password-set link.
+3. Set a password (their Google sign-in still works elsewhere; this just adds email+password).
+4. Re-run `overleaf-sync-now login` and use **email+password** in the Overleaf form. Google never sees this flow.
+
+Or fall back to `save-cookie` paste. **Do not** suggest fighting Google's detection further — patchright already does the best-available stealth, and Google iterates against bypasses.
 
 ## Subcommands
 

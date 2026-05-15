@@ -2,6 +2,63 @@
 
 All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://semver.org/).
 
+## 0.3.2 — 2026-05-15
+
+Patch release. Addresses the `overleaf-sync-now login` flow getting blocked
+by Google's *"This browser or app may not be secure"* page when the user's
+Overleaf account is registered via "Sign in with Google."
+
+**Cause.** Google's `disallowed_useragent` gate detects automated browsers
+through multiple signals; the dominant one in late 2025 is the CDP
+`Runtime.Enable` leak that Playwright triggers when it attaches. Stripping
+`--enable-automation` and patching `navigator.webdriver` (the classic
+"stealth" recipe) doesn't address that leak, so the same Playwright code
+that worked in 2024 fails in 2025-2026.
+
+**Fix.**
+
+1. **Preferred launch backend: [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python).**
+   patchright is a maintained Playwright fork that patches the
+   `Runtime.Enable` / `Console.Enable` CDP leaks and the command-flag
+   fingerprint set. Same `sync_playwright` API, drop-in. Added as a
+   conditional dep (`python_version >= '3.9'`; patchright's wheel doesn't
+   support 3.8). Vanilla Playwright stays as a fallback for 3.8 installs
+   and for environments where the patchright wheel isn't available. A new
+   `_import_sync_playwright()` adapter picks whichever is loaded. When
+   falling back to vanilla Playwright the launch call still passes
+   `ignore_default_args=["--enable-automation"]` + the
+   `AutomationControlled` blink flag as a best-effort baseline.
+2. **Google-block detector.** `cmd_login`'s wait loop watches `page.url`
+   for `signin/rejected` / `disallowed_useragent`. On hit, it skips the
+   5-minute cookie-detection timeout and prints a tailored recovery
+   message pointing the user at
+   `https://www.overleaf.com/user/password/reset` — the official Overleaf
+   workaround for accounts originally registered via Google, ORCID, or
+   Twitter. After setting an Overleaf-specific password, re-running
+   `login` and using email+password sidesteps Google entirely.
+3. **Docs.** `docs/authentication.md` adds a new section on the Google
+   block and the password escape hatch. `docs/troubleshooting.md` adds a
+   row for the symptom. `SKILL.md` adds a sub-section to the auth-failure
+   recovery flow so the AI playbook tells the user the right thing
+   instead of looping on `login` retries.
+
+**Caveats.**
+
+- patchright improves the odds Google's gate doesn't fire, but it's not a
+  guarantee — Google iterates against bypasses. The password-reset path
+  is the permanently stable workaround for Google-SSO users; everything
+  else is best-effort.
+- Disk: after upgrading, existing installs may briefly hold both
+  Playwright's and patchright's ~150 MB Chromium binaries (separate
+  caches). The old Playwright Chromium goes unused but isn't auto-removed
+  — it may still be in use by other Playwright-based projects on the
+  same machine.
+- Org/enterprise SSO accounts (Overleaf for Education / SAML / Shibboleth)
+  can't use the password-reset path; their fallback is `save-cookie`.
+  Not addressed in this release.
+
+No CLI surface change. No data format change. Drop-in upgrade.
+
 ## 0.3.1 — 2026-04-26
 
 Patch release. Three fixes uncovered by post-0.3.0 testing and code review.

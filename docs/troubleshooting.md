@@ -3,6 +3,7 @@
 | Symptom | Fix |
 |---|---|
 | `No valid Overleaf cookies` | Run `overleaf-sync-now doctor` to see which auth source failed. On Chrome 130+ Windows, run `overleaf-sync-now login`. Otherwise, log into overleaf.com in any [supported browser](authentication.md#auth-chain). |
+| `login` shows *"This browser or app may not be secure"* (Google sign-in) | Google's anti-automation gate is rejecting the managed browser. Bypass it by setting an Overleaf-specific password at https://www.overleaf.com/user/password/reset, then re-run `overleaf-sync-now login` and use email+password (Google never sees that flow). See [authentication → Google block](authentication.md#what-if-google-blocks-the-sign-in). |
 | `[overleaf-sync-now] Overleaf cookies invalid. Re-auth ...` (Claude blocked the edit) | Same as above. After re-auth, retry the edit. |
 | `Outbound HTTPS to Overleaf was blocked by the host environment ...` | The shell is sandboxed (Codex CLI, some CI runners) and blocked the socket. Auth is fine. Approve the `overleaf-sync-now` command prefix in your sandbox policy, or re-run from an unsandboxed shell. **Don't** run `setup`/`login`/`doctor` — they'll hit the same block. |
 | `status` reports `Cookie auth: UNKNOWN — outbound HTTPS is blocked` | Same as above — sandbox / firewall is blocking. |
