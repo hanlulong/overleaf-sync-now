@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }} / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        # Full version sweep on Linux — the requires-python >=3.8 claim and the
+        # marker gymnastics (playwright <1.49 vs >=1.49, rookiepy/patchright
+        # python_version + platform markers) only get exercised by a real
+        # multi-version install.
+        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
+        include:
+          # The tool is developed on Windows and macOS/Linux are under-tested;
+          # smoke the install + suite on each at one version.
+          - os: windows-latest
+            python-version: '3.12'
+          - os: macos-latest
+            python-version: '3.12'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # Editable install pulls the runtime deps so `import overleaf_sync_now`
+      # (which imports requests transitively) works — bare `unittest` would
+      # fail with ModuleNotFoundError otherwise. No browser binary is needed:
+      # the suite monkeypatches every network/cookie path.
+      - name: Install (editable, with deps)
+        run: python -m pip install -e .
+      - name: Run unit tests
+        run: python -m unittest discover tests -v
+
+  build:
+    name: build & metadata check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install build twine
+      # Validates the dynamic-version wiring ([tool.setuptools.dynamic] attr)
+      # and the SKILL.md package-data inclusion before a release tag.
+      - run: python -m build
+      - run: python -m twine check dist/*

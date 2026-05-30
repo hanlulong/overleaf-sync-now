@@ -31,7 +31,7 @@ Overleaf's Dropbox bridge polls in one direction (Overleaf → Dropbox) every 10
 
 ## Auth — DO NOT ask the user which method to use
 
-The script handles auth itself. It tries (in this exact order, automatically): cached cookies → `rookiepy` (Chrome 127+ friendly) → `browser_cookie3` → Claude Code's Playwright profile → manual paste prompt.
+The script handles auth itself. It tries (in this exact order, automatically): cached cookies → persistent `login` browser profile → `rookiepy` (Chrome 127+ friendly) → `browser_cookie3` → Claude Code's Playwright MCP profile → manual paste prompt.
 
 **Just run `overleaf-sync-now setup` (or `install`).** Do not ask the user "do you want auto-detect or manual paste?" — the script picks the best available source.
 
@@ -78,7 +78,7 @@ Refresh the project that owns `folder` (or current dir) against Overleaf.
 - Probes `/project/<id>/updates`; skips if no change or if all new updates are Dropbox-origin round-trips of our own saves; otherwise downloads the zip and extracts only the files whose web-origin updates aren't yet on local.
 - `--force`: always download the zip and re-extract. Hash-compare still skips files whose bytes already match local. Also disables the 30-second recent-mtime guard (see below).
 
-Data-safety: by default, `sync` refuses to overwrite a local file modified within the last 30 seconds, and prints `SKIP <path>` to stderr. This protects an in-progress local save that hasn't yet propagated Dropbox → Overleaf. Pass `--force` to override.
+Data-safety: by default, `sync` refuses to overwrite a local file modified within the last 30 seconds, and prints `SKIP <path>` to stderr. This protects an in-progress local save that hasn't yet propagated Dropbox → Overleaf. When a protected file *also* had a web-origin change in the pulled zip, `sync` does **not** advance the cached version — it reports `version held at <toV>` and re-offers that web change on the next sync (once the local file ages out of the 30 s window), so the web edit is never silently dropped. Pass `--force` to overwrite local with the Overleaf copy immediately.
 
 When to invoke: manually when the user says "pull latest from Overleaf," or automatically before editing in Codex CLI (PreToolUse hooks aren't reliable on Windows in Codex).
 
@@ -125,10 +125,15 @@ When you see that message (or any of the above errno markers):
 
 ## Failure modes & recovery
 
-- **"No valid Overleaf cookies found. Run setup"**: cookies expired or never set. Run `overleaf-sync-now setup`. The chain will try cached → browsers → Playwright; falls through to manual paste in interactive mode.
-- **`setup` can't find browser cookies**: user may not be logged into overleaf.com in Chrome/Edge/Firefox. Either log in there, or paste cookie manually when prompted.
+- **`No valid Overleaf cookies (cache: <path>)`**: cookies expired or never set. **In the Claude Code hook this now BLOCKS the edit (exit 2)** so the AI re-auths instead of editing a possibly-stale copy. Recovery: run `overleaf-sync-now doctor` to confirm which sources failed, then `overleaf-sync-now login` (browser-assisted; works on Chrome 130+ Windows). Fallback: `overleaf-sync-now save-cookie "<value>"`. Do **not** rely on `setup` here — in non-interactive/agent context it only retries auto-detect and returns `AUTO-DETECT FAILED` without capturing a cookie.
+- **`setup` can't find browser cookies**: user may not be logged into overleaf.com in Chrome/Edge/Firefox. Use `overleaf-sync-now login` (the reliable path), or paste a cookie via `save-cookie`.
 - **Auto-link can't find the project**: folder name doesn't match Overleaf project name. Use `link <project_id> .` inside the folder.
 
 ## Security note
 
-Cached cookies grant full access to the user's Overleaf account. Stored at `~/.overleaf-sync/cookies.json` with default user permissions. Don't commit, don't share.
+Cached cookies grant full access to the user's Overleaf account. Two sensitive stores live under the data dir (`~/.overleaf-sync/` by default; legacy `~/.claude/overleaf-data/`):
+
+- `cookies.json` — the cached session, written `0600` on POSIX (user-only).
+- `browser-profile/` — created by `overleaf-sync-now login`; holds a **live, weeks-long Overleaf session** that grants the same full account access.
+
+Since 0.4.0 the data dir itself is `0700` on POSIX so neither is reachable by other local users. To scrub credentials (sharing a home dir, decommissioning a machine, after a suspected compromise), delete the **whole** data dir, not just `cookies.json`. Don't commit, don't share. (On Windows, ACL inheritance from the parent directory is the relevant control.)

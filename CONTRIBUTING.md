@@ -29,17 +29,17 @@ uv tool install --reinstall --from . overleaf-sync-now
 
 ## Running the unit tests
 
-The project has a small unit test suite under `tests/` covering the project resolver, marker handling, atomic write concurrency, and POSIX file perms. No external dependencies — just `unittest`:
+The unit test suite under `tests/` covers the project resolver, marker handling, atomic-write concurrency, POSIX file perms, the version-match refresh decision, the zip-slip + recent-mtime guards in `_extract_files`, the `cmd_hook` exit-code contract, `get_session` auth/retry behavior, and `save-cookie` normalization. No external dependencies — just `unittest` (HTTP/cookie paths are monkeypatched):
 
 ```bash
 python -m unittest discover tests
 ```
 
-Tests must pass before opening a PR. Anything touching `_atomic_write_text`, `_extract_files`, the resolver (`_resolve_by_name`, `_autolink_resolve`, `_disambiguate_by_fingerprint`), or the index format should add a test.
+Tests must pass before opening a PR; CI (`.github/workflows/ci.yml`) runs them across Python 3.8–3.13. Anything touching `_atomic_write_text`, `_extract_files`, the resolver (`_resolve_by_name`, `_autolink_resolve`, `_disambiguate_by_fingerprint`), `refresh_project`, `cmd_hook`, the install/uninstall hook surgery, or the index format should add a test.
 
 ## Style
 
-- Python 3.8+ compatible. Avoid 3.10+ syntax (`match`, `|` type unions, etc.).
+- Python 3.8+ compatible. Avoid 3.9+ syntax/stdlib (`match`, `|` type unions, `str.removeprefix`/`removesuffix`, `Path.is_relative_to` without a 3.8 fallback, etc.).
 - Standard library where possible. New runtime deps need a justification in the PR.
 - Errors raised by `refresh_project` / `fetch_updates` / `download_zip` should be one of: `AuthExpired`, `RateLimited`, or a `RuntimeError` with a user-actionable message including the path / URL / next step.
 - Anything written to disk should go through `_atomic_write_text` (writes to `.tmp` + `os.replace`) — particularly `~/.claude/settings.json`.
@@ -50,7 +50,7 @@ Tests must pass before opening a PR. Anything touching `_atomic_write_text`, `_e
 
 | Area | Why |
 |---|---|
-| macOS / Linux end-to-end testing | Developed on Windows. CI verifies install + smoke tests but no real Overleaf round-trip. |
+| macOS / Linux end-to-end testing | Developed on Windows. CI runs the install + unit-test matrix on Linux/macOS/Windows, but there's no real Overleaf round-trip (the suite is hermetic). |
 | Self-hosted Overleaf / Server Pro | The `BASE` URL is hardcoded to `https://www.overleaf.com`. Needs a `--base-url` (or env var) and a way to flow it through every HTTP call. |
 | Background poller | A daemon mode that polls Overleaf periodically and triggers Dropbox sync, for users who want fresh files without an active AI session. |
 | PyPI publishing | Currently install is git-only. PyPI makes `pip install overleaf-sync-now` work for users who don't want `uv`. |
@@ -63,12 +63,12 @@ Tests must pass before opening a PR. Anything touching `_atomic_write_text`, `_e
 Small focused PRs are easier to review than large ones. If you're touching the auth chain or the install logic, please:
 
 1. Run `overleaf-sync-now doctor` before and after your change and paste both outputs in the PR.
-2. Bump the version in `pyproject.toml` and `src/overleaf_sync_now/__init__.py`.
+2. Bump `__version__` in `src/overleaf_sync_now/__init__.py` — the single source of truth; `pyproject.toml` derives its version from it via `[tool.setuptools.dynamic]`. Also bump `CITATION.cff` (a test pins the two together).
 3. Add a CHANGELOG.md entry under a new version header.
 
 ## Releasing (maintainers)
 
-1. Update version in `pyproject.toml` + `src/overleaf_sync_now/__init__.py`.
+1. Bump `__version__` in `src/overleaf_sync_now/__init__.py` (single source) and the `version`/`date-released` in `CITATION.cff`.
 2. Update CHANGELOG.md with the date.
 3. `git tag v<version> && git push --tags`.
-4. CI runs the matrix; users get the new version with `uv tool install --reinstall --refresh`.
+4. CI runs the test + build matrix; users get the new version with `uv tool install --reinstall --refresh`.

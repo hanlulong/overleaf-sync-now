@@ -2,6 +2,7 @@
 
 > **Stops Claude Code and Codex CLI from silently overwriting your Overleaf web edits with a stale local Dropbox copy.**
 
+[![CI](https://github.com/hanlulong/overleaf-sync-now/actions/workflows/ci.yml/badge.svg)](https://github.com/hanlulong/overleaf-sync-now/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 [![Install: uv](https://img.shields.io/badge/install-uv-orange.svg)](https://github.com/astral-sh/uv)

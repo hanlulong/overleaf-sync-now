@@ -8,7 +8,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "overleaf-sync-now"
-version = "0.3.2"
+# Version is single-sourced from src/overleaf_sync_now/__init__.py::__version__
+# (see [tool.setuptools.dynamic] below) so it can never drift from the runtime
+# `--version` string. Bump __version__ there on release.
+dynamic = ["version"]
 description = "Stops Claude Code and Codex CLI from silently overwriting Overleaf web edits with a stale local Dropbox copy. PreToolUse hook + CLI + agent skill that probes Overleaf's version history and refreshes local .tex/.bib files before every AI Read/Edit."
 readme = "README.md"
 # Old-form license metadata. Don't switch to PEP 639 SPDX (`license = "MIT"`
@@ -58,8 +61,12 @@ dependencies = [
     "rookiepy>=0.5; python_version < '3.13' and platform_system != 'Linux'",
     # Bundled (small, ~10MB) so `overleaf-sync-now login` works in uv-managed
     # tool venvs (which ship without pip and so can't lazy-install). The big
-    # ~150MB Chromium download is still on-demand at first `login`.
-    "playwright>=1.40",
+    # ~150MB Chromium download is still on-demand at first `login`. playwright
+    # dropped Python 3.8 at 1.49.0, so pin a 3.8-compatible range there and
+    # let 3.9+ take a current build — keeping the marker-per-dep convention the
+    # rest of this table uses, rather than leaving 3.8 resolution to backtracking.
+    "playwright>=1.40,<1.49; python_version < '3.9'",
+    "playwright>=1.49; python_version >= '3.9'",
     # patchright is a maintained Playwright fork that patches the CDP
     # Runtime.Enable leak and command-flag fingerprints that Google's
     # `disallowed_useragent` gate detects. Same `sync_playwright` API, so the
@@ -79,6 +86,9 @@ Publisher = "https://openecon.ai/"
 
 [project.scripts]
 overleaf-sync-now = "overleaf_sync_now.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "overleaf_sync_now.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]

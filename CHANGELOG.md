@@ -2,6 +2,86 @@
 
 All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://semver.org/).
 
+## 0.4.0 — 2026-05-30
+
+Hardening release from a deep multi-dimension audit. Closes the two
+data-safety holes where the tool could fail *open* — silently letting the AI
+edit a stale local copy, the exact scenario it exists to prevent — plus
+network resilience, credential-storage, and packaging fixes.
+
+### Fixed — data safety (the core guarantee)
+
+1. **Missing/expired cookies now BLOCK the edit instead of passing it
+   through.** Previously, only an HTTP 401/403 at request time raised
+   `AuthExpired` (which the PreToolUse hook blocks on, exit 2). The far more
+   common case — cookies expired, deleted, or never set — failed earlier in
+   `get_session()` with a *plain* `RuntimeError`, which the hook's generic
+   handler caught, marked-synced, and exited 0 on. So the routine reason sync
+   stops working (an expired session) let the AI edit a possibly-stale copy
+   and overwrite web edits on the next Dropbox round-trip. `get_session()` now
+   raises `AuthExpired` for the genuine no-/expired-cookie case, so the hook
+   blocks and the agent re-auths. A sandbox/socket block still raises a plain
+   `RuntimeError` and passes through (auth is fine there; see 0.1.x). This also
+   removes the misleading "will retry after debounce" message on that path
+   (re-auth is required, not a wait).
+
+2. **A protected (recently-modified) file no longer strands a web edit.**
+   `refresh_project` advanced the cached `toV` unconditionally after
+   extraction — even when a file was *skipped* by the 30 s recent-mtime guard.
+   The cheap-probe gate (`latest_toV == cached_toV → no_change`) then
+   short-circuited every future sync, so a genuine web-origin change to a
+   file that happened to have a fresh local mtime was tracked as "synced" and
+   never re-pulled. The version is now advanced **only when `n_protected ==
+   0`**; otherwise it is held at the cached value and the pending web change
+   is re-offered on the next sync (status reports `version held at <toV>`).
+
+### Fixed — resilience & security
+
+3. **Bounded retry on transient upstream 5xx.** `get_session()` now mounts a
+   `urllib3` `Retry` (total 3, `status_forcelist` 502/503/504, GET only,
+   `raise_on_status=False`) so a momentary Overleaf/CDN hiccup during a deploy
+   no longer aborts the refresh (and, in the hook, lets a stale edit through).
+
+4. **Data dir hardened to `0700` on POSIX.** The `0600` on `cookies.json`
+   didn't cover the persistent `login` browser profile (Chromium-written,
+   holding a weeks-long session) sitting in a world-traversable `0755` data
+   dir. The data dir is now `chmod 0700` on write, and `login` also tightens
+   the profile dir. On Windows, parent-directory ACL inheritance applies.
+
+### Fixed — packaging & docs
+
+5. **Version single-sourced.** `__init__.__version__` had drifted to `0.3.1`
+   while the package shipped `0.3.2`, so `--version` lied. `pyproject.toml`
+   now derives the version from `__init__.__version__` via
+   `[tool.setuptools.dynamic]`; bump `__init__.py` (and `CITATION.cff`) on
+   release. A test pins the three together.
+6. **`playwright` Python-3.8 marker made explicit** (`<1.49` on 3.8, `>=1.49`
+   on 3.9+), matching the per-dependency markering the rest of the table uses
+   instead of leaving 3.8 resolution to resolver backtracking.
+7. **Docs corrected:** SKILL.md auth-chain order now lists the `login` profile
+   (step 2); the failure-mode bullet quotes the real `No valid Overleaf
+   cookies` message and points to `login`/`save-cookie` (not `setup`); the
+   data-safety paragraph documents the new version-hold; the security note
+   lists the browser profile and the `0600`/`0700` perms. `authentication.md`
+   and `troubleshooting.md` no longer hardcode the legacy
+   `~/.claude/overleaf-data/` path as canonical.
+8. **`doctor` now probes the same browser set as the live auth chain.** The
+   browser-backend list was duplicated across four sites and had drifted —
+   `doctor`'s rookiepy probe silently skipped Opera/LibreWolf. It is now a
+   single `CHROMIUM_COOKIE_FNS` constant, so diagnostics match reality.
+
+### Tests
+
+Added `tests/test_review_fixes.py` (45 tests) covering the version-match
+decision matrix and the new protected-file version hold, the zip-slip
+containment guard and the recent-mtime protect window, `cmd_hook`'s exit-code
+contract, `get_session` auth/sandbox/retry behavior, `find_linked_folder`
+walk + shared-level skip + auto-link dispatch, `save-cookie` normalization,
+the `0700` data-dir hardening, `install`/`uninstall` settings.json hook
+surgery (`_is_our_hook` + idempotency), and version single-sourcing. Suite:
+77 tests. Added `.github/workflows/ci.yml` running them across Python
+3.8–3.13 (plus a build + `twine check` job).
+
 ## 0.3.2 — 2026-05-15
 
 Patch release. Addresses the `overleaf-sync-now login` flow getting blocked

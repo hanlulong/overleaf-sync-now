@@ -6,7 +6,7 @@
 
 | # | Source | Notes |
 |---|---|---|
-| 1 | **Cached cookie** (`~/.claude/overleaf-data/cookies.json`) | After first successful auth. Validated against Overleaf on every use. |
+| 1 | **Cached cookie** (`<DATA_DIR>/cookies.json` — default `~/.overleaf-sync/cookies.json`; legacy `~/.claude/overleaf-data/cookies.json`) | After first successful auth. Validated against Overleaf on every use. Run `overleaf-sync-now status` to see the resolved data dir. |
 | 2 | **Browser via `login` profile** | Persistent patchright/Playwright-managed Chromium (patchright preferred since 0.3.2; vanilla Playwright fallback). Created by `overleaf-sync-now login`. **The proper fix for Chrome 130+ Windows.** |
 | 3 | **`rookiepy`** | Rust cookie reader; handles Chrome 127–129 better than `browser_cookie3`. Still defeated by Chrome 130+ App-Bound Encryption. |
 | 4 | **`browser_cookie3`** | Chrome / Edge / Firefox / Brave / Vivaldi / Opera / Chromium / LibreWolf via DPAPI. Defeated by Chrome 127+ on Windows without admin. |

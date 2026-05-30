@@ -2,7 +2,7 @@
 
 | Symptom | Fix |
 |---|---|
-| `No valid Overleaf cookies` | Run `overleaf-sync-now doctor` to see which auth source failed. On Chrome 130+ Windows, run `overleaf-sync-now login`. Otherwise, log into overleaf.com in any [supported browser](authentication.md#auth-chain). |
+| `No valid Overleaf cookies` | Cookies expired or never set. **In the Claude Code hook this blocks the edit (exit 2)** so the AI re-auths rather than editing a stale copy. Run `overleaf-sync-now doctor` to see which auth source failed, then `overleaf-sync-now login` (works on Chrome 130+ Windows); fallback `overleaf-sync-now save-cookie "<value>"`. `setup` won't help in non-interactive/agent context — it only retries auto-detect. |
 | `login` shows *"This browser or app may not be secure"* (Google sign-in) | Google's anti-automation gate is rejecting the managed browser. Bypass it by setting an Overleaf-specific password at https://www.overleaf.com/user/password/reset, then re-run `overleaf-sync-now login` and use email+password (Google never sees that flow). See [authentication → Google block](authentication.md#what-if-google-blocks-the-sign-in). |
 | `[overleaf-sync-now] Overleaf cookies invalid. Re-auth ...` (Claude blocked the edit) | Same as above. After re-auth, retry the edit. |
 | `Outbound HTTPS to Overleaf was blocked by the host environment ...` | The shell is sandboxed (Codex CLI, some CI runners) and blocked the socket. Auth is fine. Approve the `overleaf-sync-now` command prefix in your sandbox policy, or re-run from an unsandboxed shell. **Don't** run `setup`/`login`/`doctor` — they'll hit the same block. |
@@ -22,7 +22,7 @@
 | Self-hosted Overleaf / Server Pro | Not supported. The tool hardcodes `https://www.overleaf.com`. PRs welcome to add a `--base-url` option. |
 | Multiple Overleaf accounts | The cache holds one session at a time. See [operations → multiple accounts](operations.md#multiple-overleaf-accounts). |
 | WSL + Claude Code on Windows | The CLI only sees its own filesystem. Claude Code on Windows (Win paths) won't find a tool installed inside WSL (Linux paths) and vice versa. Install in whichever environment runs your AI agent. |
-| Cookies cache file is corrupt | Tool prints a warning and falls through the auth chain. Delete `~/.claude/overleaf-data/cookies.json` to reset. |
+| Cookies cache file is corrupt | Tool prints a warning and falls through the auth chain. Delete `<DATA_DIR>/cookies.json` to reset (run `overleaf-sync-now status` to see the resolved data dir — default `~/.overleaf-sync/`, legacy `~/.claude/overleaf-data/`). |
 
 ## Diagnostic commands
 

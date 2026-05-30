@@ -82,6 +82,13 @@ PROJECT_MARKER = ".overleaf-project"
 DEBOUNCE_SECONDS = 30
 BASE = "https://www.overleaf.com"
 SESSION_COOKIE = "overleaf_session2"
+# Chromium-family + Firefox cookie backends to probe, in priority order, for
+# both rookiepy and browser_cookie3. Single source of truth so the live auth
+# chain and the `doctor` diagnostics probe the SAME set — they had drifted
+# (doctor's rookiepy block silently omitted opera/librewolf).
+CHROMIUM_COOKIE_FNS = (
+    "chrome", "edge", "brave", "vivaldi", "chromium", "opera", "firefox", "librewolf",
+)
 # Layer 6b: how many recent dropbox-origin update entries to use as a
 # fingerprint of "this project is the local folder". Bounded to keep the
 # extra stat() calls negligible on a Dropbox folder (which can be slow).
@@ -153,12 +160,16 @@ def _atomic_write_text(path, text):
         # Restrict perms BEFORE the atomic replace so the target file never
         # exists with permissive perms — even briefly. POSIX-only; on Windows
         # ACL inheritance from the parent dir is the relevant control.
-        if os.name == "posix":
+        if os.name == "posix" and _is_under_data_dir(path):
             try:
-                if _is_under_data_dir(path):
-                    os.chmod(tmp, 0o600)
+                os.chmod(tmp, 0o600)
             except OSError:
                 pass
+            # Tighten the data dir itself so the persistent login browser
+            # profile (Chromium-written, never chmod'd by us) and every other
+            # secret under it are unreachable by other local users. Idempotent
+            # and cheap; covers fresh installs where this write created the dir.
+            _harden_dir(CACHE_DIR)
         _replace_with_retry(tmp, path)
     except Exception:
         # Best-effort cleanup of the tmp file if anything between open and
@@ -191,6 +202,24 @@ def _is_under_data_dir(path):
                 return False
     except OSError:
         return False
+
+
+def _harden_dir(path):
+    """Best-effort: make a directory user-private (0o700) on POSIX.
+
+    The 0o600 on cookies.json only protects files this module writes. The
+    persistent `login` browser profile under CACHE_DIR/browser-profile/ holds
+    an equally-sensitive, weeks-long Overleaf session but is written by
+    Chromium and never chmod'd by us. Tightening the data dir itself to 0o700
+    stops another local user (shared workstation, lab box, CI runner) from
+    traversing a world-readable parent to reach it. No-op on Windows, where
+    ACL inheritance from the parent is the relevant control."""
+    if os.name != "posix":
+        return
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
 
 
 def _save_cache(cookies):
@@ -271,7 +300,7 @@ def _try_rookiepy():
         import rookiepy
     except ImportError:
         return None
-    for fn_name in ("chrome", "edge", "brave", "vivaldi", "chromium", "opera", "firefox", "librewolf", "load"):
+    for fn_name in (*CHROMIUM_COOKIE_FNS, "load"):
         try:
             fn = getattr(rookiepy, fn_name, None)
             if not fn:
@@ -290,7 +319,7 @@ def _try_browser_cookie3():
         import browser_cookie3
     except ImportError:
         return None
-    for fn_name in ("chrome", "edge", "brave", "vivaldi", "chromium", "opera", "firefox", "librewolf"):
+    for fn_name in CHROMIUM_COOKIE_FNS:
         try:
             fn = getattr(browser_cookie3, fn_name, None)
             if not fn:
@@ -399,6 +428,38 @@ def _prompt_manual_cookie():
 
 # -------- network --------
 
+def _mount_retries(session):
+    """Mount a bounded retry for idempotent GETs so a transient upstream 5xx
+    (502/503/504 — common from Overleaf's CDN/LB during deploys or under
+    zip-build load) or a connect/read blip doesn't fail the whole refresh.
+    Without this, a single momentary 5xx in the PreToolUse hook is swallowed
+    and the AI edits a stale local copy — the exact failure this tool prevents.
+
+    Only GET is retried (all our Overleaf calls are reads). raise_on_status is
+    False so that after retries are exhausted the response flows back to our
+    own status-code handling (which produces clean, actionable messages)
+    rather than urllib3's MaxRetryError. Best-effort: if the urllib3/requests
+    internals ever move, we degrade to no-retry rather than crash."""
+    try:
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+    except Exception:
+        return
+    try:
+        retry = Retry(
+            total=3, connect=3, read=2, backoff_factor=0.5,
+            status_forcelist=(502, 503, 504),
+            allowed_methods=frozenset(["GET"]),
+            raise_on_status=False,
+        )
+    except TypeError:
+        # Very old urllib3 used method_whitelist instead of allowed_methods.
+        retry = Retry(total=3, backoff_factor=0.5, status_forcelist=(502, 503, 504))
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+
 def get_session(force_refresh=False):
     import requests
     cookies = None if force_refresh else _load_cache()
@@ -415,7 +476,14 @@ def get_session(force_refresh=False):
             except requests.exceptions.RequestException as probe_e:
                 if _is_sandbox_block(probe_e):
                     raise RuntimeError(_SANDBOX_HINT) from probe_e
-        raise RuntimeError(
+        # Genuine missing/expired-cookie case (a sandbox block already
+        # returned above). Raise AuthExpired, NOT a plain RuntimeError: the
+        # PreToolUse hook blocks the edit (exit 2) on AuthExpired so the AI
+        # re-auths instead of silently editing a possibly-stale local copy —
+        # the precise data-loss this tool exists to prevent. A plain
+        # RuntimeError here would fall through to the hook's generic handler,
+        # which marks-synced and exits 0, passing the stale edit through.
+        raise AuthExpired(
             f"No valid Overleaf cookies (cache: {CACHE_FILE}).\n"
             f"\n"
             f"AGENT RECOVERY (do this — do NOT just tell the user 'log in'; on Windows + Chrome 130+ the browser has the cookie but app-bound encryption blocks our extractor):\n"
@@ -427,6 +495,7 @@ def get_session(force_refresh=False):
         )
     s = requests.Session()
     s.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+    _mount_retries(s)
     for name, value in cookies.items():
         s.cookies.set(name, value, domain=".overleaf.com")
     return s
@@ -628,12 +697,30 @@ def refresh_project(project_id, folder, *, force=False):
     n_written, n_unchanged, n_protected = _extract_files(
         zip_bytes, folder, need_paths, protect_recent_seconds=protect
     )
-    versions[project_id] = latest_toV
-    _save_versions(versions)
+    # Only advance the cached version when EVERY web-origin change actually
+    # landed locally. If a file was protected (skipped because the local copy
+    # was modified within the protect window), do NOT claim we're synced to
+    # latest_toV: the cheap-probe gate above (latest_toV == cached_toV ->
+    # "no_change") would then short-circuit every future sync and the pending
+    # web edit would be stranded permanently — the exact silent-staleness this
+    # tool exists to prevent. Holding cached_toV makes the next sync re-pull it
+    # once the local mtime ages out of the protect window (or the user runs
+    # --force). force never protect-skips (protect=0), so it always advances;
+    # an already-written file hits the byte-equal short-circuit on re-pull and
+    # is counted unchanged, so re-fetching the whole batch is cheap and safe.
+    if n_protected == 0:
+        versions[project_id] = latest_toV
+        _save_versions(versions)
     label = "bootstrap" if bootstrap else ("forced" if force else "refreshed")
-    parts = [f"toV -> {latest_toV}", f"wrote {n_written}", f"unchanged {n_unchanged}"]
-    if n_protected:
-        parts.append(f"protected {n_protected} (recent local edits; pass --force to override)")
+    if n_protected == 0:
+        parts = [f"toV -> {latest_toV}", f"wrote {n_written}", f"unchanged {n_unchanged}"]
+    else:
+        held = cached_toV if cached_toV is not None else "unsynced"
+        parts = [
+            f"wrote {n_written}", f"unchanged {n_unchanged}",
+            f"protected {n_protected} (recent local edits; version held at {held} so the "
+            f"pending web change is re-offered on the next sync — pass --force to pull it now)",
+        ]
     return f"{label} (" + ", ".join(parts) + ")"
 
 
@@ -1952,6 +2039,11 @@ def cmd_login(args):
 
     profile_dir = CACHE_DIR / "browser-profile"
     profile_dir.mkdir(parents=True, exist_ok=True)
+    # This profile will hold a live, weeks-long Overleaf session. Make both the
+    # data dir and the profile dir user-private so it isn't reachable by other
+    # local users (Chromium won't do this for us).
+    _harden_dir(CACHE_DIR)
+    _harden_dir(profile_dir)
 
     print()
     print(f"Opening a browser window (backend: {kind}). Log into https://www.overleaf.com when it appears.")
@@ -2193,7 +2285,7 @@ def cmd_doctor(args):
     try:
         import rookiepy
         print(f"[2a] rookiepy: installed")
-        for fn_name in ("chrome", "edge", "brave", "vivaldi", "chromium", "firefox"):
+        for fn_name in CHROMIUM_COOKIE_FNS:
             fn = getattr(rookiepy, fn_name, None)
             if not fn:
                 continue
@@ -2213,7 +2305,7 @@ def cmd_doctor(args):
     try:
         import browser_cookie3
         print(f"[2b] browser_cookie3: installed (v{getattr(browser_cookie3, '__version__', '?')})")
-        for fn_name in ("chrome", "edge", "brave", "vivaldi", "chromium", "opera", "firefox", "librewolf"):
+        for fn_name in CHROMIUM_COOKIE_FNS:
             fn = getattr(browser_cookie3, fn_name, None)
             if not fn:
                 print(f"    {fn_name:10s}: function not exported")
