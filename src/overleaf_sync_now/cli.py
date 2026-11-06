@@ -10,21 +10,24 @@ Subcommands:
                                 (or piped on stdin with `-`). Headless fallback only; the
                                 user runs it in their own terminal, never via an agent.
   link <project_id> [folder]    Mark a folder as belonging to an Overleaf project (override)
-  sync [folder] [--force]       Refresh the linked folder against Overleaf. Probes
+  sync [folder] [--force] [--wait]
+                                Refresh the linked folder against Overleaf. Probes
                                 /project/<id>/updates and downloads the zip only when
                                 a web-origin change has actually happened. --force always
-                                re-extracts.
+                                re-extracts. --wait waits (up to 2 min) for files saved
+                                locally in the last 30 s to age out, then pulls them.
   status [folder]               Show data dir, cookie validity, and link/sync state
   projects [--refresh]          List your Overleaf projects (name + ID)
-  doctor                        Verbose diagnostic dump of the auth chain
+  doctor [folder]               Verbose diagnostic dump of the auth chain
   hook                          PreToolUse hook entrypoint for Claude Code and Codex CLI
                                 (reads the tool-call JSON from stdin)
-  uninstall [--remove-markers]  Remove skill copies and hooks, then list what is left
-                                (markers, cached session, browser download) and how to
-                                remove it
+  uninstall [--remove-markers] [FOLDER...]
+                                Remove skill copies and hooks, then list what is left
+                                (markers, cached session, backups, browser download)
+                                and how to remove it
 
 Auth chain (first hit wins): cached cookies -> persistent `login` browser
-profile (the proper Chrome 130+ Windows fix) -> rookiepy (Rust cookie reader,
+profile (the proper Chrome 127+ Windows fix) -> rookiepy (Rust cookie reader,
 Chrome 127+ friendly) -> browser_cookie3 (legacy DPAPI) -> Claude Code's
 Playwright profile -> interactive paste prompt (setup/login only).
 
@@ -742,8 +745,11 @@ _SANDBOX_HINT = (
 _OFFLINE_HINT = (
     "Could not reach Overleaf ({detail}). This looks like no network connection "
     "(offline, DNS or proxy failure) or an Overleaf outage, not a login problem: the "
-    "cookie was not checked, so do not run login or setup for this. The local copy was "
-    "not refreshed and may be stale; retry when the connection is back."
+    "cookie was not checked, so do not run login or setup for this."
+)
+# Appended only where a refresh was attempted (sync), not by status/doctor/save-cookie.
+_NOT_REFRESHED_NOTE = (
+    " The local copy was not refreshed and may be stale; retry when the connection is back."
 )
 
 
@@ -2270,6 +2276,14 @@ def mark_synced(project_id):
     _save_state(state)
 
 
+def clear_synced(project_ids):
+    state = _state()
+    if any(pid in state for pid in project_ids):
+        for pid in project_ids:
+            state.pop(pid, None)
+        _save_state(state)
+
+
 def is_debounced(project_id, window=DEBOUNCE_SECONDS):
     return (time.time() - _state().get(project_id, 0)) < window
 
@@ -2375,8 +2389,12 @@ def cmd_link(args):
     print(f"Linked {folder} -> Overleaf project {project_id}")
 
 
+SYNC_WAIT_MAX_SECONDS = 120
+
+
 def cmd_sync(args):
     force = "--force" in args
+    wait = "--wait" in args
     args = [a for a in args if not a.startswith("--")]
     folder = pathlib.Path(args[0] if args else ".")
     res = resolve_project(folder)
@@ -2413,21 +2431,55 @@ def cmd_sync(args):
 
     print(f"Refreshing project {project_id} (folder: {linked})")
     t0 = time.time()
-    try:
-        status = refresh_project(project_id, linked, force=force)
-    except RateLimited as e:
-        print(f"ERROR: rate-limited ({e}). Try again in ~{e.retry_after}s.", file=sys.stderr)
-        sys.exit(1)
-    except AuthExpired as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        sys.exit(1)
-    except RuntimeError as e:
-        # Network failure, sandbox block, malformed response, etc. Print
-        # clean message (no traceback) so the actionable hint is visible.
-        print(f"ERROR: {e}", file=sys.stderr)
-        sys.exit(1)
+    deadline = t0 + SYNC_WAIT_MAX_SECONDS
+    while True:
+        report = {}
+        try:
+            status = refresh_project(project_id, linked, force=force, report=report)
+        except RateLimited as e:
+            print(f"ERROR: rate-limited ({e}). Try again in ~{e.retry_after}s.", file=sys.stderr)
+            sys.exit(1)
+        except AuthExpired as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+        except RuntimeError as e:
+            # Network failure, sandbox block, malformed response, etc. Print
+            # clean message (no traceback) so the actionable hint is visible.
+            note = _NOT_REFRESHED_NOTE if isinstance(e, NetworkUnavailable) else ""
+            print(f"ERROR: {e}{note}", file=sys.stderr)
+            sys.exit(1)
+        delay = _protect_wait_seconds(linked, report.get("protected") or []) if wait else 0
+        if not delay:
+            break
+        if time.time() + delay > deadline:
+            print(
+                f"Still saved locally in the last 30 s after waiting: "
+                f"{', '.join(sorted(report['protected'])[:5])}. Someone (or something) keeps "
+                f"saving it; stop and ask the user before editing it.",
+                file=sys.stderr,
+            )
+            break
+        print(f"Waiting {delay:.0f} s until {', '.join(sorted(report['protected'])[:5])} "
+              f"is older than 30 s, then pulling again...", flush=True)
+        time.sleep(delay)
     mark_synced(project_id)
     print(f"{status} ({time.time() - t0:.2f}s)")
+    if report.get("protected") and wait:
+        sys.exit(1)
+
+
+def _protect_wait_seconds(folder, protected, window=30):
+    """Seconds until every file in `protected` (paths relative to folder) is
+    older than the protect window, or 0 when none is waiting on it."""
+    now, wait_for = time.time(), 0.0
+    for rel in protected:
+        try:
+            age = now - (pathlib.Path(folder) / rel).stat().st_mtime
+        except OSError:
+            continue
+        if age < window:
+            wait_for = max(wait_for, window - age + 1)
+    return wait_for
 
 
 def cmd_projects(args):
@@ -3016,17 +3068,37 @@ def _hook_unresolved_message(res, tool):
     )
 
 
+def _hook_output_json(text, event="PreToolUse"):
+    """Exit-0 hook output both clients show: `systemMessage` is shown to the
+    user, `hookSpecificOutput.additionalContext` is added to the model's
+    context. (Claude Code never shows exit-0 stderr to the model, and shows
+    it to the user only in debug logs; Codex ignores plain stdout.) No
+    permissionDecision: the normal permission flow still applies."""
+    if len(text) > 4000:
+        text = text[:3990] + "\n[...]"
+    return json.dumps({
+        "systemMessage": text,
+        "hookSpecificOutput": {"hookEventName": event, "additionalContext": text},
+    }, ensure_ascii=False)
+
+
 def cmd_hook(args):
     # No keychain / browser-store access from the hook (see _BROWSER_EXTRACTION).
     previous = _BROWSER_EXTRACTION["allowed"]
     _BROWSER_EXTRACTION["allowed"] = False
+    # stdout is reserved for the one JSON object the hook may print; anything
+    # else printed while refreshing goes to stderr.
+    real_stdout = sys.stdout
+    sys.stdout = sys.stderr
     try:
-        _cmd_hook(args)
+        _cmd_hook(args, real_stdout)
     finally:
+        sys.stdout = real_stdout
         _BROWSER_EXTRACTION["allowed"] = previous
 
 
-def _cmd_hook(args):
+def _cmd_hook(args, out=None):
+    out = out or sys.stdout
     try:
         data = json.load(sys.stdin)
     except Exception as e:
@@ -3102,17 +3174,18 @@ def _cmd_hook(args):
                                   f"may be stale; edits will be blocked until this is fixed.")
 
     deletes = None  # computed on demand by write guard 2
+    blocked_pids = []
     for pid, entry in projects.items():
+        n_blocks = len(blocks)
         folder = entry["folder"]
         targets = entry["paths"]
         before = _latex_snapshot(folder, targets) if is_write else None
         window = WRITE_DEBOUNCE_SECONDS if is_write else DEBOUNCE_SECONDS
         refreshed = False
-        status = ""
         report = {}
         if not is_debounced(pid, window=window):
             try:
-                status = refresh_project(pid, folder, report=report) or ""
+                refresh_project(pid, folder, report=report)
                 mark_synced(pid)
                 refreshed = True
                 summary = _refresh_summary(folder, report)
@@ -3195,18 +3268,13 @@ def _cmd_hook(args):
         # to leave alone because it was saved locally in the last 30 s (the
         # protect window; the cached version is held). Both sides changed
         # the file, so a write now would overwrite the web edit.
-        if refreshed and "protected" in str(status):
-            now = time.time()
+        protected = list(report.get("protected") or []) if refreshed else []
+        if protected:
             if targets:
-                recent = []
-                for p in targets:
-                    try:
-                        if now - os.stat(str(p)).st_mtime < 30:
-                            recent.append(_rel_posix(p, folder) or str(p))
-                    except OSError:
-                        pass
+                rels = {_rel_posix(p, folder) for p in targets}
+                recent = [r for r in protected if r in rels]
             else:
-                recent = ["files in this project"]
+                recent = protected
             if recent:
                 names = ", ".join(recent[:5])
                 blocks.append(
@@ -3214,20 +3282,22 @@ def _cmd_hook(args):
                     f"saved locally in the last 30 s (that save may not have reached Overleaf "
                     f"yet), so the web version was not pulled. {tool} blocked so it does not "
                     f"overwrite the web edit. Do exactly this:\n"
-                    f"  1. Wait 30 seconds (for example run `sleep 30`).\n"
-                    f"  2. Run `overleaf-sync-now sync \"{folder}\"`. It pulls the web version "
-                    f"now that the local save is older than 30 s (the local copy is backed up "
-                    f"first under {pathlib.Path(CACHE_DIR) / 'backups'}).\n"
-                    f"  3. Read {names} again and check that both your recent change and the "
+                    f"  1. Run `overleaf-sync-now sync --wait \"{folder}\"`. It waits until the "
+                    f"local save is 30 s old (well under a minute), then pulls the web version "
+                    f"(the local copy is backed up first under "
+                    f"{pathlib.Path(CACHE_DIR) / 'backups'}). Do not retry the edit before that.\n"
+                    f"  2. Read {names} again and check that both your recent change and the "
                     f"web edit are there; redo whatever is missing.\n"
-                    f"  4. Then retry the edit. If this message comes back for the same file, "
+                    f"  3. Then retry the edit. If this message comes back for the same file, "
                     f"stop and tell the user: someone is editing it on overleaf.com right now."
                 )
         # Write guard 1c: a bootstrap / full pull found that a target was
         # changed locally after Overleaf last changed it (edits Overleaf never
-        # received) and kept it, saving Overleaf's version aside.
-        conflicts = report.get("conflicts") or {}
-        if refreshed and conflicts:
+        # received) and kept it, saving Overleaf's version aside. Persisted,
+        # so the first write after the pull is blocked once even when a Read
+        # (or another call) did the pull.
+        conflicts = pending_conflicts(pid)
+        if conflicts:
             if targets:
                 hit = {}
                 for p in targets:
@@ -3243,8 +3313,10 @@ def _cmd_hook(args):
                     f"Overleaf never received. The local file was kept; Overleaf's version was "
                     f"saved to {copy}. {tool} blocked: show the user both versions (for example "
                     f"`diff \"{folder / rel}\" \"{copy}\"`) and ask which to keep before editing. "
-                    f"Then retry the edit; this check does not repeat for this pull."
+                    f"Then retry the edit; this check does not repeat for this file."
                 )
+            if hit:
+                _update_pending_conflicts(pid, drop=list(hit))
         # Write guard 2: the target was deleted or renamed on the web.
         # Deleting the outdated local copy is fine (it cannot re-create the
         # file on Overleaf); anything else that touches the old path is not.
@@ -3272,12 +3344,22 @@ def _cmd_hook(args):
                         f"(deleting it is allowed). If it should come back, the user re-creates "
                         f"it on Overleaf first; edits are allowed again after the next refresh."
                     )
+        if len(blocks) > n_blocks:
+            blocked_pids.append(pid)
 
     for w in warnings:
         print(w, file=sys.stderr)
     if blocks:
+        # A blocked write must not leave the 3 s write debounce set: the
+        # retry (or the next Edit of the same turn) has to probe again and
+        # meet the same guards, not slip through unchecked.
+        if blocked_pids:
+            clear_synced(blocked_pids)
         print("\n".join(blocks), file=sys.stderr)
         sys.exit(2)
+    if warnings:
+        event = data.get("hook_event_name") or "PreToolUse"
+        print(_hook_output_json("\n".join(warnings), event), file=out)
     sys.exit(0)
 
 
