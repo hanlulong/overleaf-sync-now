@@ -623,12 +623,18 @@ class HookInstallTests(unittest.TestCase):
         self._orig = {
             "CLAUDE_SETTINGS": cli.CLAUDE_SETTINGS,
             "SKILL_TARGETS": cli.SKILL_TARGETS,
+            "LEGACY_SKILL_TARGETS": cli.LEGACY_SKILL_TARGETS,
+            "CODEX_HOME": cli.CODEX_HOME,
+            "CODEX_HOOKS": cli.CODEX_HOOKS,
             "cmd_setup": cli.cmd_setup,
             "_validate_cookies": cli._validate_cookies,
             "_load_cache": cli._load_cache,
         }
         cli.CLAUDE_SETTINGS = self.settings
         cli.SKILL_TARGETS = {}                              # skip the SKILL.md copy loop
+        cli.LEGACY_SKILL_TARGETS = {}
+        cli.CODEX_HOME = pathlib.Path(self._tmp.name) / "no-codex"   # absent -> skipped
+        cli.CODEX_HOOKS = cli.CODEX_HOME / "hooks.json"
         cli.cmd_setup = lambda *a, **k: None                # skip the auth wizard
         cli._validate_cookies = lambda *a, **k: True        # skip the final auth probe/network
         cli._load_cache = lambda: {cli.SESSION_COOKIE: "x"}
@@ -641,11 +647,14 @@ class HookInstallTests(unittest.TestCase):
     def _entries(self):
         return json.loads(self.settings.read_text())["hooks"]["PreToolUse"]
 
+    def _handlers(self):
+        return [h for e in self._entries() for h in e.get("hooks", [])]
+
     def _commands(self):
-        return [h.get("command", "") for e in self._entries() for h in e.get("hooks", [])]
+        return [h.get("command", "") for h in self._handlers()]
 
     def _our_count(self):
-        return sum(1 for c in self._commands() if cli._is_our_hook(c))
+        return sum(1 for h in self._handlers() if cli._is_our_hook(h))
 
     def test_install_adds_one_hook_and_preserves_user_hooks(self):
         self.settings.write_text(json.dumps({"hooks": {"PreToolUse": [
