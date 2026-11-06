@@ -274,17 +274,26 @@ class HookExitCodeTests(unittest.TestCase):
         self.folder = pathlib.Path(self._tmp.name)
         self.pid = "b" * 24
         self._orig = {
-            "find_linked_folder": cli.find_linked_folder,
+            "resolve_project": cli.resolve_project,
             "refresh_project": cli.refresh_project,
             "is_debounced": cli.is_debounced,
             "mark_synced": cli.mark_synced,
+            "WEB_REMOVED_FILE": cli.WEB_REMOVED_FILE,
         }
+        cli.WEB_REMOVED_FILE = self.folder / "web-removed.json"
         self.link = (self.folder, self.pid)
         self.debounced = False
         self.refresh_outcome = lambda pid, folder: "ok"
         self.marked = []
-        cli.find_linked_folder = lambda fp, verbose=True, **kw: self.link
-        cli.is_debounced = lambda pid: self.debounced
+
+        def fake_resolve(fp, verbose=True, **kw):
+            folder, pid = self.link
+            return {"folder": folder, "project_id": pid,
+                    "reason": "ok" if pid else "unmanaged",
+                    "name": None, "candidates": [], "detail": None}
+
+        cli.resolve_project = fake_resolve
+        cli.is_debounced = lambda pid, window=cli.DEBOUNCE_SECONDS: self.debounced
         cli.mark_synced = lambda pid: self.marked.append(pid)
         cli.refresh_project = lambda pid, folder, **kw: self.refresh_outcome(pid, folder)
         self._stdin = sys.stdin
@@ -303,7 +312,10 @@ class HookExitCodeTests(unittest.TestCase):
         return 0 if code is None else code
 
     def test_non_allowlisted_tool_passes(self):
+        self.assertEqual(self._run({"tool_name": "NotebookEdit", "tool_input": {"file_path": "a.tex"}}), 0)
+        # Bash is covered now, but only via tool_input.command.
         self.assertEqual(self._run({"tool_name": "Bash", "tool_input": {"file_path": "a.tex"}}), 0)
+        self.assertEqual(self.marked, [])
 
     def test_non_tex_extension_passes(self):
         self.assertEqual(self._run({"tool_name": "Edit", "tool_input": {"file_path": "a.png"}}), 0)
@@ -336,6 +348,30 @@ class HookExitCodeTests(unittest.TestCase):
         self.refresh_outcome = boom
         self.assertEqual(self._run({"tool_name": "Read", "tool_input": {"file_path": "a.bib"}}), 0)
         self.assertEqual(self.marked, [self.pid])
+
+    def test_ratelimited_write_passes_without_marking(self):
+        # A write must not be recorded as "fresh" on a 429: the next write
+        # has to probe again instead of riding a 30 s debounce.
+        def boom(pid, folder):
+            raise cli.RateLimited(5)
+        self.refresh_outcome = boom
+        self.assertEqual(self._run({"tool_name": "Write", "tool_input": {"file_path": "a.tex"}}), 0)
+        self.assertEqual(self.marked, [])
+
+    def test_authexpired_on_read_warns_but_passes(self):
+        def boom(pid, folder):
+            raise cli.AuthExpired("no cookies")
+        self.refresh_outcome = boom
+        err = io.StringIO()
+        orig_err = sys.stderr
+        sys.stderr = err
+        try:
+            code = self._run({"tool_name": "Read", "tool_input": {"file_path": "a.tex"}})
+        finally:
+            sys.stderr = orig_err
+        self.assertEqual(code, 0)
+        self.assertIn("Read allowed", err.getvalue())
+        self.assertEqual(self.marked, [])
 
     def test_generic_error_passes_and_marks(self):
         def boom(pid, folder):

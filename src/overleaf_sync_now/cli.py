@@ -17,8 +17,9 @@ Subcommands:
   status [folder]               Show data dir, cookie validity, and link/sync state
   projects [--refresh]          List your Overleaf projects (name + ID)
   doctor                        Verbose diagnostic dump of the auth chain
-  hook                          PreToolUse hook entrypoint (reads JSON from stdin)
-  uninstall                     Remove skill links and hook (cookies preserved)
+  hook                          PreToolUse hook entrypoint for Claude Code and Codex CLI
+                                (reads the tool-call JSON from stdin)
+  uninstall                     Remove skill copies and hooks (cookies preserved)
 
 Auth chain (first hit wins): cached cookies -> persistent `login` browser
 profile (the proper Chrome 130+ Windows fix) -> rookiepy (Rust cookie reader,
@@ -1738,8 +1739,8 @@ def mark_synced(project_id):
     _save_state(state)
 
 
-def is_debounced(project_id):
-    return (time.time() - _state().get(project_id, 0)) < DEBOUNCE_SECONDS
+def is_debounced(project_id, window=DEBOUNCE_SECONDS):
+    return (time.time() - _state().get(project_id, 0)) < window
 
 
 # -------- subcommands --------
@@ -2031,6 +2032,257 @@ def cmd_status(args):
         print("Cached toV: none (next sync will bootstrap)")
 
 
+# -------- hook: which files does this tool call touch? --------
+#
+# Claude Code   Read / Edit / Write        tool_input.file_path
+#               Bash / PowerShell          tool_input.command (scanned)
+# Codex CLI     apply_patch                tool_input.command (the patch text)
+#               Bash                       tool_input.command (scanned)
+#
+# Shell commands are scanned heuristically: any token ending in a LaTeX
+# extension is resolved against the payload `cwd` (and any `cd <dir>` in the
+# command). Paths assembled at run time (variables, `find -exec`, scripts that
+# open files themselves) cannot be seen; see README "Known limitations".
+
+_READ_TOOLS = ("Read",)
+_WRITE_TOOLS = ("Edit", "Write", "apply_patch")
+_SHELL_TOOLS = ("Bash", "PowerShell")
+
+_LATEX_MENTION_RE = re.compile(r"\.(?:tex|bib|cls|sty|bst)(?![\w])", re.IGNORECASE)
+_SHELL_PATH_RE = re.compile(
+    r'"([^"\n]*?\.(?:tex|bib|cls|sty|bst))"'
+    r"|'([^'\n]*?\.(?:tex|bib|cls|sty|bst))'"
+    r"|((?:\\.|[^\s'\"<>|;&()`=,])+?\.(?:tex|bib|cls|sty|bst))(?![\w.])",
+    re.IGNORECASE,
+)
+_SHELL_CD_RE = re.compile(
+    r"""(?:^|[;&|\n]|&&)\s*(?:cd|pushd|Set-Location|sl)\s+("[^"\n]+"|'[^'\n]+'|[^\s;&|]+)""",
+    re.IGNORECASE,
+)
+_PATCH_FILE_RE = re.compile(
+    r"^\*\*\* (?:(?:Update|Add|Delete) File|Move to):\s*(.+?)\s*$", re.MULTILINE
+)
+_SHELL_SPLIT_RE = re.compile(r"\|\||&&|[|;&\n]")
+# First words of shell segments that only read LaTeX sources. Anything else
+# (python, perl, cp, mv, editors, unknown tools) counts as a possible write.
+_READ_ONLY_PROGRAMS = {
+    "cat", "head", "tail", "less", "more", "bat", "nl", "grep", "egrep", "fgrep",
+    "rg", "ag", "ack", "wc", "ls", "diff", "cmp", "file", "stat", "du", "sort",
+    "uniq", "cut", "tr", "awk", "gawk", "sed", "find", "echo", "printf", "pwd",
+    "which", "type", "test", "[", "true", "cd", "pushd", "popd", "texcount",
+    "chktex", "lacheck", "detex", "kpsewhich", "latexmk", "pdflatex", "xelatex",
+    "lualatex", "latex", "bibtex", "biber", "makeindex", "synctex", "git",
+    # PowerShell
+    "get-content", "gc", "select-string", "sls", "get-childitem", "gci", "dir",
+    "measure-object", "get-item", "test-path", "set-location", "sl",
+    "compare-object", "format-hex", "write-output", "write-host",
+}
+_READ_ONLY_GIT = {"diff", "log", "show", "status", "blame", "grep", "ls-files"}
+_REDIRECT_RE = re.compile(r"(?<![0-9&])>>?\s*(\"[^\"]*\"|'[^']*'|[^\s;&|]+)")
+
+
+def _command_text(tool_input):
+    cmd = tool_input.get("command", "")
+    if isinstance(cmd, (list, tuple)):
+        cmd = " ".join(str(c) for c in cmd)
+    return cmd if isinstance(cmd, str) else ""
+
+
+def _is_latex_path(p):
+    return bool(p) and bool(_LATEX_PATH_RE.search(str(p)))
+
+
+def _is_read_only_command(cmd):
+    """Heuristic: True when every segment of a shell command starts with a
+    known read-only program and nothing redirects into a LaTeX file. Unknown
+    programs count as writes (fail closed)."""
+    for target in _REDIRECT_RE.findall(cmd):
+        t = target.strip("\"'")
+        if _is_latex_path(t) or any(ch in t for ch in "*?["):
+            return False
+    # Quoted strings may contain | ; & (regexes, sed scripts); fd
+    # duplications like 2>&1 contain &. Neither separates commands.
+    bare = re.sub(r'"(?:\\.|[^"\\])*"|\'[^\']*\'', " Q ", cmd)
+    bare = re.sub(r"\d*>&\d*-?|&>>?", " ", bare)
+    for seg in _SHELL_SPLIT_RE.split(bare):
+        words = seg.strip().split()
+        while words and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=\S*", words[0]):
+            words.pop(0)  # leading VAR=value assignments
+        if not words:
+            continue
+        prog = os.path.basename(words[0].strip("\"'(")).lower()
+        if prog.endswith(".exe"):
+            prog = prog[:-4]
+        if prog not in _READ_ONLY_PROGRAMS:
+            return False
+        rest = words[1:]
+        if prog in ("sed", "awk", "gawk") and any(
+            w.startswith("--in-place") or (w.startswith("-") and not w.startswith("--") and "i" in w)
+            for w in rest
+        ):
+            return False
+        if prog == "find" and any(
+            w in ("-exec", "-execdir", "-delete", "-ok", "-okdir", "-fprint") for w in rest
+        ):
+            return False
+        if prog == "git" and (not rest or rest[0] not in _READ_ONLY_GIT):
+            return False
+    return True
+
+
+def _shell_candidate_paths(cmd, cwd, *, posix_escapes=True):
+    """Candidate LaTeX paths mentioned in a shell command, as absolute Paths.
+    Globs are expanded (bounded). Paths need not exist."""
+    import glob as _glob
+    tokens = []
+    for m in _SHELL_PATH_RE.finditer(cmd):
+        tok = m.group(1) or m.group(2) or m.group(3)
+        if not tok:
+            continue
+        if "$" in tok:
+            tok = os.path.expandvars(tok)
+        tokens.append(tok)
+        if posix_escapes and m.group(3) and "\\" in tok:
+            tokens.append(re.sub(r"\\(.)", r"\1", tok))
+    if not tokens:
+        return []
+    cwd = pathlib.Path(cwd)
+    bases = [cwd]
+    for m in _SHELL_CD_RE.finditer(cmd):
+        d = m.group(1).strip("\"'")
+        if d and d != "-":
+            bases.append(cwd / pathlib.Path(d).expanduser())
+    out, seen = [], set()
+    for tok in tokens:
+        tp = pathlib.Path(tok).expanduser()
+        cands = [tp] if tp.is_absolute() else [b / tp for b in bases]
+        for c in cands:
+            if any(ch in str(c) for ch in "*?["):
+                expanded = sorted(_glob.glob(str(c)))[:200]
+            else:
+                expanded = [str(c)]
+            for e in expanded:
+                if e not in seen and _is_latex_path(e):
+                    seen.add(e)
+                    out.append(pathlib.Path(e))
+    return out
+
+
+def _patch_paths(text, cwd):
+    """Paths named by `*** Update File:` / `*** Add File:` / `*** Delete File:`
+    / `*** Move to:` lines of a Codex apply_patch payload."""
+    cwd = pathlib.Path(cwd)
+    out = []
+    for m in _PATCH_FILE_RE.finditer(text or ""):
+        p = pathlib.Path(m.group(1).strip().strip("\"'")).expanduser()
+        out.append(p if p.is_absolute() else cwd / p)
+    return out
+
+
+def _hook_targets(data):
+    """Classify a hook payload. Returns (kind, paths, cwd_hint) where kind is
+    "read", "write" or None (not ours), paths are the LaTeX files touched, and
+    cwd_hint is the cwd when a shell command mentions a LaTeX extension
+    without a resolvable path (e.g. `sed -i ... *.tex` in a project folder)."""
+    tool = data.get("tool_name") or ""
+    tool_input = data.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        return None, [], None
+    cwd = data.get("cwd") or os.getcwd()
+    if tool in _READ_TOOLS or tool in ("Edit", "Write"):
+        fp = tool_input.get("file_path") or ""
+        if not _is_latex_path(fp):
+            return None, [], None
+        p = pathlib.Path(fp).expanduser()
+        if not p.is_absolute():
+            p = pathlib.Path(cwd) / p
+        return ("read" if tool in _READ_TOOLS else "write"), [p], None
+    if tool == "apply_patch":
+        paths = [p for p in _patch_paths(_command_text(tool_input), cwd) if _is_latex_path(p)]
+        return ("write", paths, None) if paths else (None, [], None)
+    if tool in _SHELL_TOOLS:
+        cmd = _command_text(tool_input)
+        if not _LATEX_MENTION_RE.search(cmd):
+            return None, [], None
+        paths = _shell_candidate_paths(cmd, cwd, posix_escapes=(tool == "Bash"))
+        paths += [p for p in _patch_paths(cmd, cwd) if _is_latex_path(p)]
+        kind = "read" if (_is_read_only_command(cmd) and "*** Begin Patch" not in cmd) else "write"
+        return kind, paths, pathlib.Path(cwd)
+    return None, [], None
+
+
+def _latex_snapshot(folder, extra=()):
+    """{path_str: (mtime_ns, size)} for LaTeX files under `folder` (bounded,
+    dotdirs skipped) plus `extra` paths. Used to see what a refresh rewrote."""
+    snap = {}
+    count = 0
+    try:
+        for root, dirs, files in os.walk(folder):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for f in files:
+                if _is_latex_path(f):
+                    path = os.path.join(root, f)
+                    try:
+                        st = os.stat(path)
+                        snap[os.path.normcase(os.path.abspath(path))] = (st.st_mtime_ns, st.st_size)
+                    except OSError:
+                        pass
+                    count += 1
+                    if count >= 5000:
+                        break
+            if count >= 5000:
+                break
+    except OSError:
+        pass
+    for p in extra:
+        key = os.path.normcase(os.path.abspath(str(p)))
+        if key not in snap:
+            try:
+                st = os.stat(key)
+                snap[key] = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                snap[key] = None
+    return snap
+
+
+def _rel_posix(path, folder):
+    try:
+        return pathlib.Path(os.path.abspath(str(path))).relative_to(
+            pathlib.Path(os.path.abspath(str(folder)))
+        ).as_posix()
+    except ValueError:
+        return None
+
+
+def _hook_unresolved_message(res, tool):
+    folder = res.get("folder")
+    reason = res.get("reason")
+    head = (
+        f"[overleaf-sync-now] Could not tell which Overleaf project {folder} belongs to"
+    )
+    if reason == "auth":
+        return (
+            f"{head}: not logged in to Overleaf.\n{_AUTH_RECOVERY}"
+        )
+    if reason == "ambiguous":
+        lines = [f"{head}: {len(res.get('candidates') or [])} living Overleaf projects are named "
+                 f"{res.get('name')!r}. Refusing to guess. Candidates (most recent first):"]
+        for c in res.get("candidates") or []:
+            lines.append(f"    {c.get('id')}  lastUpdated={c.get('lastUpdated') or '?'}")
+        lines.append("  Ask the user which one this folder is, then run:")
+        lines.append(f"    overleaf-sync-now link <project_id> \"{folder}\"")
+        lines.append("  Do not pick a project id on the user's behalf.")
+        return "\n".join(lines)
+    return (
+        f"{head}: no living (non-trashed, non-archived) Overleaf project is named "
+        f"{res.get('name')!r}.\n"
+        f"  If the project was renamed on Overleaf, ask the user for the project id\n"
+        f"  (the 24-character hex in https://www.overleaf.com/project/<id>) and run:\n"
+        f"    overleaf-sync-now link <project_id> \"{folder}\"\n"
+        f"  `overleaf-sync-now projects --refresh` lists the user's projects."
+    )
+
+
 def cmd_hook(args):
     try:
         data = json.load(sys.stdin)
@@ -2039,68 +2291,166 @@ def cmd_hook(args):
         # Claude Code hook-payload changes don't make us silently no-op.
         print(f"[overleaf-sync-now] hook stdin not valid JSON ({e}); skipping.", file=sys.stderr)
         sys.exit(0)
-    # Read is included: the /updates probe is cheap (~0.3s) and debounced
-    # (30s per project), so refreshing on Read keeps Claude's downstream
-    # reasoning grounded in current content for negligible cost.
-    if data.get("tool_name", "") not in ("Read", "Edit", "Write", "MultiEdit"):
+    if not isinstance(data, dict):
         sys.exit(0)
-    fp = data.get("tool_input", {}).get("file_path", "")
-    if not fp or not re.search(r"\.(tex|bib|cls|sty|bst)$", fp, re.IGNORECASE):
+    tool = data.get("tool_name") or "tool"
+    kind, paths, cwd_hint = _hook_targets(data)
+    if kind is None:
         sys.exit(0)
-    # find_linked_folder can in principle raise (PermissionError on a network
-    # share, OSError reading a marker, etc.). Don't let those crash the hook
-    # and block the user's edit.
+    is_write = kind == "write"
+
+    # Group the touched files by project. find_linked_folder / resolve_project
+    # can in principle raise (PermissionError on a network share, OSError
+    # reading a marker, etc.); don't let those crash the hook.
     #
-    # verbose=False so repeated keystrokes don't spam stderr with the same
-    # auto-link warning. The first auto-link writes a marker; subsequent
-    # calls hit the marker fast path. Validation warnings (Layer 4) are also
-    # suppressed in the hook — the user sees them via interactive `status`
-    # / `sync`. Marker-write notice happens once per folder; that's the
-    # only thing the hook would have surfaced anyway.
-    try:
-        linked, project_id = find_linked_folder(fp, verbose=False)
-    except Exception as e:
-        print(f"[overleaf-sync-now] hook: could not resolve project for {fp}: {e}; skipping.", file=sys.stderr)
-        sys.exit(0)
-    if not project_id or is_debounced(project_id):
-        sys.exit(0)
-    try:
-        refresh_project(project_id, linked)
-        mark_synced(project_id)
-        sys.exit(0)
-    except RateLimited as e:
-        # Transient. Don't block the edit, but mark state so we don't retry
-        # immediately on every subsequent edit and dig the rate limit deeper.
-        mark_synced(project_id)
-        print(f"[overleaf-sync-now] {e} Local file may be slightly stale.", file=sys.stderr)
-        sys.exit(0)
-    except AuthExpired as e:
-        # Recoverable user action. Tell the AI by exiting 2 (Claude Code
-        # surfaces stderr to the model as a blocking hook error so the
-        # AI can prompt the user to re-auth instead of editing stale).
-        print(f"[overleaf-sync-now] {e}", file=sys.stderr)
-        print(
-            "[overleaf-sync-now] Edit blocked to prevent writing over a stale local copy. "
-            "After re-auth, retry the edit.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    except Exception as e:
-        # Unknown error (network, zip parse, sandbox block, etc.): don't
-        # block the edit; mark synced so the next edit doesn't retry
-        # inside the debounce window.
-        mark_synced(project_id)
-        msg = str(e)
-        if _is_sandbox_block(e) or "Outbound HTTPS to Overleaf was blocked" in msg:
-            # Permanent until the user/shell config changes. "Retry after
-            # debounce" would be misleading.
-            print(f"[overleaf-sync-now] {e}", file=sys.stderr)
-        else:
-            print(
-                f"[overleaf-sync-now] refresh failed: {e}; will retry after debounce.",
-                file=sys.stderr,
+    # verbose=False so repeated tool calls don't spam stderr with the same
+    # auto-link warning; the reasons come back in the result instead.
+    projects = {}   # project_id -> {"folder": Path, "paths": [Path]}
+    blocks = []     # messages that make the hook exit 2
+    warnings = []
+    unresolved_seen = set()
+    probe_points = [(p, True) for p in paths]
+    if cwd_hint is not None:
+        probe_points.append((cwd_hint, False))
+    for point, is_file_target in probe_points:
+        try:
+            res = resolve_project(point, verbose=False)
+        except Exception as e:
+            warnings.append(f"[overleaf-sync-now] hook: could not resolve project for {point}: {e}; skipping.")
+            continue
+        reason = res["reason"]
+        if reason == "ok":
+            entry = projects.setdefault(res["project_id"], {"folder": res["folder"], "paths": []})
+            if is_file_target:
+                entry["paths"].append(point)
+            continue
+        if reason == "unmanaged":
+            continue
+        key = (str(res.get("folder")), reason)
+        if key in unresolved_seen:
+            continue
+        unresolved_seen.add(key)
+        if reason == "network":
+            # Unchanged from 0.4: a network/sandbox failure passes through.
+            warnings.append(
+                f"[overleaf-sync-now] could not reach Overleaf to resolve {res.get('folder')} "
+                f"({res.get('detail')}); local copy may be stale."
             )
-        sys.exit(0)
+            continue
+        msg = _hook_unresolved_message(res, tool)
+        if is_write:
+            blocks.append(msg + f"\n[overleaf-sync-now] {tool} blocked so a possibly-stale "
+                                f"local copy is not edited. Retry after fixing the above.")
+        else:
+            warnings.append(msg + f"\n[overleaf-sync-now] {tool} allowed, but the local copy "
+                                  f"may be stale; edits will be blocked until this is fixed.")
+
+    for pid, entry in projects.items():
+        folder = entry["folder"]
+        targets = entry["paths"]
+        before = _latex_snapshot(folder, targets) if is_write else None
+        window = WRITE_DEBOUNCE_SECONDS if is_write else DEBOUNCE_SECONDS
+        refreshed = False
+        if not is_debounced(pid, window=window):
+            try:
+                refresh_project(pid, folder)
+                mark_synced(pid)
+                refreshed = True
+            except RateLimited as e:
+                # Transient. Don't block, and don't claim the copy is fresh
+                # for writes (a later write must probe again). Reads still
+                # share the debounce so a read burst doesn't dig deeper.
+                if not is_write:
+                    mark_synced(pid)
+                warnings.append(f"[overleaf-sync-now] {e} Local file may be slightly stale.")
+            except AuthExpired as e:
+                # Recoverable user action. Block writes (exit 2: Claude Code
+                # and Codex feed stderr to the model so it can ask the user
+                # to re-auth instead of editing stale); warn on reads.
+                if is_write:
+                    blocks.append(
+                        f"[overleaf-sync-now] {e}\n[overleaf-sync-now] {tool} blocked to prevent "
+                        f"writing over a possibly-stale local copy. After re-auth, retry."
+                    )
+                else:
+                    warnings.append(
+                        f"[overleaf-sync-now] {e}\n[overleaf-sync-now] {tool} allowed, but the "
+                        f"local copy may be stale; edits stay blocked until re-auth."
+                    )
+            except Exception as e:
+                # Unknown error (network, zip parse, sandbox block, local
+                # write failure): don't block; debounce so the next call
+                # doesn't retry immediately.
+                mark_synced(pid)
+                msg = str(e)
+                if _is_sandbox_block(e) or "Outbound HTTPS to Overleaf was blocked" in msg:
+                    # Permanent until the user/shell config changes. "Retry
+                    # after debounce" would be misleading.
+                    warnings.append(f"[overleaf-sync-now] {e}")
+                elif isinstance(e, OSError) and not _is_network_exception(e):
+                    warnings.append(
+                        f"[overleaf-sync-now] refresh could not write local files in {folder}: {e}"
+                    )
+                else:
+                    warnings.append(f"[overleaf-sync-now] refresh failed: {e}; will retry after debounce.")
+        if not is_write:
+            for p in targets:
+                rel = _rel_posix(p, folder)
+                gone = web_removed_paths(pid, folder) if rel else {}
+                if rel in gone:
+                    new = gone[rel]
+                    warnings.append(
+                        f"[overleaf-sync-now] NOTE: {rel} was "
+                        f"{'renamed on Overleaf to ' + new if new else 'deleted on Overleaf'}; "
+                        f"this local copy is outdated."
+                    )
+            continue
+        # Write guard 1: the refresh just rewrote a file this call is about
+        # to modify. The agent's edit was planned against the old bytes, so
+        # make it re-read first (a whole-file Write would otherwise discard
+        # the web edit the refresh just pulled in).
+        if refreshed and before is not None:
+            after = _latex_snapshot(folder, targets)
+            changed = {k for k in set(before) | set(after) if before.get(k) != after.get(k)}
+            if targets:
+                keys = {os.path.normcase(os.path.abspath(str(p))) for p in targets}
+                hit = sorted(changed & keys)
+            else:
+                hit = sorted(changed)
+            if hit:
+                shown = ", ".join(_rel_posix(h, folder) or h for h in hit[:5])
+                blocks.append(
+                    f"[overleaf-sync-now] Refreshed from Overleaf: newer web edits were just "
+                    f"pulled into {shown}. Re-read the file(s) before editing; this {tool} "
+                    f"was planned against the old content and was blocked so it does not "
+                    f"overwrite them."
+                )
+        # Write guard 2: the target was deleted or renamed on the web.
+        gone = web_removed_paths(pid, folder)
+        for p in targets:
+            rel = _rel_posix(p, folder)
+            if rel and rel in gone:
+                new = gone[rel]
+                if new:
+                    blocks.append(
+                        f"[overleaf-sync-now] {rel} was renamed on Overleaf to {new} (refreshed "
+                        f"locally). {tool} blocked: editing the old path would re-create it on "
+                        f"Overleaf through Dropbox. Edit {new} instead."
+                    )
+                else:
+                    blocks.append(
+                        f"[overleaf-sync-now] {rel} was deleted on Overleaf. {tool} blocked: "
+                        f"editing it would re-create it on Overleaf through Dropbox. Ask the "
+                        f"user whether to restore it; if so, they can delete the outdated local "
+                        f"copy or re-create the file on Overleaf first."
+                    )
+
+    for w in warnings:
+        print(w, file=sys.stderr)
+    if blocks:
+        print("\n".join(blocks), file=sys.stderr)
+        sys.exit(2)
+    sys.exit(0)
 
 
 # -------- install / uninstall --------
