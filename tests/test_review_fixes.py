@@ -66,8 +66,9 @@ class RefreshDecisionTests(unittest.TestCase):
             self.dl_calls.append(pid)
             return b"ZIPBYTES"
 
-        def fake_extract(zip_bytes, folder, paths, protect_recent_seconds=30):
-            self.extract_calls.append({"paths": paths, "protect": protect_recent_seconds})
+        def fake_extract(zip_bytes, folder, paths, protect_recent_seconds=30, **kw):
+            self.extract_calls.append({"paths": paths, "protect": protect_recent_seconds,
+                                       "change_times": kw.get("change_times")})
             return self.extract_ret
 
         cli.download_zip = fake_download
@@ -199,8 +200,11 @@ class ExtractFilesSafetyTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.folder = pathlib.Path(self._tmp.name) / "proj"
         self.folder.mkdir()
+        self._orig_cache_dir = cli.CACHE_DIR
+        cli.CACHE_DIR = pathlib.Path(self._tmp.name) / "data"  # backups land here
 
     def tearDown(self):
+        cli.CACHE_DIR = self._orig_cache_dir
         self._tmp.cleanup()
 
     def _zip(self, files):

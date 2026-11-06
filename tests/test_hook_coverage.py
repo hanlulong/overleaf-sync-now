@@ -483,6 +483,10 @@ class WriteGuardTests(_HookHarness):
         code, err = self.run_hook({"tool_name": "Write", "tool_input": {"file_path": str(folder / "main.tex")}})
         self.assertEqual(code, 2)
         self.assertIn("Conflict", err)
+        # The message spells out the exact steps.
+        self.assertIn("sleep 30", err)
+        self.assertIn(f'overleaf-sync-now sync "{folder}"', err)
+        self.assertIn("tell the user", err)
 
     def test_protected_other_file_does_not_block(self):
         folder = self.project("Paper", files=("main.tex", "intro.tex"))

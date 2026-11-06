@@ -914,12 +914,14 @@ def web_removed_paths(project_id, folder):
     return {p: n for p, n in entry.items() if _path_exists_under(folder, p)}
 
 
-def refresh_project(project_id, folder, *, force=False):
+def refresh_project(project_id, folder, *, force=False, report=None):
     """Version-match refresh. Probes /updates, decides whether a zip download
     is actually needed, and if so extracts only the changed files into folder.
 
     Returns a short human-readable status string. Raises AuthExpired,
-    RateLimited, or RuntimeError for the caller to handle.
+    RateLimited, NetworkUnavailable or RuntimeError for the caller to handle.
+    `report` (a dict), when given, receives what _extract_files did
+    ("written", "conflicts", "protected", "backup_dir").
     """
     data = fetch_updates(project_id)
     updates = data.get("updates", [])
@@ -1009,9 +1011,19 @@ def refresh_project(project_id, folder, *, force=False):
     # recent-mtime guard. Otherwise protect files the user just saved from
     # being clobbered before their save has propagated Dropbox -> Overleaf.
     protect = 0 if force else 30
+    # A bootstrap or full pull compares every file, including ones Overleaf
+    # has not changed in a long time. A local file changed after Overleaf's
+    # last change to it holds edits Overleaf never received (Dropbox paused,
+    # offline edits, an Overleaf Dropbox outage): keep it and save Overleaf's
+    # copy aside, instead of reverting it. --force always takes Overleaf's.
+    change_times = _overleaf_change_times(updates) if (need_paths is None and not force) else None
+    if report is None:
+        report = {}
     n_written, n_unchanged, n_protected = _extract_files(
-        zip_bytes, folder, need_paths, protect_recent_seconds=protect
+        zip_bytes, folder, need_paths, protect_recent_seconds=protect,
+        project_id=project_id, change_times=change_times, report=report,
     )
+    n_conflicts = len(report.get("conflicts") or {})
     if web_present or web_removed:
         _record_web_file_ops(project_id, folder, web_present, web_removed)
     # Only advance the cached version when EVERY web-origin change actually
@@ -1038,10 +1050,102 @@ def refresh_project(project_id, folder, *, force=False):
             f"protected {n_protected} (recent local edits; version held at {held} so the "
             f"pending web change is re-offered on the next sync — pass --force to pull it now)",
         ]
+    if n_conflicts:
+        parts.append(
+            f"kept {n_conflicts} newer local file(s); Overleaf's copies saved under "
+            f"{pathlib.Path(CACHE_DIR) / 'conflicts' / project_id}"
+        )
+    if report.get("backup_dir"):
+        parts.append(f"previous local versions backed up to {report['backup_dir']}")
     return f"{label} (" + ", ".join(parts) + ")"
 
 
-def _extract_files(zip_bytes, folder, paths, protect_recent_seconds=30):
+BACKUP_KEEP_DAYS = 30
+
+
+def _stamp():
+    return time.strftime("%Y%m%d-%H%M%S")
+
+
+def _save_aside(kind, project_id, stamp, rel, content):
+    """Write `content` to <DATA_DIR>/<kind>/<project>/<stamp>/<rel> (kind is
+    "backups" or "conflicts") and return the path. Never overwrites an
+    earlier copy: a second copy in the same second gets a .1, .2, ... suffix.
+    Files are user-only (0o600) on POSIX, like everything under DATA_DIR."""
+    root = pathlib.Path(CACHE_DIR) / kind / (project_id or "unlinked") / stamp
+    dest = root.joinpath(*[p for p in rel.split("/") if p not in ("", ".", "..")])
+    n = 0
+    candidate = dest
+    while candidate.exists():
+        n += 1
+        candidate = dest.with_name(f"{dest.name}.{n}")
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _unique_tmp_path(candidate)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(content)
+        if os.name == "posix":
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+        _replace_with_retry(tmp, candidate)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    _harden_dir(CACHE_DIR)
+    return candidate
+
+
+def _prune_backups(project_id, keep_days=BACKUP_KEEP_DAYS):
+    """Delete this project's backup snapshots older than `keep_days`.
+    Conflict copies are never pruned automatically."""
+    root = pathlib.Path(CACHE_DIR) / "backups" / (project_id or "unlinked")
+    cutoff = time.time() - keep_days * 86400
+    try:
+        for d in root.iterdir():
+            if d.is_dir() and d.stat().st_mtime < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _overleaf_change_times(updates):
+    """When did Overleaf last change each file, per the /updates page?
+
+    Returns {"paths": {path: epoch_seconds}, "default": epoch_seconds} or None
+    when the page carries no timestamps. A path that is not in the page last
+    changed before the page's oldest entry, so "default" (that oldest time)
+    is an upper bound for it."""
+    last, oldest = {}, None
+    for u in updates or []:
+        ts = (u.get("meta") or {}).get("end_ts")
+        if not isinstance(ts, (int, float)):
+            continue
+        ts = ts / 1000.0
+        oldest = ts if oldest is None else min(oldest, ts)
+        paths = list(u.get("pathnames") or [])
+        for op in u.get("project_ops") or []:
+            if not isinstance(op, dict):
+                continue
+            for key in ("add", "rename", "remove"):
+                body = op.get(key)
+                if isinstance(body, dict):
+                    paths += [body.get("pathname"), body.get("newPathname")]
+        for p in paths:
+            p = _norm_overleaf_path(p)
+            if p:
+                last[p] = max(last.get(p, 0.0), ts)
+    if oldest is None:
+        return None
+    return {"paths": last, "default": oldest}
+
+
+def _extract_files(zip_bytes, folder, paths, protect_recent_seconds=30, *,
+                   project_id=None, change_times=None, report=None):
     """Extract files from zip into folder. `paths` is either a set of relative
     pathnames (no leading slash) or None to extract every entry.
 
@@ -1055,6 +1159,18 @@ def _extract_files(zip_bytes, folder, paths, protect_recent_seconds=30):
     still has old content while local has fresh content. Pass 0 when the
     caller explicitly wants to overwrite (e.g. --force).
 
+    Before any overwrite the previous local bytes are copied to
+    <DATA_DIR>/backups/<project>/<timestamp>/<path>.
+
+    `change_times` (from _overleaf_change_times; passed on a bootstrap or
+    full pull) turns on keep-both: a differing local file whose mtime is
+    newer than Overleaf's last change to it holds local edits Overleaf never
+    received (Dropbox paused or offline, Overleaf's Dropbox sync down). It is
+    kept, and Overleaf's copy goes to <DATA_DIR>/conflicts/<project>/<ts>/.
+
+    `report` (a dict) receives "written", "conflicts" ({path: copy}),
+    "protected" (paths) and "backup_dir".
+
     Returns (n_written, n_unchanged, n_protected).
     """
     folder = pathlib.Path(folder).resolve()
@@ -1062,6 +1178,13 @@ def _extract_files(zip_bytes, folder, paths, protect_recent_seconds=30):
     n_unchanged = 0
     n_protected = 0
     now = time.time()
+    stamp = _stamp()
+    if report is None:
+        report = {}
+    report.setdefault("written", [])
+    report.setdefault("conflicts", {})
+    report.setdefault("protected", [])
+    report.setdefault("backup_dir", None)
 
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
         for info in z.infolist():
@@ -1089,31 +1212,55 @@ def _extract_files(zip_bytes, folder, paths, protect_recent_seconds=30):
 
             new_content = z.read(info)
 
+            old_content = None
             if target.exists():
                 try:
-                    if target.read_bytes() == new_content:
-                        n_unchanged += 1
-                        continue
+                    old_content = target.read_bytes()
                 except OSError:
-                    pass
+                    old_content = None
+                if old_content == new_content:
+                    n_unchanged += 1
+                    continue
+                try:
+                    mtime = target.stat().st_mtime
+                except OSError:
+                    mtime = None
                 # Content differs. If the local file was modified very
                 # recently, the user is probably mid-save and our write
                 # would clobber a local edit Dropbox hasn't yet pushed
                 # up to Overleaf. Leave it alone and warn.
-                if protect_recent_seconds > 0:
-                    try:
-                        age = now - target.stat().st_mtime
-                    except OSError:
-                        age = None
-                    if age is not None and age < protect_recent_seconds:
+                if protect_recent_seconds > 0 and mtime is not None:
+                    age = now - mtime
+                    if age < protect_recent_seconds:
                         n_protected += 1
+                        report["protected"].append(rel)
                         print(
                             f"[overleaf-sync-now] SKIP {rel}: local modified {age:.0f}s ago "
-                            f"(< {protect_recent_seconds}s protection window). "
-                            f"Pass --force to overwrite.",
+                            f"(< {protect_recent_seconds}s protection window). The next sync "
+                            f"pulls it once the local save is older than that "
+                            f"(`sync --force` overwrites now; the local copy is backed up first).",
                             file=sys.stderr,
                         )
                         continue
+                # Bootstrap / full pull: a local file changed after Overleaf
+                # last changed it holds edits Overleaf never got. Keep both.
+                if change_times is not None and mtime is not None:
+                    last = change_times["paths"].get(rel, change_times["default"])
+                    if last is not None and mtime > last:
+                        copy = _save_aside("conflicts", project_id, stamp, rel, new_content)
+                        report["conflicts"][rel] = str(copy)
+                        print(
+                            f"[overleaf-sync-now] KEPT local {rel}: it differs from Overleaf and "
+                            f"was changed locally after Overleaf's last change to it (edits "
+                            f"Overleaf never received?). Overleaf's version was saved to {copy}. "
+                            f"Compare the two before editing.",
+                            file=sys.stderr,
+                        )
+                        continue
+                if old_content is not None:
+                    _save_aside("backups", project_id, stamp, rel, old_content)
+                    report["backup_dir"] = str(
+                        pathlib.Path(CACHE_DIR) / "backups" / (project_id or "unlinked") / stamp)
 
             target.parent.mkdir(parents=True, exist_ok=True)
             # Same concurrency contract as _atomic_write_text: per-process,
@@ -1133,7 +1280,10 @@ def _extract_files(zip_bytes, folder, paths, protect_recent_seconds=30):
                     pass
                 raise
             n_written += 1
+            report["written"].append(rel)
 
+    if report["backup_dir"]:
+        _prune_backups(project_id)
     return n_written, n_unchanged, n_protected
 
 
@@ -2482,6 +2632,30 @@ def _rel_posix(path, folder):
         return None
 
 
+def _refresh_summary(folder, report):
+    """One line saying what a hook-driven refresh wrote or skipped (None when
+    it touched nothing), so a pull into the user's files is never silent."""
+    def names(items):
+        items = sorted(items)
+        shown = ", ".join(items[:5])
+        return shown + (f" and {len(items) - 5} more" if len(items) > 5 else "")
+
+    parts = []
+    if report.get("written"):
+        parts.append(f"pulled newer Overleaf content into {names(report['written'])}")
+    if report.get("conflicts"):
+        parts.append(f"kept the newer local {names(report['conflicts'])} (Overleaf's copy "
+                     f"saved under {pathlib.Path(CACHE_DIR) / 'conflicts'})")
+    if report.get("protected"):
+        parts.append(f"skipped {names(report['protected'])} (saved locally in the last 30 s)")
+    if not parts:
+        return None
+    line = f"[overleaf-sync-now] {pathlib.Path(folder).name}: " + "; ".join(parts) + "."
+    if report.get("backup_dir"):
+        line += f" Previous local versions: {report['backup_dir']}"
+    return line
+
+
 def _hook_unresolved_message(res, tool):
     folder = res.get("folder")
     reason = res.get("reason")
@@ -2583,11 +2757,15 @@ def cmd_hook(args):
         window = WRITE_DEBOUNCE_SECONDS if is_write else DEBOUNCE_SECONDS
         refreshed = False
         status = ""
+        report = {}
         if not is_debounced(pid, window=window):
             try:
-                status = refresh_project(pid, folder) or ""
+                status = refresh_project(pid, folder, report=report) or ""
                 mark_synced(pid)
                 refreshed = True
+                summary = _refresh_summary(folder, report)
+                if summary:
+                    warnings.append(summary)
             except RateLimited as e:
                 # Transient. Don't block, and don't claim the copy is fresh
                 # for writes (a later write must probe again). Reads still
@@ -2678,13 +2856,42 @@ def cmd_hook(args):
             else:
                 recent = ["files in this project"]
             if recent:
+                names = ", ".join(recent[:5])
                 blocks.append(
-                    f"[overleaf-sync-now] Conflict: {', '.join(recent[:5])} changed on Overleaf "
-                    f"while a local save from the last 30 s may not have reached Overleaf yet, "
-                    f"so the web version was not pulled. {tool} blocked so it does not overwrite "
-                    f"the web edit. Wait about 30 seconds, re-read the file, check that both the "
-                    f"web edit and the recent local change are present, then redo the edit. Tell "
-                    f"the user if this repeats."
+                    f"[overleaf-sync-now] Conflict: {names} changed on Overleaf, and was also "
+                    f"saved locally in the last 30 s (that save may not have reached Overleaf "
+                    f"yet), so the web version was not pulled. {tool} blocked so it does not "
+                    f"overwrite the web edit. Do exactly this:\n"
+                    f"  1. Wait 30 seconds (for example run `sleep 30`).\n"
+                    f"  2. Run `overleaf-sync-now sync \"{folder}\"`. It pulls the web version "
+                    f"now that the local save is older than 30 s (the local copy is backed up "
+                    f"first under {pathlib.Path(CACHE_DIR) / 'backups'}).\n"
+                    f"  3. Read {names} again and check that both your recent change and the "
+                    f"web edit are there; redo whatever is missing.\n"
+                    f"  4. Then retry the edit. If this message comes back for the same file, "
+                    f"stop and tell the user: someone is editing it on overleaf.com right now."
+                )
+        # Write guard 1c: a bootstrap / full pull found that a target was
+        # changed locally after Overleaf last changed it (edits Overleaf never
+        # received) and kept it, saving Overleaf's version aside.
+        conflicts = report.get("conflicts") or {}
+        if refreshed and conflicts:
+            if targets:
+                hit = {}
+                for p in targets:
+                    rel = _rel_posix(p, folder)
+                    if rel in conflicts:
+                        hit[rel] = conflicts[rel]
+            else:
+                hit = dict(conflicts)
+            for rel, copy in sorted(hit.items())[:5]:
+                blocks.append(
+                    f"[overleaf-sync-now] Conflict: {rel} differs from Overleaf's copy, and the "
+                    f"local file was changed after Overleaf last changed it, so it may hold edits "
+                    f"Overleaf never received. The local file was kept; Overleaf's version was "
+                    f"saved to {copy}. {tool} blocked: show the user both versions (for example "
+                    f"`diff \"{folder / rel}\" \"{copy}\"`) and ask which to keep before editing. "
+                    f"Then retry the edit; this check does not repeat for this pull."
                 )
         # Write guard 2: the target was deleted or renamed on the web.
         # Deleting the outdated local copy is fine (it cannot re-create the

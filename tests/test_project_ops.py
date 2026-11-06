@@ -51,7 +51,9 @@ class ProjectOpsRefreshTests(unittest.TestCase):
             "_fingerprint_sanity_warn": cli._fingerprint_sanity_warn,
             "VERSIONS_FILE": cli.VERSIONS_FILE,
             "WEB_REMOVED_FILE": cli.WEB_REMOVED_FILE,
+            "CACHE_DIR": cli.CACHE_DIR,
         }
+        cli.CACHE_DIR = base / "data"  # backups / conflicts land here
         cli.VERSIONS_FILE = base / "versions.json"
         cli.WEB_REMOVED_FILE = base / "web-removed.json"
         cli._fingerprint_sanity_warn = lambda *a, **k: None

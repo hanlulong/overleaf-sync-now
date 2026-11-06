@@ -292,9 +292,12 @@ class ExtractRoundTripSkipTests(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
+        self._orig_cache_dir = cli.CACHE_DIR
+        cli.CACHE_DIR = pathlib.Path(self._tmp.name) / "_data"  # backups land here
         self.folder = pathlib.Path(self._tmp.name)
 
     def tearDown(self):
+        cli.CACHE_DIR = self._orig_cache_dir
         self._tmp.cleanup()
 
     def _build_zip(self, files):
@@ -382,9 +385,12 @@ class ConcurrencyTests(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
+        self._orig_cache_dir = cli.CACHE_DIR
+        cli.CACHE_DIR = pathlib.Path(self._tmp.name) / "_data"  # backups land here
         self.target = pathlib.Path(self._tmp.name) / "state.json"
 
     def tearDown(self):
+        cli.CACHE_DIR = self._orig_cache_dir
         self._tmp.cleanup()
 
     def test_atomic_write_survives_concurrent_writers(self):
