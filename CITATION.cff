@@ -2,8 +2,8 @@ cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 type: software
 title: "overleaf-sync-now: stop AI coding agents from overwriting Overleaf web edits with a stale local Dropbox copy"
-version: "0.4.0"
-date-released: "2026-05-30"
+version: "0.5.0"
+date-released: "2026-11-06"
 authors:
   - family-names: Han
     given-names: Lu
@@ -17,8 +17,8 @@ abstract: >
   actually occurred, then writes only the files whose contents differ.
   AI coding agents (Claude Code, OpenAI Codex CLI) always edit the latest
   version of a LaTeX paper instead of a stale local copy lagging 10–20
-  minutes behind Overleaf's polling-based sync. Includes a PreToolUse hook
-  for Claude Code, a Playwright-managed browser login flow that works
+  minutes behind Overleaf's polling-based sync. Includes PreToolUse hooks
+  for Claude Code and Codex CLI, a Playwright-managed browser login flow that works
   around Chrome 130+ App-Bound Encryption, a recent-mtime guard that
   prevents clobbering in-progress local saves, and sandbox-block detection
   for restricted shells (Codex CLI, CI runners).

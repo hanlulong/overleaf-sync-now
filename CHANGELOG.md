@@ -2,6 +2,143 @@
 
 All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://semver.org/).
 
+## 0.5.0 — 2026-11-06
+
+Hardening release from a second audit. The tool's one job is to stop an AI
+agent from editing a stale local copy, and the audit found several paths
+where it still failed *open* (let the edit through silently): web-side file
+operations, folders it couldn't resolve, shell and Codex edits, and Codex
+having no automatic hook at all. It also stops the CLI from steering agents
+into collecting the user's session cookie in the chat. **After upgrading,
+re-run `overleaf-sync-now install`, and in Codex CLI trust the new hook
+with `/hooks`.**
+
+### Fixed — data safety (the core guarantee)
+
+1. **Web-side file adds, renames and deletes are no longer ignored.**
+   Overleaf reports them in each update's `project_ops`, not in
+   `pathnames`, and the pathname of an added file is not repeated in
+   `pathnames`. An update that only added a file on the web was classified
+   as `dropbox_echo`, the cached version advanced, and the file was never
+   pulled; a file renamed on the web could be edited under its old name and
+   re-uploaded by Dropbox. Adds and rename targets are now pulled; deletes
+   and rename sources are recorded in `<DATA_DIR>/web-removed.json` with a
+   stderr warning, and the hook blocks edits to the old path (local files
+   are never deleted). A non-Dropbox update carrying file ops is never
+   reported as `dropbox_echo`.
+2. **Unresolved Overleaf folders fail closed.** For a file under
+   `Apps/Overleaf/<name>/` whose project can't be determined — not logged in
+   yet (the default state right after `install`), no living project with
+   that name, or several — the hook used to exit 0 silently, because
+   auto-link swallowed every exception including `AuthExpired`. It now
+   **blocks writes (exit 2)** with the reason and the exact fix (`login`, or
+   the candidate ids and the `link` command), and warns on reads. Network
+   and sandbox failures still pass through. A cached project index older
+   than a minute is re-fetched once before concluding "no such project", so
+   new projects still auto-link. `sync` reports the real reason instead of
+   "not under any Overleaf project".
+3. **Shell and Codex edits are covered.** The Claude Code hook now matches
+   `Read|Edit|Write|Bash|PowerShell` and scans Bash/PowerShell commands for
+   `.tex/.bib/.cls/.sty/.bst` paths (quoted paths, `cd <dir> && …`, globs in
+   the project folder); the Codex hook matches `apply_patch|Bash` and parses
+   `*** Update File:` / `*** Add File:` / `*** Delete File:` / `*** Move to:`
+   lines. Every project a call touches is refreshed. `MultiEdit` (no longer
+   a Claude Code tool) is dropped from the matcher.
+4. **Write guard.** If the refresh just pulled newer web content into the
+   file a write is about to change, the write is blocked with a "re-read
+   first" message, so a whole-file Write planned against the old content
+   can't discard the web edit the refresh just brought in. A write is also
+   blocked when the file changed on the web but was saved locally in the
+   last 30 s, so the refresh had to leave it alone (a real conflict). This
+   narrows the mid-turn window described in issue #2; README "Known
+   limitations" describes what remains.
+5. **Writes always re-probe.** The 30 s per-project debounce now applies
+   only to reads; writes re-probe after 3 s, so a web edit made between the
+   agent's Read and its Edit is caught. A rate-limited (HTTP 429) write is
+   no longer recorded as fresh.
+6. **Codex CLI gets automatic protection.** `install` writes an idempotent
+   PreToolUse entry to `~/.codex/hooks.json` (`command` plus a
+   `commandWindows` variant, timeout 180 s), backing up the previous file
+   when it changes, and prints the `/hooks` trust step. Previously Codex had
+   no hook from `install`, and a hand-written one did nothing because the
+   hook rejected `tool_name: apply_patch`. Checked against Codex CLI
+   0.164.0, which loads the entry without warnings.
+
+### Fixed — credentials & security
+
+7. **The cookie never goes through the chat.** The auth-failure text shown
+   to the agent (hook, `sync`, `doctor`, `setup`, `login`) told it to ask
+   the user to paste their `overleaf_session2` cookie and pass it on the
+   command line, which puts a full-account credential into the model
+   provider's transcript, local session logs, the process list and shell
+   history. All recovery text is now login-first and tells the agent never
+   to ask for the cookie in chat. `save-cookie` reads the value from a
+   hidden prompt (no argument) or stdin (`-`); an argument still works but
+   warns. `setup`'s interactive fallback uses a hidden prompt too.
+8. **Cookie prefixes are no longer printed** by `setup` and `doctor`
+   (they showed the first 10-12 characters); they say `present`.
+9. **Markers are validated.** A `.overleaf-project` marker round-trips
+   through the Overleaf project, so collaborators can rewrite it; a
+   `project_id` that isn't 24 hex characters is now ignored instead of being
+   put into request URLs.
+10. **`install`/`uninstall` never delete someone else's skill.** A
+    directory at the install path whose `SKILL.md` doesn't mention
+    `overleaf-sync-now` (another skill named `overleaf`) is left alone with a
+    warning instead of being `rmtree`'d.
+11. **Local file errors are not misreported as a sandbox block.** A
+    `PermissionError` writing a local file shares the "Permission denied"
+    wording with a blocked socket; only network exceptions count now.
+
+### Changed — install, packaging & docs
+
+12. **Skill location.** `install` copies `SKILL.md` to
+    `~/.claude/skills/overleaf/` and `~/.agents/skills/overleaf/` (the Codex
+    user skills folder) and removes our old copy from the older
+    `~/.codex/skills/overleaf/`, so Codex no longer lists the skill twice.
+13. **Claude Code hook in exec form** (`"command": "<abs path>", "args":
+    ["hook"]`) with an explicit `timeout` of 180 s. The old shell form
+    (`"<path>" hook`) is a parse error under PowerShell, which Claude Code
+    uses on Windows without Git Bash, and an old 8 s timeout (written by
+    0.0.1) killed first-use pulls. A longer timeout and an `onFailure`
+    setting you added yourself are kept on reinstall.
+14. **`setup` uses the same auth chain as `sync`** (it skipped the `login`
+    profile and rookiepy) and reports which source worked; its failure text
+    recommends `login` instead of "log in to your browser".
+15. **`status` and `doctor` check install health:** stale skill copies, a
+    leftover `~/.codex/skills` copy, a Claude hook matcher missing
+    Read/Edit/Write/Bash, shell form, a timeout under 60 s, and a missing
+    Codex hook.
+16. **Python >= 3.10** (current playwright and patchright require it); the
+    3.8/3.9 dependency markers and classifiers are gone and 3.14 is added.
+    License metadata uses the PEP 639 form (`license = "MIT"`,
+    `license-files`, setuptools >= 77).
+17. **CI:** `actions/checkout` v7.0.1 and `actions/setup-python` v7.1.0,
+    Python 3.10-3.14, a weekly scheduled run, a check that the wheel ships
+    `SKILL.md`, and Dependabot for the action pins.
+18. **Docs:** README gains a "Known limitations" section and pins install
+    commands to `@v0.5.0`. Corrected against the code: 429 handling (manual
+    `sync` exits 1 and prints the wait; it does not retry), the 60 s
+    validation cache (not "validated on every use"), the marker being written
+    into the project folder, a quoted error message that didn't exist, and
+    the everyday-browser advice that contradicts the Chrome 130+ guidance.
+    SECURITY.md covers agent transcripts. SKILL.md's description leads with
+    user phrasing and drops the angle brackets skill validators reject, and
+    the body explains each exit-2 message and what the agent should do. The
+    bug template asks reporters to redact project names and ids.
+
+### Tests
+
+Added `tests/test_project_ops.py`, `tests/test_hook_coverage.py` and
+`tests/test_install_targets.py`: web add/rename/remove with web and Dropbox
+origins, ordering across updates, and history resync; fail-closed hook runs
+against the real resolver with no auth, an ambiguous `projects.json`, no
+match, and a network failure; Bash/PowerShell/apply_patch path extraction and
+the read-only classifier; the 30 s / 3 s debounce; the write guard and the
+web-removed guard; recovery-text and `save-cookie` input modes; and
+install/uninstall against a fake HOME (`~/.agents/skills`, legacy cleanup,
+foreign-skill protection, exec-form Claude hook, Codex `hooks.json`
+idempotency and backup, install health). Suite: 151 tests.
+
 ## 0.4.0 — 2026-05-30
 
 Hardening release from a deep multi-dimension audit. Closes the two
