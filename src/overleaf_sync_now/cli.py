@@ -215,15 +215,7 @@ def _is_under_data_dir(path):
     try:
         path = pathlib.Path(path).resolve()
         data = pathlib.Path(CACHE_DIR).resolve()
-        # Path.is_relative_to is 3.9+; emulate for 3.8 compat.
-        try:
-            return path.is_relative_to(data)  # type: ignore[attr-defined]
-        except AttributeError:
-            try:
-                path.relative_to(data)
-                return True
-            except ValueError:
-                return False
+        return path.is_relative_to(data)
     except OSError:
         return False
 

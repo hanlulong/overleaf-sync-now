@@ -35,11 +35,11 @@ The unit test suite under `tests/` covers the project resolver, marker handling,
 python -m unittest discover tests
 ```
 
-Tests must pass before opening a PR; CI (`.github/workflows/ci.yml`) runs them across Python 3.8–3.13. Anything touching `_atomic_write_text`, `_extract_files`, the resolver (`_resolve_by_name`, `_autolink_resolve`, `_disambiguate_by_fingerprint`), `refresh_project`, `cmd_hook`, the install/uninstall hook surgery, or the index format should add a test.
+Tests must pass before opening a PR; CI (`.github/workflows/ci.yml`) runs them across Python 3.10–3.14, on every push and pull request and once a week. Anything touching `_atomic_write_text`, `_extract_files`, the resolver (`_resolve_by_name`, `_autolink_resolve`, `_disambiguate_by_fingerprint`), `refresh_project`, `cmd_hook`, the install/uninstall hook surgery, or the index format should add a test.
 
 ## Style
 
-- Python 3.8+ compatible. Avoid 3.9+ syntax/stdlib (`match`, `|` type unions, `str.removeprefix`/`removesuffix`, `Path.is_relative_to` without a 3.8 fallback, etc.).
+- Python 3.10+ compatible (the floor set by current playwright/patchright). Avoid 3.11+ only syntax/stdlib (`except*`, `tomllib`, `typing.Self`, etc.).
 - Standard library where possible. New runtime deps need a justification in the PR.
 - Errors raised by `refresh_project` / `fetch_updates` / `download_zip` should be one of: `AuthExpired`, `RateLimited`, or a `RuntimeError` with a user-actionable message including the path / URL / next step.
 - Anything written to disk should go through `_atomic_write_text` (writes to `.tmp` + `os.replace`) — particularly `~/.claude/settings.json`.
