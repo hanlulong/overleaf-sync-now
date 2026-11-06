@@ -218,5 +218,29 @@ class InstallTargetsTests(unittest.TestCase):
         self.assertEqual([h["command"] for g in groups for h in g["hooks"]], ["python3 check.py"])
 
 
+    # ---- install health (status / doctor) ----
+    def test_health_ok_after_install(self):
+        self.install()
+        self.assertEqual(cli._install_health(), [])
+
+    def test_health_flags_stale_v00_install(self):
+        # The owner's real state before 0.5.0: old skill copy, Edit|Write|
+        # MultiEdit matcher without Read, timeout 8, shell form, no Codex hook,
+        # duplicate ~/.codex/skills copy.
+        for t in list(cli.SKILL_TARGETS.values()) + list(cli.LEGACY_SKILL_TARGETS.values()):
+            t.mkdir(parents=True)
+            (t / "SKILL.md").write_text("old overleaf-sync-now skill")
+        cli.CLAUDE_SETTINGS.write_text(json.dumps({"hooks": {"PreToolUse": [
+            {"matcher": "Edit|Write|MultiEdit",
+             "hooks": [{"type": "command", "command": '"/x/overleaf-sync-now" hook', "timeout": 8}]},
+        ]}}))
+        problems = "\n".join(cli._install_health())
+        for needle in ("stale copy", "old copy", "misses Read", "timeout 8", "shell form",
+                       "no overleaf-sync-now PreToolUse hook in"):
+            self.assertIn(needle, problems)
+        self.install()
+        self.assertEqual(cli._install_health(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1971,6 +1971,7 @@ def cmd_status(args):
                 print("Cookie auth: INVALID — sync would FAIL and the hook blocks AI edits. "
                       "Fix: the user runs `overleaf-sync-now login` in their own terminal "
                       "(headless: `overleaf-sync-now save-cookie`, hidden prompt).")
+    _print_install_health()
     print()
     if not project_id:
         print(f"Folder: {folder.resolve()}")
@@ -2692,6 +2693,95 @@ def _uninstall_codex_hook():
     return True
 
 
+def _install_health():
+    """Problems with the installed skill copies and hooks, as short strings
+    (empty list = healthy). Catches the stale-install case: `uv tool upgrade`
+    replaces the CLI but not the SKILL.md copies or hook entries that an
+    older `install` wrote, so they must be refreshed with `install`."""
+    problems = []
+    try:
+        packaged = SKILL_MD_SRC.read_bytes()
+    except OSError:
+        packaged = None
+    any_copy = False
+    for tool, target in SKILL_TARGETS.items():
+        skill = target / "SKILL.md"
+        if not skill.exists():
+            continue
+        any_copy = True
+        try:
+            if packaged is not None and skill.read_bytes() != packaged:
+                if _is_our_skill_dir(target):
+                    problems.append(f"{tool}: {skill} differs from this version's SKILL.md (stale copy)")
+                else:
+                    problems.append(f"{tool}: {skill} is a different skill named `overleaf`")
+        except OSError as e:
+            problems.append(f"{tool}: cannot read {skill}: {e}")
+    if not any_copy:
+        problems.append("no SKILL.md copy in ~/.claude/skills/overleaf or ~/.agents/skills/overleaf")
+    for tool, target in LEGACY_SKILL_TARGETS.items():
+        if (target / "SKILL.md").exists() and _is_our_skill_dir(target):
+            problems.append(f"{tool}: old copy at {target} (Codex lists the skill twice)")
+    if CLAUDE_SETTINGS.parent.exists():
+        try:
+            settings = json.loads(CLAUDE_SETTINGS.read_text()) if CLAUDE_SETTINGS.exists() else {}
+        except (OSError, ValueError):
+            settings = None
+            problems.append(f"Claude Code: {CLAUDE_SETTINGS} is not valid JSON")
+        if settings is not None:
+            ours = [
+                (g.get("matcher") or "", h)
+                for g in ((settings.get("hooks") or {}).get("PreToolUse") or [])
+                if isinstance(g, dict)
+                for h in (g.get("hooks") or [])
+                if isinstance(h, dict) and _is_our_hook(h)
+            ]
+            if not ours:
+                problems.append("Claude Code: no overleaf-sync-now PreToolUse hook in ~/.claude/settings.json")
+            for matcher, h in ours:
+                tools = set(matcher.split("|"))
+                missing = [t for t in ("Read", "Edit", "Write", "Bash") if t not in tools]
+                if missing:
+                    problems.append(f"Claude Code: hook matcher {matcher!r} misses {', '.join(missing)}")
+                try:
+                    if h.get("timeout") is not None and float(h["timeout"]) < 60:
+                        problems.append(
+                            f"Claude Code: hook timeout {h['timeout']}s is too short for a first "
+                            f"pull (10-30 s); install writes {HOOK_TIMEOUT_SECONDS}s"
+                        )
+                except (TypeError, ValueError):
+                    pass
+                if "args" not in h:
+                    problems.append("Claude Code: hook is in shell form (fails under PowerShell); install writes exec form")
+    if CODEX_HOME.exists():
+        try:
+            codex = json.loads(CODEX_HOOKS.read_text()) if CODEX_HOOKS.exists() else {}
+        except (OSError, ValueError):
+            codex = None
+            problems.append(f"Codex CLI: {CODEX_HOOKS} is not valid JSON")
+        if codex is not None:
+            groups = (codex.get("hooks") or {}).get("PreToolUse") or []
+            ours = [g.get("matcher") or "" for g in groups if isinstance(g, dict)
+                    for h in (g.get("hooks") or []) if isinstance(h, dict) and _is_our_hook(h)]
+            if not ours:
+                problems.append(f"Codex CLI: no overleaf-sync-now PreToolUse hook in {CODEX_HOOKS}")
+            elif not any("apply_patch" in m for m in ours):
+                problems.append(f"Codex CLI: hook matcher {ours[0]!r} does not cover apply_patch")
+    return problems
+
+
+def _print_install_health(indent=""):
+    problems = _install_health()
+    if not problems:
+        print(f"{indent}Install:   OK (skill copies match this version; hooks look current)")
+        return
+    print(f"{indent}Install:   NEEDS ATTENTION — re-run `overleaf-sync-now install`:")
+    for prob in problems:
+        print(f"{indent}  - {prob}")
+    if CODEX_HOME.exists():
+        print(f"{indent}  (In Codex, trust a new or changed hook with /hooks afterwards.)")
+
+
 def cmd_install(args):
     """Set up the skill in available AI tools and add the PreToolUse hooks.
 
@@ -3257,6 +3347,9 @@ def cmd_doctor(args):
             print(f"    Folder {folder} is not under any Overleaf project; can't probe /updates without a project ID.")
     else:
         print(f"    Skipped (auth resolution failed above; fix auth first)")
+    print()
+    print("[6] Install health:")
+    _print_install_health(indent="    ")
 
 
 def cmd_uninstall(args):
