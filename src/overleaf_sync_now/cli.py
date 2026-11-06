@@ -2240,11 +2240,20 @@ def _latex_snapshot(folder, targets=()):
     return snap
 
 
+def _real_path(path):
+    """Absolute path with symlinks resolved; the file need not exist.
+    resolve_project() resolves the folder it returns, so a target reached
+    through a symlink (e.g. ~/Dropbox -> ~/Library/CloudStorage/Dropbox) has
+    to be resolved too before it is compared with that folder."""
+    try:
+        return pathlib.Path(os.path.realpath(str(path)))
+    except (OSError, ValueError):
+        return pathlib.Path(os.path.abspath(str(path)))
+
+
 def _rel_posix(path, folder):
     try:
-        return pathlib.Path(os.path.abspath(str(path))).relative_to(
-            pathlib.Path(os.path.abspath(str(folder)))
-        ).as_posix()
+        return _real_path(path).relative_to(_real_path(folder)).as_posix()
     except ValueError:
         return None
 
@@ -2304,7 +2313,9 @@ def cmd_hook(args):
     blocks = []     # messages that make the hook exit 2
     warnings = []
     unresolved_seen = set()
-    probe_points = [(p, True) for p in paths]
+    # Resolve symlinks once, so the write-guard snapshot keys and the
+    # web-removed lookup compare against the (resolved) project folder.
+    probe_points = [(_real_path(p), True) for p in paths]
     if cwd_hint is not None:
         probe_points.append((cwd_hint, False))
     for point, is_file_target in probe_points:

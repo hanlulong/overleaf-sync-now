@@ -476,6 +476,44 @@ class WriteGuardTests(_HookHarness):
         code, err = self.run_hook({"tool_name": "Write", "tool_input": {"file_path": str(folder / "old.tex")}})
         self.assertEqual(code, 0, err)
 
+    # -- the same guards when the Dropbox root is reached through a symlink
+    #    (~/Dropbox -> ~/Library/CloudStorage/Dropbox on macOS). The resolver
+    #    returns the resolved folder, so the targets must be resolved too.
+    def _via_symlink(self, folder):
+        link = self.base / "link"
+        if not link.exists():
+            try:
+                link.symlink_to(self.base / "Dropbox", target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks are not available here")
+        return link / folder.relative_to(self.base / "Dropbox")
+
+    def test_web_renamed_path_blocks_through_symlinked_dropbox(self):
+        folder = self.project("Paper", files=("old.tex",))
+        cli._atomic_write_text(cli.WEB_REMOVED_FILE, json.dumps({PID: {"old.tex": "new.tex"}}))
+        linked = self._via_symlink(folder)
+        code, err = self.run_hook({"tool_name": "Write", "tool_input": {"file_path": str(linked / "old.tex")}})
+        self.assertEqual(code, 2, err)
+        self.assertIn("renamed on Overleaf to new.tex", err)
+        code, err = self.run_hook({
+            "tool_name": "Bash", "cwd": str(linked),
+            "tool_input": {"command": "sed -i 's/a/b/' old.tex"},
+        })
+        self.assertEqual(code, 2, err)
+        self.assertIn("renamed on Overleaf to new.tex", err)
+        code, err = self.run_hook({"tool_name": "Read", "tool_input": {"file_path": str(linked / "old.tex")}})
+        self.assertEqual(code, 0)
+        self.assertIn("renamed on Overleaf to new.tex", err)
+
+    def test_write_guard_through_symlinked_dropbox(self):
+        folder = self.project("Paper")
+        self._web_edit("main.tex")
+        linked = self._via_symlink(folder)
+        code, err = self.run_hook({"tool_name": "Edit", "tool_input": {"file_path": str(linked / "main.tex")}})
+        self.assertEqual(code, 2, err)
+        self.assertIn("Re-read", err)
+        self.assertIn("main.tex", err)
+
 
 # ---------------------------------------------------------------------------
 # credential hygiene + sandbox classification (OSN-03, OSN-16)
