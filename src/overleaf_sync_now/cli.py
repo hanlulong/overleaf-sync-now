@@ -91,6 +91,12 @@ INDEX_FORMAT_VERSION = 2
 PLAYWRIGHT_PROFILE = pathlib.Path.home() / ".claude" / "playwright-profile"
 WEB_REMOVED_FILE = CACHE_DIR / "web-removed.json"
 PROJECT_MARKER = ".overleaf-project"
+# Opt-out for a folder under Apps/Overleaf/ that is not an Overleaf project:
+# an (empty) file with this name in it or in any parent, or the folder listed
+# in $OVERLEAF_SYNC_IGNORE (paths separated by os.pathsep). The hook and sync
+# then leave everything below it alone.
+IGNORE_MARKER = ".overleaf-sync-ignore"
+IGNORE_ENV = "OVERLEAF_SYNC_IGNORE"
 # Read-type hook calls share one probe per project per 30 s. Write-type calls
 # (Edit/Write/apply_patch/non-read-only shell commands) use a much shorter
 # window so a web edit that lands between a Read and the following Edit is
@@ -1373,6 +1379,7 @@ def resolve_project(start, *, verbose=True, allow_disambig_network=True, read_on
       project_id   24-hex id on success, else None
       reason       "ok"         resolved (marker or auto-link)
                    "unmanaged"  not under a marker or Apps/Overleaf/<name>/
+                   "ignored"    opted out (.overleaf-sync-ignore / $OVERLEAF_SYNC_IGNORE)
                    "auth"       under Apps/Overleaf/<name>/, no valid cookies
                    "none"       ... no living Overleaf project has that name
                    "ambiguous"  ... several living projects share that name
@@ -1398,8 +1405,21 @@ def resolve_project(start, *, verbose=True, allow_disambig_network=True, read_on
     p = pathlib.Path(start).expanduser().resolve()
     if p.is_file():
         p = p.parent
+    for entry in (os.environ.get(IGNORE_ENV) or "").split(os.pathsep):
+        if not entry.strip():
+            continue
+        try:
+            ignored = pathlib.Path(entry.strip()).expanduser().resolve()
+        except OSError:
+            continue
+        if p == ignored or p.is_relative_to(ignored):
+            res.update(folder=ignored, reason="ignored", detail=f"listed in ${IGNORE_ENV}")
+            return res
     cur = p
     while True:
+        if (cur / IGNORE_MARKER).exists():
+            res.update(folder=cur, reason="ignored", detail=f"{cur / IGNORE_MARKER} exists")
+            return res
         marker = cur / PROJECT_MARKER
         if marker.exists():
             try:
@@ -1463,6 +1483,7 @@ def resolve_project(start, *, verbose=True, allow_disambig_network=True, read_on
                         reason=outcome.get("reason") or "none",
                         candidates=outcome.get("candidates") or [],
                         detail=outcome.get("detail"),
+                        numbered_base=outcome.get("numbered_base"),
                     )
                 return res
     return res
@@ -1510,6 +1531,24 @@ def _autolink_resolve(name, folder, *, verbose=True, allow_disambig_network=True
         except (RuntimeError, requests.exceptions.RequestException):
             pass
     status = status_outcome[0]
+    if status == "numbered":
+        # A numbered duplicate folder. With several same-name projects the
+        # fingerprint check may pick one; with a single one, the number is
+        # no evidence ("Chapter 2" is not "Chapter"), so the user decides.
+        outcome["numbered_base"] = status_outcome[1][0].get("name")
+        if len(status_outcome[1]) >= 2:
+            status = "ambiguous"
+        else:
+            outcome.update(reason="ambiguous", candidates=status_outcome[1])
+            if verbose:
+                print(
+                    f"[overleaf-sync-now] auto-link: no project is named {name!r}; it looks like a "
+                    f"numbered copy of {outcome['numbered_base']!r} "
+                    f"({status_outcome[1][0].get('id')}). Not guessing. If that is the project, run:\n"
+                    f"    overleaf-sync-now link {status_outcome[1][0].get('id')} {folder}",
+                    file=sys.stderr,
+                )
+            return None
     outcome["reason"] = status if status != "ok" else None
     if status == "ok":
         pid = status_outcome[1]
@@ -1638,11 +1677,21 @@ def _validate_marker_id_against_index(project_id, folder, *, verbose=True):
         )
 
 
+_NUMBERED_SUFFIX_RE = re.compile(r"^(.*\S)\s+\(?(\d+)\)?$")
+
+
+def _nfc(text):
+    import unicodedata
+    return unicodedata.normalize("NFC", text or "")
+
+
 def _resolve_by_name(name, records):
     """Policy-driven name resolver. Returns one of:
       ("ok", project_id)
       ("none",)
       ("ambiguous", [candidate_records])
+      ("numbered", [candidate_records])  folder "Paper (1)" / "Paper 2" with
+                                         no exact match, projects named "Paper"
 
     Filters trashed and archived projects out by default. Tries case-sensitive
     exact match first; only if that yields zero results does it fall back to
@@ -1652,10 +1701,24 @@ def _resolve_by_name(name, records):
     candidates = [r for r in records
                   if not r.get("trashed") and not r.get("archived")
                   and r.get("name") and r.get("id")]
-    exact = [r for r in candidates if r["name"] == name]
+    # Compare in Unicode NFC: a folder name can reach us decomposed (NFD,
+    # e.g. "E" + combining accent) while Overleaf stores the composed form.
+    name = _nfc(name)
+    exact = [r for r in candidates if _nfc(r["name"]) == name]
     if not exact:
-        exact = [r for r in candidates if r["name"].lower() == name.lower()]
+        exact = [r for r in candidates if _nfc(r["name"]).casefold() == name.casefold()]
     if not exact:
+        # Overleaf's Dropbox sync may append an incremented number to the
+        # folders of projects that share a name ("Paper (1)", "Paper 2").
+        # Never resolve such a folder on the name alone: return the projects
+        # with the base name for the fingerprint check / the user to pick.
+        m = _NUMBERED_SUFFIX_RE.match(name)
+        if m:
+            base = m.group(1).casefold()
+            dup = [r for r in candidates if _nfc(r["name"]).casefold() == base]
+            if dup:
+                dup.sort(key=lambda r: r.get("lastUpdated") or "", reverse=True)
+                return ("numbered", dup)
         return ("none",)
     if len(exact) == 1:
         return ("ok", exact[0]["id"])
@@ -2134,6 +2197,13 @@ def cmd_sync(args):
     folder = pathlib.Path(args[0] if args else ".")
     res = resolve_project(folder)
     linked, project_id = res["folder"], res["project_id"]
+    if res["reason"] == "ignored":
+        print(
+            f"{folder.resolve()} is opted out of overleaf-sync-now ({res.get('detail')}); "
+            f"nothing to sync. Remove the opt-out to sync it.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     if res["reason"] == "auth":
         print(f"ERROR: {res.get('detail')}", file=sys.stderr)
         sys.exit(1)
@@ -2237,7 +2307,8 @@ def cmd_status(args):
     folder = pathlib.Path(args[0] if args else ".")
     # read_only=True so a diagnostic command never writes a marker as a
     # side effect. The next sync (or hook fire) will write the marker.
-    linked, project_id = find_linked_folder(folder, read_only=True)
+    res = resolve_project(folder, read_only=True)
+    linked, project_id = (res["folder"], res["project_id"]) if res["reason"] == "ok" else (None, None)
     print(f"Data dir:    {CACHE_DIR}")
     print(f"Cookie file: {CACHE_FILE} ({'present' if CACHE_FILE.exists() else 'MISSING'})")
     cached = _load_cache()
@@ -2272,7 +2343,10 @@ def cmd_status(args):
     print()
     if not project_id:
         print(f"Folder: {folder.resolve()}")
-        print("Project: not under any Overleaf project (auto-link only works under .../Apps/Overleaf/<name>/)")
+        if res["reason"] == "ignored":
+            print(f"Project: opted out ({res.get('detail')}); the hook and sync leave it alone")
+        else:
+            print("Project: not under any Overleaf project (auto-link only works under .../Apps/Overleaf/<name>/)")
         return
     print(f"Folder:    {linked}")
     # Resolution provenance: was the project ID supplied by an explicit
@@ -2711,8 +2785,14 @@ def _hook_unresolved_message(res, tool):
             f"{head}: not logged in to Overleaf.\n{_AUTH_RECOVERY}"
         )
     if reason == "ambiguous":
-        lines = [f"{head}: {len(res.get('candidates') or [])} living Overleaf projects are named "
-                 f"{res.get('name')!r}. Refusing to guess. Candidates (most recent first):"]
+        n = len(res.get("candidates") or [])
+        if res.get("numbered_base"):
+            lines = [f"{head}: no project is named {res.get('name')!r}; the folder looks like a "
+                     f"numbered duplicate of {res['numbered_base']!r} ({n} living project(s) with "
+                     f"that name). Refusing to guess. Candidates (most recent first):"]
+        else:
+            lines = [f"{head}: {n} living Overleaf projects are named "
+                     f"{res.get('name')!r}. Refusing to guess. Candidates (most recent first):"]
         for c in res.get("candidates") or []:
             lines.append(f"    {c.get('id')}  lastUpdated={c.get('lastUpdated') or '?'}")
         lines.append("  Ask the user which one this folder is, then run:")
@@ -2725,7 +2805,9 @@ def _hook_unresolved_message(res, tool):
         f"  If the project was renamed on Overleaf, ask the user for the project id\n"
         f"  (the 24-character hex in https://www.overleaf.com/project/<id>) and run:\n"
         f"    overleaf-sync-now link <project_id> \"{folder}\"\n"
-        f"  `overleaf-sync-now projects --refresh` lists the user's projects."
+        f"  `overleaf-sync-now projects --refresh` lists the user's projects.\n"
+        f"  If the user says this folder is not an Overleaf project at all, they can opt it\n"
+        f"  out with an empty file named {IGNORE_MARKER} in it (only with their OK)."
     )
 
 
@@ -2782,7 +2864,7 @@ def _cmd_hook(args):
             if is_file_target:
                 entry["paths"].append(point)
             continue
-        if reason == "unmanaged":
+        if reason in ("unmanaged", "ignored"):
             continue
         key = (str(res.get("folder")), reason)
         if key in unresolved_seen:

@@ -703,3 +703,84 @@ class SetupNoPrefixTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# numbered duplicate folders, Unicode normalisation, and the opt-out
+# ---------------------------------------------------------------------------
+class NameMatchingTests(unittest.TestCase):
+    REC = [{"id": "1" * 24, "name": "Paper"}, {"id": "2" * 24, "name": "Paper"},
+           {"id": "3" * 24, "name": "Économie du travail"}, {"id": "4" * 24, "name": "Chapter"}]
+
+    def test_nfd_folder_matches_nfc_project(self):
+        import unicodedata
+        nfd = unicodedata.normalize("NFD", "Économie du travail")
+        self.assertNotEqual(nfd, "Économie du travail")
+        self.assertEqual(cli._resolve_by_name(nfd, self.REC), ("ok", "3" * 24))
+
+    def test_numbered_duplicate_folders_return_the_base_projects(self):
+        for folder in ("Paper (1)", "Paper 1", "paper (2)"):
+            status, cands = cli._resolve_by_name(folder, self.REC)
+            self.assertEqual(status, "numbered")
+            self.assertEqual({c["id"] for c in cands}, {"1" * 24, "2" * 24})
+
+    def test_exact_name_with_number_still_wins(self):
+        rec = self.REC + [{"id": "5" * 24, "name": "Paper 1"}]
+        self.assertEqual(cli._resolve_by_name("Paper 1", rec), ("ok", "5" * 24))
+
+    def test_no_base_project_is_none(self):
+        self.assertEqual(cli._resolve_by_name("Thesis (1)", self.REC), ("none",))
+
+
+class NumberedAndIgnoreHookTests(_HookHarness):
+    def _write(self, folder):
+        f = folder / "main.tex"
+        f.write_text("x")
+        return self.run_hook({"tool_name": "Write", "tool_input": {"file_path": str(f)}})
+
+    def test_single_base_candidate_is_never_auto_linked(self):
+        # "Chapter 2" with only a project named "Chapter": the number is no
+        # evidence, so writes block with the candidate and the link command.
+        self.index([{"id": PID, "name": "Chapter"}])
+        folder = self.overleaf / "Chapter 2"
+        folder.mkdir()
+        code, err = self._write(folder)
+        self.assertEqual(code, 2)
+        self.assertIn("numbered duplicate of 'Chapter'", err)
+        self.assertIn(PID, err)
+        self.assertIn("overleaf-sync-now link", err)
+        self.assertFalse((folder / cli.PROJECT_MARKER).exists())
+
+    def test_numbered_folder_with_two_base_projects_lists_both(self):
+        self.index([{"id": PID, "name": "Paper"}, {"id": PID2, "name": "Paper"}])
+        cli.fetch_updates = lambda pid: {"updates": []}  # fingerprint: no signal
+        folder = self.overleaf / "Paper (1)"
+        folder.mkdir()
+        code, err = self._write(folder)
+        self.assertEqual(code, 2)
+        self.assertIn(PID, err)
+        self.assertIn(PID2, err)
+
+    def test_ignore_marker_opts_a_folder_out(self):
+        folder = self.overleaf / "Not a project"
+        (folder / "sub").mkdir(parents=True)
+        (folder / cli.IGNORE_MARKER).write_text("")
+        code, err = self._write(folder / "sub")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(self.refresh_calls, [])
+
+    def test_ignore_env_var_opts_a_folder_out(self):
+        from unittest import mock
+        folder = self.overleaf / "Scratch"
+        folder.mkdir()
+        with mock.patch.dict(os.environ, {cli.IGNORE_ENV: os.pathsep.join(["/nowhere", str(folder)])}):
+            code, err = self._write(folder)
+        self.assertEqual((code, err), (0, ""))
+
+    def test_no_match_message_mentions_the_opt_out(self):
+        self.index([{"id": PID, "name": "Other"}])
+        folder = self.overleaf / "Notes"
+        folder.mkdir()
+        code, err = self._write(folder)
+        self.assertEqual(code, 2)
+        self.assertIn(cli.IGNORE_MARKER, err)
