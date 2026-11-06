@@ -187,7 +187,8 @@ with `/hooks`.**
     every edit through. The path now comes from PATH, the running entry
     point, this Python's scripts directory or `uv tool dir --bin`, with a
     `uv tool update-shell` hint; `install` refuses to run without one or
-    from uv's cache.
+    from uv's cache. `status` and `doctor` flag an existing hook whose
+    command is a bare name or a path that no longer exists.
 26. **`CLAUDE_CONFIG_DIR` and `CODEX_HOME` are honored**, and `install`
     lists what it wrote and exits 1 when it installed nothing (it used to
     print "Install complete").
