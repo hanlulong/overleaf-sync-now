@@ -486,6 +486,8 @@ class CredentialHygieneTests(unittest.TestCase):
         src = (ROOT / "src" / "overleaf_sync_now" / "cli.py").read_text()
         self.assertNotIn("Ask the user: 'Paste", src)
         self.assertNotIn('save-cookie \\"<', src)
+        skill = (ROOT / "src" / "overleaf_sync_now" / "SKILL.md").read_text()
+        self.assertNotIn('save-cookie "<value>"', skill)
 
     def test_local_permission_error_is_not_a_sandbox_block(self):
         self.assertFalse(cli._is_sandbox_block(PermissionError(13, "Permission denied", "/x/main.tex")))
