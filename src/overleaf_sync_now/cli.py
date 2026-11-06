@@ -3076,10 +3076,12 @@ def _hook_output_json(text, event="PreToolUse"):
     permissionDecision: the normal permission flow still applies."""
     if len(text) > 4000:
         text = text[:3990] + "\n[...]"
+    # ASCII escapes: valid JSON whatever the console's code page is (a
+    # Windows cp1252 stdout cannot encode a project named "论文").
     return json.dumps({
         "systemMessage": text,
         "hookSpecificOutput": {"hookEventName": event, "additionalContext": text},
-    }, ensure_ascii=False)
+    })
 
 
 def cmd_hook(args):

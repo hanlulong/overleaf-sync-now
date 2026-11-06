@@ -332,6 +332,7 @@ class HookSummaryTests(_Env):
         self.assertEqual(out["hookSpecificOutput"]["additionalContext"], out["systemMessage"])
         self.assertNotIn("permissionDecision", out["hookSpecificOutput"])
         self.assertNotIn("continue", out)  # Codex rejects it on PreToolUse
+        self.stdout.encode("ascii")  # any console code page can print it
 
     def test_nothing_to_report_prints_nothing(self):
         main = self.local("main.tex", "SAME\n", minutes_ago=60)
