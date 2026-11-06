@@ -322,6 +322,27 @@ class InstallTargetsTests(unittest.TestCase):
         self.assertEqual(backup.read_text(encoding="utf-8"), original)
 
 
+    def test_uninstall_lists_markers_data_dir_and_session(self):
+        import tempfile as _tf
+        from unittest import mock
+        proj = self.home / "Dropbox" / "Apps" / "Overleaf" / "My JMP"
+        proj.mkdir(parents=True)
+        marker = proj / cli.PROJECT_MARKER
+        marker.write_text(json.dumps({"project_id": "0123456789abcdef01234567"}))
+        data = self.home / "data"
+        data.mkdir()
+        self.install()
+        with mock.patch.object(cli, "HOME", self.home), mock.patch.object(cli, "CACHE_DIR", data):
+            cli.cmd_uninstall([])
+            out = self.out.getvalue()
+            self.assertIn(str(marker), out)
+            self.assertIn("--remove-markers", out)
+            self.assertIn(str(data), out)
+            self.assertIn("Clear Sessions", out)
+            self.assertTrue(marker.exists())
+            cli.cmd_uninstall(["--remove-markers"])
+        self.assertFalse(marker.exists())
+
     # ---- install health (status / doctor) ----
     def test_health_ok_after_install(self):
         self.install()

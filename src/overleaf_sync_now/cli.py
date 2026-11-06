@@ -19,7 +19,9 @@ Subcommands:
   doctor                        Verbose diagnostic dump of the auth chain
   hook                          PreToolUse hook entrypoint for Claude Code and Codex CLI
                                 (reads the tool-call JSON from stdin)
-  uninstall                     Remove skill copies and hooks (cookies preserved)
+  uninstall [--remove-markers]  Remove skill copies and hooks, then list what is left
+                                (markers, cached session, browser download) and how to
+                                remove it
 
 Auth chain (first hit wins): cached cookies -> persistent `login` browser
 profile (the proper Chrome 130+ Windows fix) -> rookiepy (Rust cookie reader,
@@ -4066,7 +4068,68 @@ def cmd_doctor(args):
     _print_install_health(indent="    ")
 
 
+def _playwright_cache_dir():
+    """Where `login` downloaded its browser (shared with other Playwright
+    tools): $PLAYWRIGHT_BROWSERS_PATH, else the per-OS default."""
+    env = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if env and env != "0":
+        return pathlib.Path(env).expanduser()
+    if sys.platform == "darwin":
+        return HOME / "Library" / "Caches" / "ms-playwright"
+    if os.name == "nt":
+        return pathlib.Path(os.environ.get("LOCALAPPDATA") or (HOME / "AppData" / "Local")) / "ms-playwright"
+    return pathlib.Path(os.environ.get("XDG_CACHE_HOME") or (HOME / ".cache")) / "ms-playwright"
+
+
+def _overleaf_roots(extra=()):
+    """Apps/Overleaf folders to look for markers in: the usual Dropbox
+    locations plus any folders given on the command line."""
+    bases = [HOME / "Dropbox"]
+    for pattern in ("Dropbox (*)", "Library/CloudStorage/Dropbox*"):
+        try:
+            bases += sorted(HOME.glob(pattern))
+        except OSError:
+            pass
+    roots = [b / "Apps" / "Overleaf" for b in bases]
+    roots += [pathlib.Path(x).expanduser() for x in extra]
+    seen, out = set(), []
+    for r in roots:
+        try:
+            key = r.resolve()
+        except OSError:
+            continue
+        if key not in seen and r.is_dir():
+            seen.add(key)
+            out.append(r)
+    return out
+
+
+def _find_markers(roots):
+    """`.overleaf-project` files in each root and its direct subfolders (auto-
+    link writes them at Apps/Overleaf/<project>/)."""
+    found = []
+    for r in roots:
+        candidates = [r / PROJECT_MARKER]
+        try:
+            candidates += [c / PROJECT_MARKER for c in sorted(r.iterdir()) if c.is_dir()]
+        except OSError:
+            pass
+        for m in candidates:
+            try:
+                if m.is_file() and "project_id" in m.read_text(encoding="utf-8", errors="replace"):
+                    found.append(m)
+            except OSError:
+                pass
+    return found
+
+
 def cmd_uninstall(args):
+    """uninstall [--remove-markers] [FOLDER ...]: remove our skill copies and
+    hooks, then list what stays behind (project markers, the data dir with the
+    cached session, the browser download) and how to remove it. FOLDERs are
+    extra Apps/Overleaf (or project) folders to search for markers."""
+    remove_markers = "--remove-markers" in args
+    extra = [a for a in args if not a.startswith("--")]
     print("=== Uninstalling overleaf-sync-now skill and hooks ===")
     for tool, target in list(SKILL_TARGETS.items()) + list(LEGACY_SKILL_TARGETS.items()):
         if target.exists() or target.is_symlink():
@@ -4086,7 +4149,42 @@ def cmd_uninstall(args):
                     print(f"  - Claude Code hook removed from {CLAUDE_SETTINGS}")
     if _uninstall_codex_hook():
         print(f"  - Codex CLI hook removed from {CODEX_HOOKS}")
-    print(f"  - Cookies and state preserved at {CACHE_DIR} (delete manually if desired)")
+
+    markers = _find_markers(_overleaf_roots(extra))
+    if remove_markers:
+        for m in markers:
+            try:
+                m.unlink()
+                print(f"  - removed marker {m}")
+            except OSError as e:
+                print(f"  WARN: could not remove {m}: {e}", file=sys.stderr)
+        markers = [m for m in markers if m.exists()]
+
+    print()
+    print("Left in place (remove what you no longer want):")
+    if markers:
+        print(f"  - {len(markers)} project marker(s). Each syncs into its Overleaf project through")
+        print("    Dropbox, so collaborators see it too:")
+        for m in markers[:20]:
+            print(f"      {m}")
+        if len(markers) > 20:
+            print(f"      ... and {len(markers) - 20} more")
+        print("    Remove them with `overleaf-sync-now uninstall --remove-markers` (or delete the files).")
+    else:
+        print("  - No .overleaf-project markers found in the usual Dropbox locations. If your")
+        print("    Dropbox folder is elsewhere, run `overleaf-sync-now uninstall <Apps/Overleaf folder>`.")
+    if CACHE_DIR.exists():
+        print(f"  - Data dir {CACHE_DIR}: the cached Overleaf session (cookies.json), the `login`")
+        print("    browser profile, backups/ and conflicts/ copies of your files, and sync state.")
+        print(f"    Remove it: rm -r \"{CACHE_DIR}\"   (Windows: Remove-Item -Recurse \"{CACHE_DIR}\")")
+    pw = _playwright_cache_dir()
+    if pw.exists():
+        print(f"  - Browser downloaded by `login`: {pw} (shared with any other Playwright tool;")
+        print("    remove it only if nothing else uses it).")
+    print("  - The Overleaf session itself stays valid on Overleaf's servers until it expires;")
+    print("    deleting files does not end it. To end it: on overleaf.com open Account >")
+    print("    Account Settings > Sessions > Manage your sessions, then Clear Sessions.")
+    print("  - The CLI: uv tool uninstall overleaf-sync-now")
 
 
 # -------- entry --------
