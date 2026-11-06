@@ -748,9 +748,7 @@ _OFFLINE_HINT = (
     "cookie was not checked, so do not run login or setup for this."
 )
 # Appended only where a refresh was attempted (sync), not by status/doctor/save-cookie.
-_NOT_REFRESHED_NOTE = (
-    " The local copy was not refreshed and may be stale; retry when the connection is back."
-)
+_NOT_REFRESHED_NOTE = " The local copy was not refreshed and may be stale."
 
 
 def _network_detail(exc):
