@@ -211,9 +211,13 @@ class HookOfflineTests(_Env):
         key = "file_path"
         sys.stdin = io.StringIO(json.dumps({"tool_name": tool, "tool_input": {key: str(self.tex)}}))
         sys.stderr = err = io.StringIO()
-        with self.assertRaises(SystemExit) as cm:
-            cli.cmd_hook([])
-        sys.stderr = self._streams[2]
+        sys.stdout = out = io.StringIO()
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                cli.cmd_hook([])
+        finally:
+            sys.stdout, sys.stderr = self._streams[1], self._streams[2]
+        self.stdout = out.getvalue()
         return cm.exception.code or 0, err.getvalue()
 
     def test_offline_edit_passes_with_note_not_auth_block(self):
@@ -227,6 +231,10 @@ class HookOfflineTests(_Env):
             self.assertIn(f"{tool} allowed", err)
             self.assertNotIn("No valid Overleaf cookies", err)
             self.assertNotIn("overleaf-sync-now login", err)
+            # The note reaches the user and the model, not only stderr.
+            note = json.loads(self.stdout)
+            self.assertIn("Could not reach Overleaf", note["systemMessage"])
+            self.assertIn(f"{tool} allowed", note["hookSpecificOutput"]["additionalContext"])
         self.assertEqual(self.chain_calls, [])
 
     def test_codex_sandbox_edit_passes_with_sandbox_hint(self):
@@ -265,6 +273,17 @@ class CommandMessagesTests(_Env):
         code, out = self.capture(cli.cmd_status, [str(self.base)])
         self.assertIn("could not reach Overleaf", out)
         self.assertNotIn("INVALID", out)
+        self.assertNotIn("was not refreshed", out)  # status refreshes nothing
+
+    def test_sync_offline_says_not_refreshed(self):
+        folder = self.base / "Dropbox" / "Apps" / "Overleaf" / "P"
+        folder.mkdir(parents=True)
+        (folder / cli.PROJECT_MARKER).write_text(json.dumps({"project_id": PID}))
+        self.cookie()
+        code, out = self.capture(cli.cmd_sync, [str(folder)])
+        self.assertEqual(code, 1)
+        self.assertIn("could not reach overleaf", out.lower())
+        self.assertIn("was not refreshed", out)
 
     def test_doctor_says_unknown_not_invalid(self):
         self.cookie()
@@ -275,6 +294,22 @@ class CommandMessagesTests(_Env):
         self.assertIn("could not reach Overleaf", out)
         self.assertNotIn("INVALID (rejected", out)
         self.assertNotIn("WOULD FAIL", out)
+
+    def test_doctor_reads_no_browser_store_when_unreachable(self):
+        # Reading a browser store can raise a macOS keychain dialog; with
+        # Overleaf unreachable a cookie found there could not be checked.
+        import types
+        calls = []
+        fake = types.ModuleType("rookiepy")
+        for name in cli.CHROMIUM_COOKIE_FNS:
+            setattr(fake, name, lambda *a, _n=name, **k: calls.append(_n) or [])
+        self.cookie()
+        cli._resolve_cookies = self._orig["_resolve_cookies"]
+        with mock.patch.dict(sys.modules, {"rookiepy": fake, "browser_cookie3": fake}):
+            code, out = self.capture(cli.cmd_doctor, [str(self.base)])
+        self.assertEqual(calls, [])
+        self.assertIn("Browser cookie stores: skipped", out)
+        self.assertIn("UNKNOWN", out)
 
     def test_save_cookie_says_could_not_reach_and_saves_nothing(self):
         sys.stdin = io.StringIO("abc123\n")

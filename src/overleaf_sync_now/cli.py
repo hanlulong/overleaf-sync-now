@@ -4420,6 +4420,7 @@ def cmd_doctor(args):
     print()
 
     cached = _load_cache()
+    net_down = None  # set when [1] could not reach Overleaf
     if cached:
         names = sorted(cached.keys())
         has_session = SESSION_COOKIE in cached
@@ -4433,6 +4434,7 @@ def cmd_doctor(args):
             if state == "ok":
                 print("    -> Result: OK")
             elif state == "unreachable":
+                net_down = NetworkUnavailable(_network_unavailable_message(exc))
                 print(f"    -> Result: UNKNOWN (could not reach Overleaf: {_network_detail(exc)})")
                 print(f"       {_network_unavailable_message(exc)}")
             else:
@@ -4441,9 +4443,31 @@ def cmd_doctor(args):
         print("[1] Cached cookies: NONE")
     print()
 
+    # Each browser's cookie store is read once per reader here ([2a], [2b]);
+    # [4] reuses what they found instead of reading the stores again, so on
+    # macOS a browser asks for keychain access at most once per reader.
+    found = []
+    if net_down is not None:
+        print("[2] Browser cookie stores: skipped (Overleaf could not be reached in [1], so a")
+        print("    cookie found there could not be checked; on macOS reading them can ask for")
+        print("    keychain access). Re-run doctor when the connection is back.")
+        print()
+    rookie_mod = bc3_mod = None
+    if net_down is None:
+        try:
+            import rookiepy as rookie_mod
+        except ImportError:
+            print("[2a] rookiepy: not installed (recommended on Windows for Chrome 127+; `pip install rookiepy`)")
+            print()
+        try:
+            import browser_cookie3 as bc3_mod
+        except ImportError:
+            print("[2b] browser_cookie3: NOT INSTALLED — run `pip install browser-cookie3` or reinstall")
+            print()
+
     # Rookie (Chrome 127+ friendly)
-    try:
-        import rookiepy
+    if rookie_mod is not None:
+        rookiepy = rookie_mod
         print(f"[2a] rookiepy: installed")
         for fn_name in CHROMIUM_COOKIE_FNS:
             fn = getattr(rookiepy, fn_name, None)
@@ -4454,16 +4478,15 @@ def cmd_doctor(args):
                 cookies = {c["name"]: c["value"] for c in raw}
                 if SESSION_COOKIE in cookies:
                     print(f"     {fn_name:10s}: {SESSION_COOKIE} present")
+                    found.append((f"rookiepy {fn_name}", cookies))
                 else:
                     print(f"     {fn_name:10s}: no overleaf.com cookies (not logged in here?)")
             except Exception as e:
                 print(f"     {fn_name:10s}: error - {type(e).__name__}: {e}")
-    except ImportError:
-        print("[2a] rookiepy: not installed (recommended on Windows for Chrome 127+; `pip install rookiepy`)")
-    print()
+        print()
 
-    try:
-        import browser_cookie3
+    if bc3_mod is not None:
+        browser_cookie3 = bc3_mod
         print(f"[2b] browser_cookie3: installed (v{getattr(browser_cookie3, '__version__', '?')})")
         for fn_name in CHROMIUM_COOKIE_FNS:
             fn = getattr(browser_cookie3, fn_name, None)
@@ -4475,16 +4498,16 @@ def cmd_doctor(args):
                 cookies = {c.name: c.value for c in cj}
                 if SESSION_COOKIE in cookies:
                     print(f"    {fn_name:10s}: {SESSION_COOKIE} present")
+                    found.append((f"browser_cookie3 {fn_name}", cookies))
                 else:
                     print(f"    {fn_name:10s}: no overleaf.com cookies (not logged in here?)")
             except Exception as e:
                 print(f"    {fn_name:10s}: error - {type(e).__name__}: {e}")
-    except ImportError:
-        print("[2b] browser_cookie3: NOT INSTALLED — run `pip install browser-cookie3` or reinstall")
-    print()
+        print()
 
     pw = _try_playwright_profile()
     if pw and SESSION_COOKIE in pw:
+        found.append(("Claude Code Playwright profile", pw))
         print(f"[3] Playwright profile: {SESSION_COOKIE} found")
     elif PLAYWRIGHT_PROFILE.exists():
         print("[3] Playwright profile: present but no usable overleaf.com cookies")
@@ -4492,12 +4515,24 @@ def cmd_doctor(args):
         print("[3] Playwright profile: not installed (this is fine; only needed if browser_cookie3 fails)")
     print()
 
-    # Best-available cookies
-    try:
-        best = _resolve_cookies(interactive=False, browsers=True)
-        unreachable = None
-    except NetworkUnavailable as e:
-        best, unreachable = None, e
+    # Best-available cookies: cached cookie and `login` profile, then what
+    # [2a]/[2b]/[3] found (no second read of the browser stores).
+    best, unreachable = None, net_down
+    if unreachable is None:
+        try:
+            best = _resolve_cookies(interactive=False, browsers=False)
+        except NetworkUnavailable as e:
+            unreachable = e
+    if best is None and unreachable is None:
+        for _label, cookies in found:
+            state, exc = _check_cookies(cookies, use_cache=False)
+            if state == "ok":
+                _save_cache(cookies)
+                best = cookies
+                break
+            if state == "unreachable":
+                unreachable = NetworkUnavailable(_network_unavailable_message(exc))
+                break
     if unreachable is not None:
         print("[4] Auth resolution: UNKNOWN (could not reach Overleaf; this is not an auth failure).")
         print(f"    {unreachable}")
