@@ -165,7 +165,7 @@ def _replace_with_retry(src, dst):
     raise last_err
 
 
-def _atomic_write_text(path, text):
+def _atomic_write_text(path, text, *, mode=None):
     """Write `text` to `path` atomically: write to a unique sibling tempfile,
     then os.replace. Avoids leaving the destination in a half-written state
     if the process is killed (which would corrupt e.g. ~/.claude/settings.json).
@@ -181,8 +181,13 @@ def _atomic_write_text(path, text):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = _unique_tmp_path(path)
     try:
-        with open(tmp, "w") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             f.write(text)
+        if mode is not None:
+            try:
+                os.chmod(tmp, mode)
+            except OSError:
+                pass
         # Restrict perms BEFORE the atomic replace so the target file never
         # exists with permissive perms — even briefly. POSIX-only; on Windows
         # ACL inheritance from the parent dir is the relevant control.
@@ -2979,8 +2984,13 @@ def _cmd_hook(args):
 # -------- install / uninstall --------
 
 HOME = pathlib.Path.home()
+# Claude Code reads its configuration from $CLAUDE_CONFIG_DIR when set (one
+# directory per account), else ~/.claude. Codex CLI uses $CODEX_HOME, else
+# ~/.codex. ~/.agents/skills is the Codex user skills folder either way.
+CLAUDE_DIR = pathlib.Path(os.environ.get("CLAUDE_CONFIG_DIR") or (HOME / ".claude")).expanduser()
+CODEX_HOME = pathlib.Path(os.environ.get("CODEX_HOME") or (HOME / ".codex")).expanduser()
 SKILL_TARGETS = {
-    "Claude Code": HOME / ".claude" / "skills" / "overleaf",
+    "Claude Code": CLAUDE_DIR / "skills" / "overleaf",
     # Codex CLI (and other Agent Skills clients) read user skills from
     # ~/.agents/skills (the documented user location); <= 0.4.x used
     # ~/.codex/skills, and two copies make Codex list the skill twice.
@@ -2989,15 +2999,76 @@ SKILL_TARGETS = {
 # Copies written by <= 0.4.x. Removed on install (when ours) so Codex does not
 # list the skill twice, and on uninstall.
 LEGACY_SKILL_TARGETS = {
-    "Codex CLI (legacy ~/.codex/skills)": HOME / ".codex" / "skills" / "overleaf",
+    "Codex CLI (legacy ~/.codex/skills)": CODEX_HOME / "skills" / "overleaf",
 }
-CLAUDE_SETTINGS = HOME / ".claude" / "settings.json"
-CODEX_HOME = pathlib.Path(os.environ.get("CODEX_HOME") or (HOME / ".codex"))
+CLAUDE_SETTINGS = CLAUDE_DIR / "settings.json"
 CODEX_HOOKS = CODEX_HOME / "hooks.json"
+SETTINGS_BACKUP_SUFFIX = ".bak-overleaf-sync-now"
+
+
+def _env_dir_is(var, path):
+    """True when $var names `path` (the user pointed the tool at it, so it
+    counts as present even before the client has created it)."""
+    value = os.environ.get(var)
+    if not value:
+        return False
+    try:
+        return pathlib.Path(value).expanduser().resolve() == pathlib.Path(path).resolve()
+    except OSError:
+        return False
+
+
+def _claude_present():
+    return CLAUDE_SETTINGS.parent.exists() or _env_dir_is("CLAUDE_CONFIG_DIR", CLAUDE_SETTINGS.parent)
+
+
+def _codex_present():
+    return CODEX_HOME.exists() or _env_dir_is("CODEX_HOME", CODEX_HOME)
+
+
+def _is_ephemeral_install(path):
+    """A uvx / `uv run --with` environment lives in uv's cache and can be
+    garbage-collected at any time, so a hook pointing into it breaks later."""
+    parts = [x.lower() for x in pathlib.PurePath(str(path)).parts]
+    if any(x.startswith("archive-v") or x.startswith("builds-v") for x in parts):
+        return True
+    cache = os.environ.get("UV_CACHE_DIR")
+    if cache:
+        try:
+            return pathlib.Path(path).resolve().is_relative_to(pathlib.Path(cache).resolve())
+        except OSError:
+            return False
+    return False
 
 
 def _cli_path():
-    return shutil.which("overleaf-sync-now")
+    """Absolute path of the overleaf-sync-now executable, or None.
+
+    The hooks must name it absolutely: Claude Code runs hook commands with
+    its own PATH, and a hook that cannot start (exit 127) does not block the
+    tool call. ~/.local/bin is often not on PATH (e.g. uv from Homebrew), so
+    besides PATH this also looks at the running entry point, the scripts
+    directory of this Python (the uv tool environment), and `uv tool dir
+    --bin`."""
+    found = shutil.which("overleaf-sync-now")
+    candidates = [found] if found else []
+    argv0 = sys.argv[0] if sys.argv else ""
+    if argv0 and os.path.basename(argv0).lower().startswith("overleaf-sync-now"):
+        candidates.append(argv0)
+    exe_dir = pathlib.Path(sys.executable).parent
+    candidates += [str(exe_dir / "overleaf-sync-now"), str(exe_dir / "overleaf-sync-now.exe")]
+    try:
+        out = subprocess.run(["uv", "tool", "dir", "--bin"], capture_output=True, text=True,
+                             timeout=10, check=False).stdout.strip()
+        if out:
+            candidates += [str(pathlib.Path(out) / "overleaf-sync-now"),
+                           str(pathlib.Path(out) / "overleaf-sync-now.exe")]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    for c in candidates:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return os.path.abspath(c)
+    return None
 
 
 def _claude_hook_handler(existing=None):
@@ -3008,7 +3079,7 @@ def _claude_hook_handler(existing=None):
     a bare `overleaf-sync-now` on PATH when the absolute path is unknown."""
     handler = {
         "type": "command",
-        "command": _cli_path() or "overleaf-sync-now",
+        "command": _cli_path() or "overleaf-sync-now",  # install refuses to run without a path
         "args": ["hook"],
         "timeout": HOOK_TIMEOUT_SECONDS,
     }
@@ -3145,12 +3216,12 @@ def _read_json_config(path, label):
     if not path.exists():
         return {}, True
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
             raise ValueError("top level is not a JSON object")
         return data, True
-    except (json.JSONDecodeError, ValueError) as e:
+    except (json.JSONDecodeError, ValueError) as e:  # UnicodeDecodeError is a ValueError
         backup = path.with_name(f"{path.name}.broken-{int(time.time())}")
         try:
             shutil.copyfile(str(path), str(backup))
@@ -3162,6 +3233,34 @@ def _read_json_config(path, label):
             file=sys.stderr,
         )
         return None, False
+
+
+def _write_json_config(path, data, *, backup="once"):
+    """Write a client config file without breaking how the user keeps it.
+
+    Writes through a symlink (dotfiles setups link settings.json elsewhere;
+    replacing the link would silently fork the config), keeps non-ASCII text
+    as is, keeps the file mode, and saves the previous content first: once as
+    <name>.bak-overleaf-sync-now (backup="once"), or as a timestamped copy
+    (backup="timestamped"). Returns the backup path written, if any."""
+    real = pathlib.Path(os.path.realpath(str(path)))
+    made = None
+    mode = None
+    if real.exists():
+        try:
+            mode = real.stat().st_mode & 0o777
+        except OSError:
+            mode = None
+        if backup == "timestamped":
+            made = real.with_name(f"{real.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+        else:
+            made = real.with_name(real.name + SETTINGS_BACKUP_SUFFIX)
+            if made.exists():
+                made = None
+        if made is not None:
+            shutil.copyfile(str(real), str(made))
+    _atomic_write_text(real, json.dumps(data, indent=2, ensure_ascii=False) + "\n", mode=mode)
+    return made
 
 
 def _install_codex_hook():
@@ -3194,11 +3293,9 @@ def _install_codex_hook():
     data["hooks"] = hooks
     if json.dumps(data, indent=2, sort_keys=True) == original:
         return True
-    if CODEX_HOOKS.exists():
-        backup = CODEX_HOOKS.with_name(f"hooks.json.bak-{time.strftime('%Y%m%d-%H%M%S')}")
-        shutil.copyfile(str(CODEX_HOOKS), str(backup))
+    backup = _write_json_config(CODEX_HOOKS, data, backup="timestamped")
+    if backup:
         print(f"  - Codex CLI: previous hooks.json backed up to {backup}")
-    _atomic_write_text(CODEX_HOOKS, json.dumps(data, indent=2) + "\n")
     return True
 
 
@@ -3218,7 +3315,7 @@ def _uninstall_codex_hook():
         hooks["PreToolUse"] = groups
     else:
         hooks.pop("PreToolUse", None)
-    _atomic_write_text(CODEX_HOOKS, json.dumps(data, indent=2) + "\n")
+    _write_json_config(CODEX_HOOKS, data, backup="timestamped")
     return True
 
 
@@ -3250,13 +3347,14 @@ def _install_health():
         except OSError as e:
             problems.append(f"{tool}: cannot read {skill}: {e}")
     if not any_copy:
-        problems.append("no SKILL.md copy in ~/.claude/skills/overleaf or ~/.agents/skills/overleaf")
+        problems.append("no SKILL.md copy in " + " or ".join(str(t) for t in SKILL_TARGETS.values()))
     for tool, target in LEGACY_SKILL_TARGETS.items():
         if (target / "SKILL.md").exists() and _is_our_skill_dir(target):
             problems.append(f"{tool}: old copy at {target} (Codex lists the skill twice)")
     if CLAUDE_SETTINGS.parent.exists():
         try:
-            settings = json.loads(CLAUDE_SETTINGS.read_text()) if CLAUDE_SETTINGS.exists() else {}
+            settings = (json.loads(CLAUDE_SETTINGS.read_text(encoding="utf-8"))
+                        if CLAUDE_SETTINGS.exists() else {})
         except (OSError, ValueError):
             settings = None
             problems.append(f"Claude Code: {CLAUDE_SETTINGS} is not valid JSON")
@@ -3269,7 +3367,7 @@ def _install_health():
                 if isinstance(h, dict) and _is_our_hook(h)
             ]
             if not ours:
-                problems.append("Claude Code: no overleaf-sync-now PreToolUse hook in ~/.claude/settings.json")
+                problems.append(f"Claude Code: no overleaf-sync-now PreToolUse hook in {CLAUDE_SETTINGS}")
             for matcher, h in ours:
                 tools = set(matcher.split("|"))
                 missing = [t for t in ("Read", "Edit", "Write", "Bash") if t not in tools]
@@ -3287,7 +3385,7 @@ def _install_health():
                     problems.append("Claude Code: hook is in shell form (fails under PowerShell); install writes exec form")
     if CODEX_HOME.exists():
         try:
-            codex = json.loads(CODEX_HOOKS.read_text()) if CODEX_HOOKS.exists() else {}
+            codex = json.loads(CODEX_HOOKS.read_text(encoding="utf-8")) if CODEX_HOOKS.exists() else {}
         except (OSError, ValueError):
             codex = None
             problems.append(f"Codex CLI: {CODEX_HOOKS} is not valid JSON")
@@ -3317,22 +3415,51 @@ def _print_install_health(indent=""):
 def cmd_install(args):
     """Set up the skill in available AI tools and add the PreToolUse hooks.
 
-    Everything written here is USER-GLOBAL (~/.claude/, ~/.agents/, ~/.codex/).
-    The hooks + skill apply to every project the user works in, in any
-    directory. The only per-project file the tool ever writes is the
-    `.overleaf-project` marker that auto-link drops into an Overleaf folder.
+    Everything written here is USER-GLOBAL (~/.claude/ or $CLAUDE_CONFIG_DIR,
+    ~/.agents/, ~/.codex/ or $CODEX_HOME). The hooks + skill apply to every
+    project the user works in, in any directory. The only per-project file the
+    tool ever writes is the `.overleaf-project` marker that auto-link drops
+    into an Overleaf folder.
     """
     print("=== Installing overleaf-sync-now (USER-GLOBAL, applies to all projects) ===\n")
 
-    # 1. Copy SKILL.md into available skills directories.
     if not SKILL_MD_SRC.exists():
         print(f"ERROR: SKILL.md not found at {SKILL_MD_SRC}", file=sys.stderr)
         sys.exit(1)
-    codex_present = CODEX_HOME.exists()
+    # The hooks name the CLI by absolute path. Without one, a hook would be a
+    # bare `overleaf-sync-now` that fails to start (exit 127) wherever it is
+    # not on PATH, and a hook that cannot start lets every edit through.
+    cli = _cli_path()
+    if not cli:
+        print(
+            "ERROR: could not find the overleaf-sync-now executable (not on PATH, not next to\n"
+            f"  this Python ({sys.executable}), and `uv tool dir --bin` did not list it).\n"
+            "  Nothing was installed. Install the CLI with `uv tool install` (see README), then run\n"
+            "  the installed `overleaf-sync-now install`.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if _is_ephemeral_install(cli):
+        print(
+            f"ERROR: {cli} is in uv's cache (a uvx / `uv run` environment that uv may delete),\n"
+            "  so hooks pointing at it would break later. Nothing was installed. Run\n"
+            "    uv tool install --from git+https://github.com/hanlulong/overleaf-sync-now"
+            f"@v{_pkg_version()} overleaf-sync-now\n"
+            "  and then `overleaf-sync-now install`.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    installed = []
+    claude_present = _claude_present()
+    codex_present = _codex_present()
+
+    # 1. Copy SKILL.md into available skills directories.
     for tool, target in SKILL_TARGETS.items():
-        root = target.parent.parent  # ~/.claude or ~/.agents
-        if not root.exists() and not (tool == "Codex CLI" and codex_present):
-            print(f"  - {tool}: skipped ({root} not found)")
+        present = claude_present if tool == "Claude Code" else (
+            target.parent.parent.exists() or codex_present)
+        if not present:
+            print(f"  - {tool}: skipped ({target.parent.parent} not found)")
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         if not _remove_existing_target(target):
@@ -3340,6 +3467,7 @@ def cmd_install(args):
             continue
         target.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(str(SKILL_MD_SRC), str(target / "SKILL.md"))
+        installed.append(f"{tool} skill: {target / 'SKILL.md'}")
         print(f"  - {tool}: SKILL.md installed at {target / 'SKILL.md'}  [user-global]")
     for tool, target in LEGACY_SKILL_TARGETS.items():
         if (target.exists() or target.is_symlink()) and _is_our_skill_dir(target):
@@ -3348,8 +3476,8 @@ def cmd_install(args):
 
     # 2. Add Claude Code PreToolUse hook (atomically — settings.json
     # corruption breaks Claude Code start, so don't half-write it).
-    if CLAUDE_SETTINGS.parent.exists():
-        settings, ok = _read_json_config(CLAUDE_SETTINGS, "~/.claude/settings.json")
+    if claude_present:
+        settings, ok = _read_json_config(CLAUDE_SETTINGS, str(CLAUDE_SETTINGS))
         if not ok:
             sys.exit(1)
         hooks_root = settings.setdefault("hooks", {})
@@ -3357,25 +3485,41 @@ def cmd_install(args):
         handler = _claude_hook_handler(removed[-1] if removed else None)
         cleaned.append({"matcher": CLAUDE_HOOK_MATCHER, "hooks": [handler]})
         hooks_root["PreToolUse"] = cleaned
-        _atomic_write_text(CLAUDE_SETTINGS, json.dumps(settings, indent=2))
+        backup = _write_json_config(CLAUDE_SETTINGS, settings)
+        if backup:
+            print(f"  - Claude Code: previous settings.json saved as {backup} (one-time backup)")
+        installed.append(f"Claude Code hook: {CLAUDE_SETTINGS}")
         print(
             f"  - Claude Code hook: {handler['command']} {' '.join(handler['args'])} "
-            f"(matcher {CLAUDE_HOOK_MATCHER}, timeout {handler['timeout']}s)  [user-global]"
+            f"(matcher {CLAUDE_HOOK_MATCHER}, timeout {handler['timeout']}s) in "
+            f"{CLAUDE_SETTINGS}  [user-global]"
         )
     else:
-        print("  - Claude Code: skipped (~/.claude/ not found)")
+        print(f"  - Claude Code: skipped ({CLAUDE_SETTINGS.parent} not found; "
+              f"set CLAUDE_CONFIG_DIR if you keep it elsewhere)")
 
-    # 3. Codex CLI PreToolUse hook (~/.codex/hooks.json).
+    # 3. Codex CLI PreToolUse hook ($CODEX_HOME/hooks.json).
     codex_hook = False
     if codex_present:
         codex_hook = _install_codex_hook()
         if codex_hook:
+            installed.append(f"Codex CLI hook: {CODEX_HOOKS}")
             print(
                 f"  - Codex CLI hook: {_hook_command()} (matcher {CODEX_HOOK_MATCHER}) "
                 f"in {CODEX_HOOKS}  [user-global]"
             )
     else:
-        print(f"  - Codex CLI: hook skipped ({CODEX_HOME} not found)")
+        print(f"  - Codex CLI: hook skipped ({CODEX_HOME} not found; set CODEX_HOME if you keep it elsewhere)")
+
+    if not installed:
+        print(
+            "\nERROR: nothing was installed. No Claude Code configuration directory "
+            f"({CLAUDE_SETTINGS.parent}) and no Codex CLI home ({CODEX_HOME}) was found.\n"
+            "  Start Claude Code or Codex once so it creates that directory (or set\n"
+            "  CLAUDE_CONFIG_DIR / CODEX_HOME to where you keep it), then re-run install.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # 4. Run setup. Always non-interactive in install context: install is
     # the path agents run, and an unexpected prompt would block them mid-flow.
@@ -3384,8 +3528,16 @@ def cmd_install(args):
 
     print("\n=== Install complete (USER-GLOBAL) ===")
     print("Scope: applies to ALL projects, in any directory, for this user.")
-    cli_path = _cli_path() or "(not on PATH yet - open a new shell)"
-    print(f"CLI on PATH at: {cli_path}")
+    print("Written:")
+    for item in installed:
+        print(f"  - {item}")
+    print(f"Hooks run: {cli}")
+    if not shutil.which("overleaf-sync-now"):
+        print(
+            f"WARN: {pathlib.Path(cli).parent} is not on your PATH. The hooks use the full path,\n"
+            "  so they work, but to type `overleaf-sync-now login` (and the other commands) by\n"
+            "  name, run `uv tool update-shell` and open a new terminal."
+        )
     print()
     # Check if auth resolved during the setup that just ran. If not, surface
     # the fix up front so the user doesn't have to wait for the first sync.
@@ -3921,17 +4073,17 @@ def cmd_uninstall(args):
             if _remove_existing_target(target):
                 print(f"  - {tool}: removed {target}")
     if CLAUDE_SETTINGS.exists():
-        settings, ok = _read_json_config(CLAUDE_SETTINGS, "~/.claude/settings.json")
+        settings, ok = _read_json_config(CLAUDE_SETTINGS, str(CLAUDE_SETTINGS))
         if not ok:
             print("  WARN: skipping Claude Code hook removal.", file=sys.stderr)
         else:
             hooks_root = settings.get("hooks")
             if isinstance(hooks_root, dict) and "PreToolUse" in hooks_root:
                 cleaned, removed = _strip_our_hooks(hooks_root.get("PreToolUse", []))
-                hooks_root["PreToolUse"] = cleaned
-                _atomic_write_text(CLAUDE_SETTINGS, json.dumps(settings, indent=2))
                 if removed:
-                    print("  - Claude Code hook removed")
+                    hooks_root["PreToolUse"] = cleaned
+                    _write_json_config(CLAUDE_SETTINGS, settings)
+                    print(f"  - Claude Code hook removed from {CLAUDE_SETTINGS}")
     if _uninstall_codex_hook():
         print(f"  - Codex CLI hook removed from {CODEX_HOOKS}")
     print(f"  - Cookies and state preserved at {CACHE_DIR} (delete manually if desired)")

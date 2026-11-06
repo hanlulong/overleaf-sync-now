@@ -218,6 +218,110 @@ class InstallTargetsTests(unittest.TestCase):
         self.assertEqual([h["command"] for g in groups for h in g["hooks"]], ["python3 check.py"])
 
 
+    # ---- CLI path resolution (the hook must name an absolute path) ----
+    def test_cli_found_from_entry_point_when_not_on_path(self):
+        import os
+        import shutil
+        import stat
+        from unittest import mock
+        cli._cli_path = self._orig["_cli_path"]
+        bindir = self.home / "uv-bin"
+        bindir.mkdir()
+        exe = bindir / "overleaf-sync-now"
+        exe.write_text("#!/bin/sh\n")
+        exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+        with mock.patch.object(shutil, "which", lambda name: None), \
+                mock.patch.object(sys, "argv", [str(exe), "install"]), \
+                mock.patch.object(sys, "executable", str(self.home / "nopy" / "python")), \
+                mock.patch.object(cli.subprocess, "run", side_effect=OSError("no uv")):
+            self.install()
+        (matcher, handler), = self.claude_handlers()
+        self.assertEqual(handler["command"], os.path.abspath(str(exe)))
+        self.assertIn("is not on your PATH", self.out.getvalue())
+        self.assertIn("uv tool update-shell", self.out.getvalue())
+
+    def test_install_fails_loudly_without_a_cli_path(self):
+        cli._cli_path = lambda: None
+        with self.assertRaises(SystemExit) as cm:
+            self.install()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("could not find the overleaf-sync-now executable", self.err.getvalue())
+        self.assertFalse(cli.CLAUDE_SETTINGS.exists())
+        self.assertFalse(cli.CODEX_HOOKS.exists())
+
+    def test_install_refuses_a_uvx_cache_path(self):
+        cli._cli_path = lambda: str(self.home / ".cache" / "uv" / "archive-v0" / "x" / "bin" / "overleaf-sync-now")
+        with self.assertRaises(SystemExit) as cm:
+            self.install()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("uv's cache", self.err.getvalue())
+        self.assertFalse(cli.CLAUDE_SETTINGS.exists())
+
+    # ---- CLAUDE_CONFIG_DIR / CODEX_HOME, and "nothing installed" ----
+    def test_config_dirs_follow_environment(self):
+        import os
+        import subprocess
+        env = dict(os.environ, HOME=str(self.home), CLAUDE_CONFIG_DIR=str(self.home / "cfg-claude"),
+                   CODEX_HOME=str(self.home / "cfg-codex"), PYTHONPATH=str(ROOT / "src"))
+        out = subprocess.run([sys.executable, "-c", (
+            "from overleaf_sync_now import cli;"
+            "print(cli.CLAUDE_SETTINGS); print(cli.SKILL_TARGETS['Claude Code']);"
+            "print(cli.CODEX_HOOKS); print(cli.LEGACY_SKILL_TARGETS[next(iter(cli.LEGACY_SKILL_TARGETS))])")],
+            env=env, capture_output=True, text=True, check=True).stdout.split("\n")
+        self.assertEqual(out[0], str(self.home / "cfg-claude" / "settings.json"))
+        self.assertEqual(out[1], str(self.home / "cfg-claude" / "skills" / "overleaf"))
+        self.assertEqual(out[2], str(self.home / "cfg-codex" / "hooks.json"))
+        self.assertEqual(out[3], str(self.home / "cfg-codex" / "skills" / "overleaf"))
+
+    def test_claude_config_dir_from_env_counts_as_present(self):
+        import os
+        from unittest import mock
+        cfg = self.home / "cfg-claude"
+        cli.CLAUDE_SETTINGS = cfg / "settings.json"
+        cli.SKILL_TARGETS["Claude Code"] = cfg / "skills" / "overleaf"
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(cfg)}):
+            self.install()
+        self.assertTrue(any(cli._is_our_hook(h) for _, h in self.claude_handlers()))
+        self.assertTrue((cfg / "skills" / "overleaf" / "SKILL.md").exists())
+
+    def test_nothing_installed_exits_nonzero(self):
+        import shutil
+        for d in (".claude", ".codex", ".agents"):
+            shutil.rmtree(self.home / d)
+        with self.assertRaises(SystemExit) as cm:
+            self.install()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("nothing was installed", self.err.getvalue())
+        self.assertNotIn("Install complete", self.out.getvalue())
+
+    # ---- settings.json: symlinks, non-ASCII, backup, mode ----
+    def test_symlinked_settings_written_through_with_backup(self):
+        import os
+        dotfiles = self.home / "dotfiles"
+        dotfiles.mkdir()
+        real = dotfiles / "claude-settings.json"
+        original = '{"statusLine": {"type": "command", "command": "echo \u8bba\u6587 \u2713"}}'
+        real.write_text(original, encoding="utf-8")
+        os.chmod(real, 0o600)
+        try:
+            cli.CLAUDE_SETTINGS.symlink_to(real)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        self.install()
+        self.assertTrue(cli.CLAUDE_SETTINGS.is_symlink())
+        text = real.read_text(encoding="utf-8")
+        self.assertIn("echo \u8bba\u6587 \u2713", text)
+        self.assertNotIn("\\u8bba", text)
+        self.assertTrue(any(cli._is_our_hook(h) for _, h in self.claude_handlers()))
+        backup = dotfiles / ("claude-settings.json" + cli.SETTINGS_BACKUP_SUFFIX)
+        self.assertEqual(backup.read_text(encoding="utf-8"), original)
+        if os.name == "posix":
+            self.assertEqual(real.stat().st_mode & 0o777, 0o600)
+        # The one-time backup is not replaced on the next install.
+        self.install()
+        self.assertEqual(backup.read_text(encoding="utf-8"), original)
+
+
     # ---- install health (status / doctor) ----
     def test_health_ok_after_install(self):
         self.install()
