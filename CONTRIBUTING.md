@@ -29,7 +29,7 @@ uv tool install --reinstall --from . overleaf-sync-now
 
 ## Running the unit tests
 
-The unit test suite under `tests/` covers the project resolver, marker handling, atomic-write concurrency, POSIX file perms, the version-match refresh decision, the zip-slip + recent-mtime guards in `_extract_files`, the `cmd_hook` exit-code contract and fail-closed resolution, Bash/PowerShell/apply_patch path extraction, the write guards, `project_ops` handling, install/uninstall against a fake HOME (Claude settings, `~/.agents/skills`, Codex `hooks.json`), `get_session` auth/retry behavior, and `save-cookie` input modes. No external dependencies — just `unittest` (HTTP/cookie paths are monkeypatched):
+The unit test suite under `tests/` covers the project resolver, marker handling, atomic-write concurrency, POSIX file perms, the version-match refresh decision, the zip-slip + recent-mtime guards in `_extract_files`, the `cmd_hook` exit-code contract and fail-closed resolution, Bash/PowerShell/apply_patch path extraction, the write guards, `project_ops` handling, install/uninstall against a fake HOME (Claude settings, `~/.agents/skills`, Codex `hooks.json`, `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, symlinked settings, the absolute hook path, the leftover report), `get_session` auth/retry behavior, offline and Codex-sandbox handling (built from real requests/urllib3 exception shapes), backups and keep-both on a first sync, the keychain-free hook path, `login`'s browser choice, `save-cookie` input modes, and the SKILL.md frontmatter and size budget. No external dependencies — just `unittest` (HTTP/cookie paths are monkeypatched):
 
 ```bash
 python -m unittest discover tests

@@ -225,8 +225,9 @@ from the exception shapes captured in a real Codex sandbox, keep-both on a
 bootstrap / full pull / rewind with backups, the hook's refresh summary,
 numbered duplicate folders and NFD names, the opt-out, the keychain-free hook
 path, login's browser choice, the absolute hook path, CLAUDE_CONFIG_DIR /
-CODEX_HOME, symlinked settings.json, and uninstall's leftover report.
-Suite: 208 tests.
+CODEX_HOME, symlinked settings.json, and uninstall's leftover report; and
+(`tests/test_skill_md.py`) the SKILL.md frontmatter and size budget.
+Suite: 212 tests.
 
 ## 0.4.0 — 2026-05-30
 
