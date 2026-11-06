@@ -2206,37 +2206,38 @@ def _hook_targets(data):
     return None, [], None
 
 
-def _latex_snapshot(folder, extra=()):
-    """{path_str: (mtime_ns, size)} for LaTeX files under `folder` (bounded,
-    dotdirs skipped) plus `extra` paths. Used to see what a refresh rewrote."""
+def _latex_snapshot(folder, targets=()):
+    """{path_key: (mtime_ns, size) or None} used to see what a refresh
+    rewrote. With explicit `targets`, only those are stat'ed (cheap). Without
+    (a shell command that only mentions `*.tex` in the project folder), the
+    LaTeX files under `folder` are walked, bounded and skipping dotdirs."""
     snap = {}
-    count = 0
-    try:
-        for root, dirs, files in os.walk(folder):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
-            for f in files:
-                if _is_latex_path(f):
-                    path = os.path.join(root, f)
-                    try:
-                        st = os.stat(path)
-                        snap[os.path.normcase(os.path.abspath(path))] = (st.st_mtime_ns, st.st_size)
-                    except OSError:
-                        pass
-                    count += 1
-                    if count >= 5000:
-                        break
-            if count >= 5000:
-                break
-    except OSError:
-        pass
-    for p in extra:
-        key = os.path.normcase(os.path.abspath(str(p)))
-        if key not in snap:
+    if targets:
+        for p in targets:
+            key = os.path.normcase(os.path.abspath(str(p)))
             try:
                 st = os.stat(key)
                 snap[key] = (st.st_mtime_ns, st.st_size)
             except OSError:
                 snap[key] = None
+        return snap
+    visited = 0
+    try:
+        for root, dirs, files in os.walk(folder):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for f in files:
+                visited += 1
+                if visited > 20000:
+                    return snap
+                if _is_latex_path(f):
+                    path = os.path.normcase(os.path.abspath(os.path.join(root, f)))
+                    try:
+                        st = os.stat(path)
+                        snap[path] = (st.st_mtime_ns, st.st_size)
+                    except OSError:
+                        pass
+    except OSError:
+        pass
     return snap
 
 
