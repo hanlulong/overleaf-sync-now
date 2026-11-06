@@ -12,10 +12,15 @@ All under `<DATA_DIR>` (resolved as `$OVERLEAF_SYNC_DATA_DIR` → `~/.claude/ove
 - **Persistent browser profile** (after running `overleaf-sync-now login`) at `<DATA_DIR>/browser-profile/`. Holds an equally sensitive, weeks-long Overleaf session in Chromium's own cookie database; it is protected by the `0700` data dir.
 - **Project list cache** at `<DATA_DIR>/projects.json`. Project IDs, names, trashed/archived flags, lastUpdated timestamps, and ownerIds. No project content.
 - **Per-project sync state** at `<DATA_DIR>/state.json`, `<DATA_DIR>/versions.json` and `<DATA_DIR>/web-removed.json`. Project IDs, timestamps, version numbers, and the paths of files deleted or renamed on overleaf.com. No content.
+- **Backups and conflict copies** at `<DATA_DIR>/backups/` and `<DATA_DIR>/conflicts/`. Copies of your project files (the previous local version of every file a refresh overwrote, and Overleaf's version of files kept locally). Same `0600` / `0700` protection; backups are deleted after 30 days, conflict copies only by you.
 - **Cookie-validation timestamp** at `<DATA_DIR>/.validated-at`. A single epoch float used as a 60-second cache to skip re-probing Overleaf on every hook fire.
 - **`.overleaf-project` markers** (per-project) inside `<Dropbox>/Apps/Overleaf/<name>/`. JSON containing `project_id` plus debug metadata (`source`, `linked_at`, `name_at_link_time`). These are deliberately **not** restricted to `0600` — the local Dropbox client and other AI agents on the same machine need to read them. They contain no credentials, but they sync into the Overleaf project, so collaborators can read and rewrite them. The tool ignores a marker whose `project_id` is not a 24-character hex id.
 
 `install` also writes hook entries into `~/.claude/settings.json` and `~/.codex/hooks.json` (backing up the latter when it changes). Neither contains credentials.
+
+## Browser cookie stores and the macOS keychain
+
+`setup`, `install`, `status` and `doctor` may read your installed browsers' cookie stores to find an existing Overleaf login (only the `overleaf.com` cookies are used). On macOS, Chromium-based browsers protect that store with a "<Browser> Safe Storage" key in the login keychain, so macOS asks before `security` hands it out. Choose Allow or Deny; avoid Always Allow, which adds `security` to that key's access list so any program that runs it can read the key without a prompt. The PreToolUse hook never reads browser stores or the keychain, and `sync` stops trying for an hour after a failed attempt. `overleaf-sync-now login` avoids all of this by using its own browser profile.
 
 ## Agent transcripts
 
@@ -26,7 +31,7 @@ The cookie must never pass through an AI agent. Anything typed into an agent cha
 - `overleaf-sync-now save-cookie` (headless fallback) is run by the user in their own terminal and reads the value from a hidden prompt or stdin. Passing it as an argument still works for old scripts but prints a warning.
 - `setup`, `status` and `doctor` report a cookie as present or absent; they never print any part of it.
 
-If a cookie has been pasted somewhere it shouldn't be, sign out of Overleaf in the browser it came from (Overleaf ends that session on logout) and run `overleaf-sync-now login` again.
+If a cookie has been pasted somewhere it shouldn't be, end the session: on overleaf.com open Account → Account Settings → Sessions → Manage your sessions and click Clear Sessions (or sign out in the browser it came from). Then run `overleaf-sync-now login` again.
 
 ## What this tool does NOT do
 
@@ -34,7 +39,7 @@ If a cookie has been pasted somewhere it shouldn't be, sign out of Overleaf in t
 - It does not log to disk by default.
 - It does not auto-update.
 - It does not run code from Overleaf — only consumes a documented (well, reverse-engineered) JSON API.
-- It never deletes local project files.
+- It never deletes local project files, and it copies a file's previous version to `<DATA_DIR>/backups/` before overwriting it.
 
 ## Threat model
 

@@ -11,14 +11,17 @@ Everything `install` writes is **user-global**. The only file the tool ever writ
 | `~/.local/bin/overleaf-sync-now` | CLI binary (on PATH) |
 | `~/.claude/skills/overleaf/SKILL.md` | Skill description for Claude Code |
 | `~/.agents/skills/overleaf/SKILL.md` | Skill description for Codex CLI (user skills folder; since 0.5.0) |
-| `~/.claude/settings.json` | Claude Code PreToolUse hook entry |
-| `~/.codex/hooks.json` | Codex CLI PreToolUse hook entry (since 0.5.0; the previous file is backed up as `hooks.json.bak-<timestamp>` when install changes it) |
+| `~/.claude/settings.json` | Claude Code PreToolUse hook entry (written through a symlink; the previous content is kept once as `settings.json.bak-overleaf-sync-now`). `$CLAUDE_CONFIG_DIR` replaces `~/.claude` when set. |
+| `~/.codex/hooks.json` | Codex CLI PreToolUse hook entry (since 0.5.0; the previous file is backed up as `hooks.json.bak-<timestamp>` when install changes it). `$CODEX_HOME` replaces `~/.codex` when set. |
 | `<DATA_DIR>/cookies.json` | Cached `overleaf_session2` cookie (POSIX `0o600`) |
 | `<DATA_DIR>/state.json` | Per-project debounce timestamps (POSIX `0o600`) |
 | `<DATA_DIR>/versions.json` | Per-project last-synced Overleaf `toV` (since 0.1.0; POSIX `0o600`) |
 | `<DATA_DIR>/projects.json` | 24-hour-cached project records (id, name, trashed, archived, lastUpdated, ownerId — since 0.3.0; POSIX `0o600`) |
 | `<DATA_DIR>/web-removed.json` | Paths deleted or renamed on overleaf.com whose local copy still exists (since 0.5.0; POSIX `0o600`) |
-| `<DATA_DIR>/browser-profile/` | Persistent Playwright profile created by `login` (Chromium with the Overleaf session) |
+| `<DATA_DIR>/browser-profile/` | Persistent browser profile created by `login` (holds the Overleaf session; opened with the installed Chrome or Edge when available) |
+| `<DATA_DIR>/backups/<project>/<timestamp>/` | Previous local version of every file a refresh overwrote (since 0.5.0; pruned after 30 days) |
+| `<DATA_DIR>/conflicts/<project>/<timestamp>/` | Overleaf's version of a file kept locally because it had newer local edits (since 0.5.0; never pruned) |
+| `<DATA_DIR>/.browser-cookies-failed-at` | One-hour back-off after the installed-browser cookie readers failed (since 0.5.0) |
 
 Versions up to 0.4.x copied the skill to `~/.codex/skills/overleaf/`. Codex documents `~/.agents/skills` as the user skills location, and a second copy makes it list the skill twice, so `install` removes that copy (only if it is ours). `install` and `uninstall` never delete a skill folder whose `SKILL.md` doesn't mention `overleaf-sync-now`.
 
@@ -42,21 +45,21 @@ Shell commands are classified as reads when every command in them is a known rea
 | Step | What happens |
 |---|---|
 | **1. Tool + path filter** | Not one of the tools above, or no LaTeX path → exit 0. |
-| **2. Resolve** | Walk each path upward to a `.overleaf-project` marker or `…/Apps/Overleaf/<name>/`. Map `<name>` → project ID via the cached project index (refreshed every 24 h, and once more before concluding that no project has that name). |
+| **2. Resolve** | Walk each path upward to a `.overleaf-project` marker or `…/Apps/Overleaf/<name>/` (a `.overleaf-sync-ignore` file, or a folder listed in `$OVERLEAF_SYNC_IGNORE`, opts a folder out). Map `<name>` → project ID via the cached project index (refreshed every 24 h, and once more before concluding that no project has that name). |
 | **3. Fail closed** | Under `Apps/Overleaf/<name>/` but unresolved (not logged in, no living project with that name, several) → **writes exit 2** with the reason and the exact fix; reads get a warning and proceed. Network/sandbox failures pass through. |
 | **4. Debounce** | Reads: skip the probe if this project was probed in the last 30 s. Writes: skip only within 3 s. |
-| **5. Cookie resolve** | Use the cached cookie if it was validated in the last 60 s; otherwise re-validate and, if needed, walk the [auth chain](authentication.md). |
+| **5. Cookie resolve** | Use the cached cookie if it was validated in the last 60 s; otherwise re-validate. Overleaf refused it → try the `login` profile (the hook never reads installed browsers or the keychain). No answer from Overleaf (offline, sandbox) → `NetworkUnavailable`: the call proceeds with a note, never an auth block. |
 | **6. Version-match probe** | `GET /project/<id>/updates` (~30 KB, ~0.3 s). Compare latest `toV` to the cached `toV` in `versions.json`. |
 | **7. Decide** | • Latest `toV` matches cache → no-op. • All new updates are `origin.kind == "dropbox"` (echoes of our own local saves round-tripping) → no-op, advance cache. • A web-origin update exists (text edits, or file adds/renames/deletes in `project_ops`) → continue. |
-| **8. Conditional zip pull** | `GET /project/<id>/download/zip`, hash-compare each entry against local, write only the files whose contents actually differ (including files added or renamed on the web). Web-side deletes and rename sources go to `web-removed.json`; local files are never deleted. |
+| **8. Conditional zip pull** | `GET /project/<id>/download/zip`, hash-compare each entry against local, write only the files whose contents actually differ (including files added or renamed on the web), after copying the previous local bytes to `backups/`. On a bootstrap or full pull, a local file changed after Overleaf's last change to it (per `/updates` `meta.end_ts`) is kept and Overleaf's copy goes to `conflicts/`. Web-side deletes and rename sources go to `web-removed.json`; local files are never deleted. A one-line summary of what was written or skipped goes to stderr. |
 | **9. Recent-mtime guard** | Files modified locally in the last 30 s are skipped (with a `SKIP <path>` warning to stderr) — protects an in-progress local save not yet propagated Dropbox → Overleaf. `--force` disables. |
-| **10. Write guards** | For writes only: if step 8 just rewrote a file this call is about to change → exit 2, "re-read first". If step 9 had to skip a target that also changed on the web → exit 2, "conflict, wait and re-read". If the target was deleted or renamed on the web and the local copy still exists → exit 2, unless the call only deletes it (`rm`, `git rm`, `Remove-Item`, `del`, `*** Delete File:`). |
+| **10. Write guards** | For writes only: if step 8 just rewrote a file this call is about to change → exit 2, "re-read first". If step 9 had to skip a target that also changed on the web → exit 2, "conflict" with the exact steps. If step 8 kept a newer local target → exit 2 once, "compare with Overleaf's copy and ask the user". If the target was deleted or renamed on the web and the local copy still exists → exit 2, unless the call only deletes it (`rm`, `git rm`, `Remove-Item`, `del`, `*** Delete File:`). |
 
 ## Exit codes (hook)
 
 | Code | Meaning | Effect on the AI agent |
 |---|---|---|
-| `0` | Refresh succeeded, nothing changed, debounced, a read, or a transient error (network blip, 429, 5xx, sandbox-blocked socket) | Tool call proceeds. Warnings go to stderr. |
+| `0` | Refresh succeeded, nothing changed, debounced, a read, or Overleaf could not be reached (offline, 429, 5xx, a sandbox without network access) | Tool call proceeds. Warnings and the refresh summary go to stderr. |
 | `2` | A write that must not proceed: auth missing, folder unresolved, target refreshed under the agent, or target deleted/renamed on the web | Tool call is **blocked**; Claude Code and Codex show the stderr reason to the model, which can fix it (re-read, `link`, ask the user to `login`). |
 
 The choice to exit 0 on transient errors is deliberate: blocking your AI session over a momentary problem is worse than risking one stale read. A hook that fails to start or times out also lets the call through by default; Claude Code 2.1.295 and later accept `"onFailure": "block"` on the hook entry if you prefer the opposite.
