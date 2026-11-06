@@ -377,11 +377,13 @@ class ReadOnlyClassifierTests(unittest.TestCase):
         for cmd in (
             "sort -o main.tex main.tex", "sort -uo main.tex a.tex", "sort --output=main.tex a.tex",
             "uniq a.tex main.tex", "git diff --output=main.tex", "git diff --output main.tex",
+            "sed 's/a/b/w main.tex' a.tex", "sed -n '/x/w out.tex' main.tex",
         ):
             self.assertFalse(cli._is_read_only_command(cmd), cmd)
         for cmd in (
             "sort -u -k2 refs.bib", "uniq -c main.tex", "uniq -f 2 main.tex",
             "uniq main.tex 2>/dev/null", "uniq main.tex > /tmp/out.txt",
+            "sed -n '/draw/p' main.tex", "sed -n 's/a/b/p' main.tex",
         ):
             self.assertTrue(cli._is_read_only_command(cmd), cmd)
 

@@ -2072,6 +2072,10 @@ _READ_ONLY_PROGRAMS = {
     "compare-object", "format-hex", "write-output", "write-host",
 }
 _READ_ONLY_GIT = {"diff", "log", "show", "status", "blame", "grep", "ls-files"}
+# sed's `w FILE` command / s///w flag writes FILE.
+_SED_WRITE_RE = re.compile(
+    r"(?:^|[\s;/}'\"])[wW]\s*[^\s;'\"|&]+\.(?:tex|bib|cls|sty|bst)(?![\w])", re.IGNORECASE
+)
 # Output redirections: >, >>, 1>, 2>, &>, &>>, >|, and >&file. Only fd
 # duplication (2>&1, >&2, >&-) is not a write: the target group can't start
 # with '&', and the optional '&' after '>' is taken only before a filename.
@@ -2120,6 +2124,8 @@ def _is_read_only_command(cmd):
             for w in rest
         ):
             return False
+        if prog == "sed" and _SED_WRITE_RE.search(cmd):
+            return False  # sed 's/a/b/w main.tex' (the script is masked in `seg`)
         if prog == "find" and any(
             w in ("-exec", "-execdir", "-delete", "-ok", "-okdir", "-fprint") for w in rest
         ):
