@@ -59,7 +59,7 @@ with `/hooks`.**
    last 30 s, so the refresh had to leave it alone (a real conflict). This
    narrows the mid-turn window described in issue #2; README "Known
    limitations" describes what remains.
-5. **Writes always re-probe.** The 30 s per-project debounce now applies
+5. **Writes re-probe sooner.** The 30 s per-project debounce now applies
    only to reads; writes re-probe after 3 s, so a web edit made between the
    agent's Read and its Edit is caught. A rate-limited (HTTP 429) write is
    no longer recorded as fresh.
