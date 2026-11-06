@@ -3870,6 +3870,7 @@ def cmd_install(args):
         sys.exit(1)
 
     installed = []
+    failed = []
     claude_present = _claude_present()
     codex_present = _codex_present()
 
@@ -3904,15 +3905,29 @@ def cmd_install(args):
         handler = _claude_hook_handler(removed[-1] if removed else None)
         cleaned.append({"matcher": CLAUDE_HOOK_MATCHER, "hooks": [handler]})
         hooks_root["PreToolUse"] = cleaned
-        backup = _write_json_config(CLAUDE_SETTINGS, settings)
-        if backup:
-            print(f"  - Claude Code: previous settings.json saved as {backup} (one-time backup)")
-        installed.append(f"Claude Code hook: {CLAUDE_SETTINGS}")
-        print(
-            f"  - Claude Code hook: {handler['command']} {' '.join(handler['args'])} "
-            f"(matcher {CLAUDE_HOOK_MATCHER}, timeout {handler['timeout']}s) in "
-            f"{CLAUDE_SETTINGS}  [user-global]"
-        )
+        try:
+            backup = _write_json_config(CLAUDE_SETTINGS, settings)
+        except OSError as e:
+            # E.g. settings.json links into a read-only store (nix /
+            # home-manager). Say what to add by hand and carry on with Codex.
+            failed.append(f"Claude Code hook: {CLAUDE_SETTINGS}")
+            print(
+                f"  - Claude Code hook: NOT installed, could not write "
+                f"{os.path.realpath(str(CLAUDE_SETTINGS))} ({e}).\n"
+                f"    Add this entry to hooks.PreToolUse in your settings.json source by hand:\n"
+                + "\n".join("      " + line for line in json.dumps(
+                    {"matcher": CLAUDE_HOOK_MATCHER, "hooks": [handler]}, indent=2).splitlines()),
+                file=sys.stderr,
+            )
+        else:
+            if backup:
+                print(f"  - Claude Code: previous settings.json saved as {backup} (one-time backup)")
+            installed.append(f"Claude Code hook: {CLAUDE_SETTINGS}")
+            print(
+                f"  - Claude Code hook: {handler['command']} {' '.join(handler['args'])} "
+                f"(matcher {CLAUDE_HOOK_MATCHER}, timeout {handler['timeout']}s) in "
+                f"{CLAUDE_SETTINGS}  [user-global]"
+            )
     else:
         print(f"  - Claude Code: skipped ({CLAUDE_SETTINGS.parent} not found; "
               f"set CLAUDE_CONFIG_DIR if you keep it elsewhere)")
@@ -3920,7 +3935,12 @@ def cmd_install(args):
     # 3. Codex CLI PreToolUse hook ($CODEX_HOME/hooks.json).
     codex_hook = False
     if codex_present:
-        codex_hook = _install_codex_hook()
+        try:
+            codex_hook = _install_codex_hook()
+        except OSError as e:
+            failed.append(f"Codex CLI hook: {CODEX_HOOKS}")
+            print(f"  - Codex CLI hook: NOT installed, could not write "
+                  f"{os.path.realpath(str(CODEX_HOOKS))} ({e}).", file=sys.stderr)
         if codex_hook:
             installed.append(f"Codex CLI hook: {CODEX_HOOKS}")
             print(
@@ -3981,6 +4001,9 @@ def cmd_install(args):
     print("<Dropbox>/Apps/Overleaf/<project>/ refresh from Overleaf first, in every project.")
     print()
     print("Manual sync any time, from any directory:  overleaf-sync-now sync .")
+    if failed:
+        print("\nERROR: not installed (see above): " + "; ".join(failed), file=sys.stderr)
+        sys.exit(1)
 
 
 def _import_sync_playwright():
@@ -4600,7 +4623,10 @@ def cmd_uninstall(args):
             if isinstance(hooks_root, dict) and "PreToolUse" in hooks_root:
                 cleaned, removed = _strip_our_hooks(hooks_root.get("PreToolUse", []))
                 if removed:
-                    hooks_root["PreToolUse"] = cleaned
+                    if cleaned:
+                        hooks_root["PreToolUse"] = cleaned
+                    else:
+                        hooks_root.pop("PreToolUse", None)
                     _write_json_config(CLAUDE_SETTINGS, settings)
                     print(f"  - Claude Code hook removed from {CLAUDE_SETTINGS}")
     if _uninstall_codex_hook():
@@ -4633,13 +4659,25 @@ def cmd_uninstall(args):
         print(f"  - Data dir {CACHE_DIR}: the cached Overleaf session (cookies.json), the `login`")
         print("    browser profile, backups/ and conflicts/ copies of your files, and sync state.")
         print(f"    Remove it: rm -r \"{CACHE_DIR}\"   (Windows: Remove-Item -Recurse \"{CACHE_DIR}\")")
+    backups = [CLAUDE_SETTINGS.with_name(CLAUDE_SETTINGS.name + SETTINGS_BACKUP_SUFFIX)]
+    try:
+        backups += sorted(CODEX_HOOKS.parent.glob(CODEX_HOOKS.name + ".bak-*"))
+    except OSError:
+        pass
+    backups = [b for b in backups if b.exists()]
+    if backups:
+        print("  - Config backups made by install/uninstall. They still contain the old hook")
+        print("    entry, so restoring one brings the hook back. Remove them with:")
+        for b in backups:
+            print(f"      rm \"{b}\"")
     pw = _playwright_cache_dir()
     if pw.exists():
         print(f"  - Browser downloaded by `login`: {pw} (shared with any other Playwright tool;")
         print("    remove it only if nothing else uses it).")
     print("  - The Overleaf session itself stays valid on Overleaf's servers until it expires;")
     print("    deleting files does not end it. To end it: on overleaf.com open Account >")
-    print("    Account Settings > Sessions > Manage your sessions, then Clear Sessions.")
+    print("    Account Settings > Sessions > Manage your sessions, then Clear Sessions (it ends")
+    print("    every session except the one in the browser you click it in).")
     print("  - The CLI: uv tool uninstall overleaf-sync-now")
 
 

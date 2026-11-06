@@ -349,6 +349,54 @@ class InstallTargetsTests(unittest.TestCase):
             cli.cmd_uninstall(["--remove-markers"])
         self.assertFalse(marker.exists())
 
+    def test_read_only_settings_target_does_not_stop_codex_install(self):
+        # settings.json links into a read-only store (nix / home-manager).
+        import os
+        if os.name != "posix" or os.geteuid() == 0:
+            self.skipTest("needs POSIX permissions as a normal user")
+        store = self.home / "store"
+        store.mkdir()
+        real = store / "settings.json"
+        real.write_text("{}")
+        try:
+            cli.CLAUDE_SETTINGS.symlink_to(real)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        os.chmod(real, 0o444)
+        os.chmod(store, 0o555)
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                self.install()
+        finally:
+            os.chmod(store, 0o755)
+            os.chmod(real, 0o644)
+        self.assertEqual(cm.exception.code, 1)
+        err = self.err.getvalue()
+        self.assertIn("Claude Code hook: NOT installed", err)
+        self.assertIn('"matcher": "Read|Edit|Write|Bash|PowerShell"', err)
+        # The Codex step still ran.
+        self.assertTrue(any("overleaf-sync-now" in h.get("command", "")
+                            for g in self.codex_groups() for h in g["hooks"]))
+        self.assertEqual(real.read_text(), "{}")
+
+    def test_uninstall_lists_config_backups_and_drops_empty_lists(self):
+        from unittest import mock
+        cli.CLAUDE_SETTINGS.write_text('{"theme": "dark"}')
+        self.install()
+        self.install()  # second run: no change, no new Codex backup
+        data = self.home / "data"
+        with mock.patch.object(cli, "HOME", self.home), mock.patch.object(cli, "CACHE_DIR", data):
+            cli.cmd_uninstall([])
+        out = self.out.getvalue()
+        bak = cli.CLAUDE_SETTINGS.with_name("settings.json" + cli.SETTINGS_BACKUP_SUFFIX)
+        self.assertTrue(bak.exists())
+        self.assertIn(f'rm "{bak}"', out)
+        for b in cli.CODEX_HOOKS.parent.glob("hooks.json.bak-*"):
+            self.assertIn(f'rm "{b}"', out)
+        settings = json.loads(cli.CLAUDE_SETTINGS.read_text())
+        self.assertNotIn("PreToolUse", settings.get("hooks", {}))
+        self.assertEqual(settings["theme"], "dark")
+
     # ---- install health (status / doctor) ----
     def test_health_ok_after_install(self):
         self.install()
