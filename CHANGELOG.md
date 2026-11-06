@@ -140,11 +140,13 @@ Added `tests/test_project_ops.py`, `tests/test_hook_coverage.py` and
 origins, ordering across updates, and history resync; fail-closed hook runs
 against the real resolver with no auth, an ambiguous `projects.json`, no
 match, and a network failure; Bash/PowerShell/apply_patch path extraction and
-the read-only classifier; the 30 s / 3 s debounce; the write guard and the
-web-removed guard; recovery-text and `save-cookie` input modes; and
-install/uninstall against a fake HOME (`~/.agents/skills`, legacy cleanup,
-foreign-skill protection, exec-form Claude hook, Codex `hooks.json`
-idempotency and backup, install health). Suite: 151 tests.
+the read-only classifier (including fd-numbered and combined redirects);
+the 30 s / 3 s debounce; the write guard and the web-removed guard (through
+a symlinked Dropbox root, and allowing a pure delete of the outdated copy);
+recovery-text and `save-cookie` input modes; and install/uninstall against a
+fake HOME (`~/.agents/skills`, legacy cleanup, foreign-skill protection,
+exec-form Claude hook, Codex `hooks.json` idempotency and backup, install
+health). Suite: 158 tests.
 
 ## 0.4.0 — 2026-05-30
 
