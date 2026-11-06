@@ -4,7 +4,7 @@ Subcommands:
   install                       Link skill into Claude Code/Codex + add hook + run setup
   login                         Open a controlled browser to log into Overleaf and capture
                                 the cookie via DevTools Protocol (the proper fix for Chrome
-                                130+ app-bound encryption). One-time, persists for weeks.
+                                127+ app-bound encryption). One-time, persists for weeks.
   setup                         Auth setup (auto-detect from existing browsers/profiles)
   save-cookie [-]               Save an overleaf_session2 cookie typed at a hidden prompt
                                 (or piped on stdin with `-`). Headless fallback only; the
@@ -474,7 +474,7 @@ def _resolve_cookies_with_source(interactive=False, *, browsers=None):
     if state == "unreachable":
         raise NetworkUnavailable(_network_unavailable_message(exc))
     # Persistent browser profile from `login` command (the proper fix for
-    # Chrome 130+ app-bound encryption). Browser API can read HttpOnly cookies
+    # Chrome 127+ app-bound encryption). Browser API can read HttpOnly cookies
     # that no on-disk extractor can decrypt without admin.
     if browsers is None:
         browsers = _BROWSER_EXTRACTION["allowed"] and not _browser_extraction_in_cooldown()
@@ -620,9 +620,9 @@ class AuthExpired(RuntimeError):
 _AUTH_RECOVERY = (
     "HOW TO FIX (tell the user; the cookie must never pass through this chat):\n"
     "  1. The user runs, in their own terminal:  overleaf-sync-now login\n"
-    "     A browser window opens; they log into Overleaf there (works on Chrome 130+).\n"
+    "     A browser window opens; they log into Overleaf there (works on Chrome 127+).\n"
     "     Do not suggest logging into Overleaf in their everyday browser instead:\n"
-    "     Chrome 130+ app-bound encryption blocks reading cookies from it.\n"
+    "     Chrome 127+ app-bound encryption blocks reading cookies from it.\n"
     "  2. Only on a machine with no display for `login`: the user runs\n"
     "       overleaf-sync-now save-cookie\n"
     "     in their own terminal and pastes the overleaf_session2 value at the hidden prompt.\n"
@@ -2319,7 +2319,7 @@ def cmd_setup(args, *, force_noninteractive=False):
         print()
         print("AUTO-DETECT FAILED. Next step (the user runs this in their own terminal):")
         print("    overleaf-sync-now login")
-        print("  A browser window opens; log into Overleaf there. Works on Chrome 130+,")
+        print("  A browser window opens; log into Overleaf there. Works on Chrome 127+,")
         print("  where logging into your everyday browser does NOT help (app-bound")
         print("  encryption blocks reading its cookies).")
         print("  No display (server/SSH)? Run `overleaf-sync-now save-cookie` in a terminal")
@@ -2429,7 +2429,7 @@ def cmd_sync(args):
         )
         sys.exit(1)
 
-    print(f"Refreshing project {project_id} (folder: {linked})")
+    print(f"Refreshing project {project_id} (folder: {linked})", flush=True)
     t0 = time.time()
     deadline = t0 + SYNC_WAIT_MAX_SECONDS
     while True:
@@ -4127,7 +4127,7 @@ def _ensure_playwright_browser():
 def cmd_login(args):
     """Launch a browser for the user to log into Overleaf, then capture the
     session cookie via the browser's own API. This is the PROPER fix when
-    automatic on-disk cookie extraction fails (Chrome 130+ app-bound encryption,
+    automatic on-disk cookie extraction fails (Chrome 127+ app-bound encryption,
     Edge same, Firefox profile not present, etc.)."""
 
     if not sys.stdin.isatty():

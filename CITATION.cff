@@ -19,7 +19,7 @@ abstract: >
   version of a LaTeX paper instead of a stale local copy lagging 10–20
   minutes behind Overleaf's polling-based sync. Includes PreToolUse hooks
   for Claude Code and Codex CLI, a Playwright-managed browser login flow that works
-  around Chrome 130+ App-Bound Encryption, a recent-mtime guard that
+  around Chrome 127+ App-Bound Encryption, a recent-mtime guard that
   prevents clobbering in-progress local saves, and sandbox-block detection
   for restricted shells (Codex CLI, CI runners).
 keywords:

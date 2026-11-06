@@ -4,7 +4,7 @@ Day-to-day notes for keeping `overleaf-sync-now` running smoothly.
 
 ## Cookie maintenance
 
-Overleaf session cookies last several weeks. The tool re-validates the cached cookie at most once a minute (a successful check is cached for 60 s). If it's been invalidated, the auth chain re-runs automatically and refreshes the cache — the `login` browser profile is checked first, so after one `overleaf-sync-now login` the system usually self-heals. (Being logged into overleaf.com in your everyday browser only helps where cookies can still be read from it; Chrome 130+ app-bound encryption blocks that.)
+Overleaf session cookies last several weeks. The tool re-validates the cached cookie at most once a minute (a successful check is cached for 60 s). If it's been invalidated, the auth chain re-runs automatically and refreshes the cache — the `login` browser profile is checked first, so after one `overleaf-sync-now login` the system usually self-heals. (Being logged into overleaf.com in your everyday browser only helps where cookies can still be read from it; Chrome 127+ app-bound encryption blocks that.)
 
 If the entire auth chain fails, the PreToolUse hook **blocks AI edits** with `exit 2` and a "run `overleaf-sync-now login`" message — your AI agent surfaces this to you instead of silently writing over a stale file. Reads still go through, with a warning.
 
@@ -51,8 +51,9 @@ rm -r ~/.overleaf-sync               # optional: cached session, login profile, 
 
 - **`.overleaf-project` markers** in the usual Dropbox locations (`~/Dropbox`, `~/Dropbox (…)`, `~/Library/CloudStorage/Dropbox*`); pass your `Apps/Overleaf` folder as an argument if Dropbox lives elsewhere. Each marker syncs into its Overleaf project, so collaborators see it until it is deleted.
 - **The data dir**: the cached session, the `login` browser profile, `backups/` and `conflicts/`.
+- **Config backups**: the one-time `settings.json.bak-overleaf-sync-now` beside Claude Code's `settings.json`, and `hooks.json.bak-<timestamp>` copies beside Codex's `hooks.json`. They still hold the old hook entry, so restoring one brings the hook back; `uninstall` prints an `rm` command for each.
 - **The browser `login` downloaded**, if it had to (the Playwright cache, shared with other Playwright tools).
-- **The Overleaf session itself**, which stays valid on Overleaf's servers until it expires; deleting the files does not end it. On overleaf.com open Account → Account Settings → Sessions → Manage your sessions and click Clear Sessions.
+- **The Overleaf session itself**, which stays valid on Overleaf's servers until it expires; deleting the files does not end it. On overleaf.com open Account → Account Settings → Sessions → Manage your sessions and click Clear Sessions (it ends every session except the one in the browser you click it in, which includes the tool's `login` session).
 
 ## Claude Code or Codex configuration in another directory
 

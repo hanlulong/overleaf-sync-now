@@ -20,7 +20,7 @@ All under `<DATA_DIR>` (resolved as `$OVERLEAF_SYNC_DATA_DIR` → `~/.claude/ove
 
 ## Browser cookie stores and the macOS keychain
 
-`setup`, `install`, `status` and `doctor` may read your installed browsers' cookie stores to find an existing Overleaf login (only the `overleaf.com` cookies are used). On macOS, Chromium-based browsers protect that store with a "<Browser> Safe Storage" key in the login keychain, so macOS asks before `security` hands it out. Choose Allow or Deny; avoid Always Allow, which adds `security` to that key's access list so any program that runs it can read the key without a prompt. The PreToolUse hook never reads browser stores or the keychain, and `sync` stops trying for an hour after a failed attempt. `overleaf-sync-now login` avoids all of this by using its own browser profile.
+`setup`, `install`, `status`, `doctor` and `sync` may read your installed browsers' cookie stores to find an existing Overleaf login (only the `overleaf.com` cookies are used). On macOS, Chromium-based browsers protect that store with a "<Browser> Safe Storage" key in the login keychain, so macOS asks before `security` hands it out. The tool has two cookie readers, so one browser can ask twice. Choose Allow or Deny; avoid Always Allow, which adds `security` to that key's access list so any program that runs it can read the key without a prompt. The PreToolUse hook never reads browser stores or the keychain, and `sync` stops trying for an hour after a failed attempt. `overleaf-sync-now login` avoids all of this by using its own browser profile.
 
 ## Agent transcripts
 
@@ -31,7 +31,7 @@ The cookie must never pass through an AI agent. Anything typed into an agent cha
 - `overleaf-sync-now save-cookie` (headless fallback) is run by the user in their own terminal and reads the value from a hidden prompt or stdin. Passing it as an argument still works for old scripts but prints a warning.
 - `setup`, `status` and `doctor` report a cookie as present or absent; they never print any part of it.
 
-If a cookie has been pasted somewhere it shouldn't be, end the session: on overleaf.com open Account → Account Settings → Sessions → Manage your sessions and click Clear Sessions (or sign out in the browser it came from). Then run `overleaf-sync-now login` again.
+If a cookie has been pasted somewhere it shouldn't be, end that session. If it came from the browser you are using, sign out of Overleaf there: Clear Sessions (on overleaf.com, Account → Account Settings → Sessions → Manage your sessions) ends every session except the one in the browser you click it in. For a cookie from another browser or from the `login` profile, Clear Sessions is enough. Then run `overleaf-sync-now login` again.
 
 ## What this tool does NOT do
 
