@@ -2114,6 +2114,11 @@ def cmd_setup(args, *, force_noninteractive=False):
         and not os.environ.get("OVERLEAF_SYNC_NONINTERACTIVE")
     )
     print("Setting up Overleaf sync...")
+    if sys.platform == "darwin" and _check_cookies(_load_cache())[0] != "ok":
+        print("  - Looking for an existing Overleaf login in your browsers. macOS may ask for")
+        print("    your login keychain password to let `security` read \"<Browser> Safe Storage\".")
+        print("    Allow uses that login; Deny is fine too (then run `overleaf-sync-now login`).")
+        print("    Avoid Always Allow. The PreToolUse hook never asks for this.")
     # Same chain `sync` and the hook use (cached -> login profile -> rookiepy
     # -> browser_cookie3 -> Playwright profile), so setup never reports
     # failure for a session that sync would find.
