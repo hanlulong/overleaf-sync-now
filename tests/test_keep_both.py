@@ -197,6 +197,93 @@ class KeepBothTests(_Env):
         self.assertFalse(old.exists())
 
 
+class ExtractSafetyTests(_Env):
+    def test_own_extraction_is_not_a_local_save(self):
+        # The tool's own write must not trigger the 30 s protect window: a
+        # web edit right after a pull would otherwise be held as a "local
+        # save" conflict nobody made.
+        main = self.local("main.tex", "V1\n", minutes_ago=60)
+        cli._extract_files(_zip({"main.tex": "V2\n"}), self.folder, None, project_id=PID)
+        self.assertEqual(main.read_text(), "V2\n")
+        n_written, _, n_protected = cli._extract_files(
+            _zip({"main.tex": "V3\n"}), self.folder, {"main.tex"}, project_id=PID)
+        self.assertEqual((n_written, n_protected, main.read_text()), (1, 0, "V3\n"))
+        # A real local save after our write is protected again.
+        main.write_text("USER\n")
+        _, _, n_protected = cli._extract_files(
+            _zip({"main.tex": "V4\n"}), self.folder, {"main.tex"}, project_id=PID)
+        self.assertEqual((n_protected, main.read_text()), (1, "USER\n"))
+
+    def test_unreadable_local_file_is_not_overwritten(self):
+        if os.name != "posix" or os.geteuid() == 0:
+            self.skipTest("needs POSIX permissions as a normal user")
+        main = self.local("main.tex", "LOCAL\n", minutes_ago=60)
+        os.chmod(main, 0)
+        try:
+            report = {}
+            n_written, _, n_protected = cli._extract_files(
+                _zip({"main.tex": "WEB\n"}), self.folder, {"main.tex"}, project_id=PID,
+                report=report)
+        finally:
+            os.chmod(main, 0o644)
+        self.assertEqual((n_written, n_protected), (0, 1))
+        self.assertEqual(main.read_text(), "LOCAL\n")
+        self.assertIn("can't be backed up", self.err.getvalue())
+
+    def test_opt_out_file_from_overleaf_is_never_extracted(self):
+        cli._extract_files(_zip({cli.IGNORE_MARKER: "", "main.tex": "x"}), self.folder, None,
+                           project_id=PID)
+        self.assertFalse((self.folder / cli.IGNORE_MARKER).exists())
+        self.assertTrue((self.folder / "main.tex").exists())
+
+
+class SyncWaitTests(_Env):
+    """`sync --wait`: the protect-window block's first step (Claude Code's
+    Bash tool refuses a foreground `sleep 30`)."""
+
+    def setUp(self):
+        super().setUp()
+        (self.folder / cli.PROJECT_MARKER).write_text(json.dumps({"project_id": PID}))
+        cli._save_versions({PID: 10})
+        self.main = self.local("main.tex", "LOCAL SAVE\n", minutes_ago=0.1)  # 6 s ago
+        self.zip_files = {"main.tex": "WEB EDIT\n"}
+        self.updates([upd(10, 11, ["main.tex"], minutes_ago=0.05), upd(9, 10, [], minutes_ago=90)])
+        self.slept = []
+
+    def sync(self, *args):
+        from unittest import mock
+
+        def fake_sleep(sec):
+            self.slept.append(sec)
+            old = time.time() - 60  # the local save ages out of the window
+            os.utime(self.main, (old, old))
+        out = io.StringIO()
+        with mock.patch.object(cli.time, "sleep", fake_sleep), mock.patch.object(sys, "stdout", out):
+            try:
+                cli.cmd_sync([*args, str(self.folder)])
+                code = 0
+            except SystemExit as e:
+                code = e.code or 0
+        return code, out.getvalue()
+
+    def test_wait_holds_then_pulls(self):
+        code, out = self.sync("--wait")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(self.slept), 1)
+        self.assertTrue(20 <= self.slept[0] <= 31, self.slept)
+        self.assertIn("Waiting", out)
+        self.assertEqual(self.main.read_text(), "WEB EDIT\n")
+        self.assertEqual(self.copies("backups"), {"main.tex": "LOCAL SAVE\n"})
+        self.assertEqual(self.toV(), 11)
+
+    def test_without_wait_the_file_stays_protected(self):
+        code, out = self.sync()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.slept, [])
+        self.assertEqual(self.main.read_text(), "LOCAL SAVE\n")
+        self.assertEqual(self.toV(), 10)
+
+
 class HookSummaryTests(_Env):
     def setUp(self):
         super().setUp()
@@ -204,12 +291,22 @@ class HookSummaryTests(_Env):
         cli.CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     def run_hook(self, tool, path):
-        sys.stdin = io.StringIO(json.dumps({"tool_name": tool, "tool_input": {"file_path": str(path)}}))
+        sys.stdin = io.StringIO(json.dumps({"tool_name": tool, "hook_event_name": "PreToolUse",
+                                            "tool_input": {"file_path": str(path)}}))
         sys.stderr = err = io.StringIO()
-        with self.assertRaises(SystemExit) as cm:
-            cli.cmd_hook([])
-        sys.stderr = self.err
+        stdout, sys.stdout = sys.stdout, io.StringIO()
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                cli.cmd_hook([])
+            self.stdout = sys.stdout.getvalue()
+        finally:
+            sys.stdout = stdout
+            sys.stderr = self.err
         return cm.exception.code or 0, err.getvalue()
+
+    def hook_json(self):
+        """The one JSON object an exit-0 hook prints on stdout (or None)."""
+        return json.loads(self.stdout) if self.stdout.strip() else None
 
     def test_read_prints_one_line_summary(self):
         main = self.local("main.tex", "STALE\n", minutes_ago=60)
@@ -219,6 +316,59 @@ class HookSummaryTests(_Env):
         self.assertEqual(code, 0)
         self.assertIn("My JMP: pulled newer Overleaf content into main.tex.", err)
         self.assertIn("Previous local versions:", err)
+
+    def test_summary_reaches_user_and_model_as_json(self):
+        # Claude Code never shows exit-0 stderr to the model (and the user
+        # sees it only in debug logs); Codex ignores plain stdout. The note
+        # goes out as systemMessage (user) + additionalContext (model).
+        main = self.local("main.tex", "STALE\n", minutes_ago=60)
+        self.zip_files = {"main.tex": "WEB\n"}
+        self.updates([upd(9, 10, ["main.tex"], minutes_ago=5)])
+        code, _ = self.run_hook("Read", main)
+        self.assertEqual(code, 0)
+        out = self.hook_json()
+        self.assertIn("pulled newer Overleaf content into main.tex", out["systemMessage"])
+        self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "PreToolUse")
+        self.assertEqual(out["hookSpecificOutput"]["additionalContext"], out["systemMessage"])
+        self.assertNotIn("permissionDecision", out["hookSpecificOutput"])
+        self.assertNotIn("continue", out)  # Codex rejects it on PreToolUse
+
+    def test_nothing_to_report_prints_nothing(self):
+        main = self.local("main.tex", "SAME\n", minutes_ago=60)
+        self.zip_files = {"main.tex": "SAME\n"}
+        self.updates([upd(9, 10, ["main.tex"], minutes_ago=5)])
+        code, err = self.run_hook("Read", main)
+        self.assertEqual((code, self.stdout), (0, ""))
+
+    def test_read_then_edit_of_kept_file_is_blocked_once(self):
+        # The usual order: the agent Reads first, so the Read does the
+        # bootstrap that keeps the local file. The Edit after it (no new
+        # refresh) must still be blocked once, and the Read must tell both
+        # the user and the model about the kept file.
+        main = self.local("main.tex", "LOCAL NEWER\n", minutes_ago=10)
+        self.zip_files = {"main.tex": "OVERLEAF\n"}
+        self.updates([upd(9, 10, ["main.tex"], minutes_ago=60)])
+        code, err = self.run_hook("Read", main)
+        self.assertEqual(code, 0, err)
+        self.assertIn("kept the newer local main.tex", self.hook_json()["systemMessage"])
+        self.assertEqual(self.toV(), 10)
+        code, err = self.run_hook("Edit", main)  # within the debounce: no refresh
+        self.assertEqual(code, 2, err)
+        self.assertIn("Conflict: main.tex differs from Overleaf's copy", err)
+        self.assertIn(str(self.data / "conflicts" / PID), err)
+        code, err = self.run_hook("Edit", main)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(main.read_text(), "LOCAL NEWER\n")
+
+    def test_pull_that_writes_the_file_clears_the_pending_conflict(self):
+        main = self.local("main.tex", "LOCAL NEWER\n", minutes_ago=10)
+        self.zip_files = {"main.tex": "OVERLEAF\n"}
+        self.updates([upd(9, 10, ["main.tex"], minutes_ago=60)])
+        cli.refresh_project(PID, self.folder)
+        self.assertIn("main.tex", cli.pending_conflicts(PID))
+        cli.refresh_project(PID, self.folder, force=True)  # user chose Overleaf's
+        self.assertEqual(main.read_text(), "OVERLEAF\n")
+        self.assertEqual(cli.pending_conflicts(PID), {})
 
     def test_write_to_kept_local_file_is_blocked_once(self):
         main = self.local("main.tex", "LOCAL NEWER\n", minutes_ago=10)

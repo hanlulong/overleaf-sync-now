@@ -59,18 +59,22 @@ class _HookHarness(unittest.TestCase):
         cli._VALIDATION_FILE = self.data / ".validated-at"
         self.refresh_calls = []
         self.on_refresh = None
+        self.report_fill = None  # what the fake refresh puts in `report`
 
         def fake_refresh(pid, folder, **kw):
             self.refresh_calls.append((pid, pathlib.Path(folder)))
+            if self.report_fill is not None and kw.get("report") is not None:
+                kw["report"].update(self.report_fill)
             if self.on_refresh:
                 return self.on_refresh(pid, pathlib.Path(folder))
             return "no_change"
 
         cli.refresh_project = fake_refresh
-        self._stdin, self._stderr = sys.stdin, sys.stderr
+        self._stdin, self._stderr, self._stdout = sys.stdin, sys.stderr, sys.stdout
+        self.last_stdout = ""
 
     def tearDown(self):
-        sys.stdin, sys.stderr = self._stdin, self._stderr
+        sys.stdin, sys.stderr, sys.stdout = self._stdin, self._stderr, self._stdout
         for k, v in self._orig.items():
             setattr(cli, k, v)
         self._tmp.cleanup()
@@ -96,11 +100,13 @@ class _HookHarness(unittest.TestCase):
     def run_hook(self, payload):
         sys.stdin = io.StringIO(json.dumps(payload))
         sys.stderr = err = io.StringIO()
+        sys.stdout = out = io.StringIO()
         try:
             with self.assertRaises(SystemExit) as cm:
                 cli.cmd_hook([])
         finally:
-            sys.stderr = self._stderr
+            sys.stderr, sys.stdout = self._stderr, self._stdout
+        self.last_stdout = out.getvalue()
         code = cm.exception.code
         return (0 if code is None else code), err.getvalue()
 
@@ -182,7 +188,7 @@ class FailClosedResolutionTests(_HookHarness):
                    ts=time.time() - 3600)
         calls = []
 
-        def fake_refresh_records(strict=False):
+        def fake_refresh_records(strict=False, **kw):
             calls.append(strict)
             return [{"id": PID2, "name": "Brand New", "trashed": False, "archived": False}]
         orig = cli._refresh_projects_records
@@ -340,6 +346,50 @@ class ShellAndPatchCoverageTests(_HookHarness):
         self.assertEqual(len(self.refresh_calls), 1)
 
 
+class ShellCdExpansionTests(_HookHarness):
+    """`cd "$HOME/..."`, `cd ${HOME}/...`, `cd ~/A\\ B`, PowerShell $env:."""
+
+    def setUp(self):
+        super().setUp()
+        self.folder = self.project("Var Test")
+        self.cwd = self.base / "cwdtest"
+        self.cwd.mkdir()
+        from unittest import mock
+        self._env = mock.patch.dict(os.environ, {"HOME": str(self.base), "USERPROFILE": str(self.base)})
+        self._env.start()
+
+    def tearDown(self):
+        self._env.stop()
+        super().tearDown()
+
+    def targets(self, cmd, tool="Bash"):
+        kind, paths, _ = cli._hook_targets(
+            {"tool_name": tool, "cwd": str(self.cwd), "tool_input": {"command": cmd}})
+        return kind, {pathlib.Path(p) for p in paths}
+
+    def test_cd_targets_expand_like_the_shell(self):
+        want = self.folder / "main.tex"
+        for cmd in (
+            'cd "$HOME/Dropbox/Apps/Overleaf/Var Test" && sed -i "" "s/a/b/" main.tex',
+            "cd ${HOME}/Dropbox/Apps/Overleaf/Var\\ Test && sed -i s/a/b/ main.tex",
+            "cd ~/Dropbox/Apps/Overleaf/Var\\ Test && sed -i s/a/b/ main.tex",
+        ):
+            kind, paths = self.targets(cmd)
+            self.assertEqual(kind, "write", cmd)
+            self.assertIn(want, paths, cmd)
+        kind, paths = self.targets(
+            'Set-Location "$env:USERPROFILE/Dropbox/Apps/Overleaf/Var Test"; '
+            'Set-Content main.tex "x"', tool="PowerShell")
+        self.assertIn(want, paths)
+
+    def test_cd_with_variable_refreshes_the_real_folder(self):
+        cmd = 'cd "$HOME/Dropbox/Apps/Overleaf/Var Test" && sed -i "" "s/old/new/" main.tex'
+        self.run_hook({"tool_name": "Bash", "cwd": str(self.cwd), "tool_input": {"command": cmd}})
+        self.assertEqual([c[1] for c in self.refresh_calls], [self.folder])
+        # No stray Apps/Overleaf tree under the session cwd.
+        self.assertEqual(list(self.cwd.iterdir()), [])
+
+
 class ReadOnlyClassifierTests(unittest.TestCase):
     def test_read_only(self):
         for cmd in (
@@ -348,6 +398,16 @@ class ReadOnlyClassifierTests(unittest.TestCase):
             "head main.tex > /dev/null", "Get-Content main.tex",
         ):
             self.assertTrue(cli._is_read_only_command(cmd), cmd)
+
+    def test_writes_found_in_round_two(self):
+        for cmd in (
+            'F=main.tex; cat new.txt > "$F"', "cat new.txt > `ls *.tex`",
+            "find . -name main.tex -fprintf main.tex x", "find . -fprint0 out.tex",
+            "find . -fls main.tex", "awk '{print > FILENAME}' main.tex",
+            "awk '{print $0 > \"out.tex\"}' main.tex",
+        ):
+            self.assertFalse(cli._is_read_only_command(cmd), cmd)
+        self.assertTrue(cli._is_read_only_command("awk '$1 > 5 {print}' main.tex"))
 
     def test_writes(self):
         for cmd in (
@@ -436,13 +496,14 @@ class WriteGuardTests(_HookHarness):
     def test_retry_after_reread_passes(self):
         folder = self.project("Paper")
         self._web_edit("main.tex")
-        self.run_hook({"tool_name": "Edit", "tool_input": {"file_path": str(folder / "main.tex")}})
+        code, _ = self.run_hook({"tool_name": "Edit", "tool_input": {"file_path": str(folder / "main.tex")}})
+        self.assertEqual(code, 2)
         self.on_refresh = None  # nothing new on the web this time
-        state = json.loads(cli.STATE_FILE.read_text())
-        state[PID] -= 10
-        cli.STATE_FILE.write_text(json.dumps(state))
+        # The block cleared the write debounce: the immediate retry probes
+        # again (and passes, since nothing changed).
         code, err = self.run_hook({"tool_name": "Edit", "tool_input": {"file_path": str(folder / "main.tex")}})
         self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.refresh_calls), 2)
 
     def test_read_is_not_blocked_by_refresh(self):
         folder = self.project("Paper")
@@ -480,19 +541,35 @@ class WriteGuardTests(_HookHarness):
         folder = self.project("Paper")
         self.on_refresh = lambda pid, f: ("refreshed (wrote 0, unchanged 0, protected 1 (recent "
                                           "local edits; version held at 5 ...))")
+        self.report_fill = {"protected": ["main.tex"]}
         code, err = self.run_hook({"tool_name": "Write", "tool_input": {"file_path": str(folder / "main.tex")}})
         self.assertEqual(code, 2)
-        self.assertIn("Conflict", err)
-        # The message spells out the exact steps.
-        self.assertIn("sleep 30", err)
-        self.assertIn(f'overleaf-sync-now sync "{folder}"', err)
+        self.assertIn("Conflict: main.tex changed on Overleaf", err)
+        # The message spells out the exact steps, with no bare `sleep` (Claude
+        # Code's Bash tool refuses long foreground sleeps).
+        self.assertNotIn("sleep 30", err)
+        self.assertIn(f'overleaf-sync-now sync --wait "{folder}"', err)
         self.assertIn("tell the user", err)
+
+    def test_retry_right_after_protect_block_is_blocked_again(self):
+        # The block must not leave the 3 s write debounce set, or the next
+        # Edit of the same turn skips the probe and the stale edit lands.
+        folder = self.project("Paper")
+        self.on_refresh = lambda pid, f: "refreshed (wrote 0, unchanged 0, protected 1 (...))"
+        self.report_fill = {"protected": ["main.tex"]}
+        payload = {"tool_name": "Edit", "tool_input": {"file_path": str(folder / "main.tex")}}
+        self.assertEqual(self.run_hook(payload)[0], 2)
+        code, err = self.run_hook(payload)
+        self.assertEqual(code, 2, err)
+        self.assertIn("Conflict", err)
+        self.assertEqual(len(self.refresh_calls), 2)
 
     def test_protected_other_file_does_not_block(self):
         folder = self.project("Paper", files=("main.tex", "intro.tex"))
-        old = time.time() - 120
-        os.utime(folder / "main.tex", (old, old))
         self.on_refresh = lambda pid, f: "refreshed (wrote 0, unchanged 0, protected 1 (...))"
+        # intro.tex was protected; main.tex was also saved seconds ago but has
+        # no pending web change, so editing it is fine.
+        self.report_fill = {"protected": ["intro.tex"]}
         code, err = self.run_hook({"tool_name": "Write", "tool_input": {"file_path": str(folder / "main.tex")}})
         self.assertEqual(code, 0, err)
 
@@ -514,9 +591,6 @@ class WriteGuardTests(_HookHarness):
         self.assertEqual(code, 2)
         self.assertIn("deleted on Overleaf", err)
         (folder / "old.tex").unlink()
-        state = json.loads(cli.STATE_FILE.read_text())
-        state[PID] -= 10
-        cli.STATE_FILE.write_text(json.dumps(state))
         code, err = self.run_hook({"tool_name": "Write", "tool_input": {"file_path": str(folder / "old.tex")}})
         self.assertEqual(code, 0, err)
 
@@ -776,6 +850,96 @@ class NumberedAndIgnoreHookTests(_HookHarness):
         with mock.patch.dict(os.environ, {cli.IGNORE_ENV: os.pathsep.join(["/nowhere", str(folder)])}):
             code, err = self._write(folder)
         self.assertEqual((code, err), (0, ""))
+
+    def test_valid_marker_beats_an_ignore_file(self):
+        # The opt-out file can arrive from Overleaf (any collaborator's
+        # Dropbox uploads it); it must never switch off a linked project.
+        folder = self.project("My Paper")
+        (folder / cli.IGNORE_MARKER).write_text("")
+        res = cli.resolve_project(folder / "main.tex", verbose=False)
+        self.assertEqual((res["reason"], res["project_id"]), ("ok", PID))
+        code, _ = self.run_hook({"tool_name": "Edit", "tool_input": {"file_path": str(folder / "main.tex")}})
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.refresh_calls), 1)
+
+    def test_ignore_file_does_not_beat_an_exact_project_name(self):
+        self.index([{"id": PID, "name": "Real Paper"}])
+        folder = self.overleaf / "Real Paper"
+        folder.mkdir()
+        (folder / cli.IGNORE_MARKER).write_text("")
+        res = cli.resolve_project(folder / "main.tex", verbose=False)
+        self.assertEqual((res["reason"], res["project_id"]), ("ok", PID))
+        # ... and the env var still opts it out (it is local to this machine).
+        from unittest import mock
+        with mock.patch.dict(os.environ, {cli.IGNORE_ENV: str(folder)}):
+            self.assertEqual(cli.resolve_project(folder, verbose=False)["reason"], "ignored")
+
+    def test_numbered_name_with_stale_index_refetches(self):
+        # "Problem Set 5" created after the cached index, next to an older
+        # "Problem Set": the re-fetch must run and find the exact match.
+        self.index([{"id": PID, "name": "Problem Set"}], ts=time.time() - 3600)
+        fresh = [{"id": PID, "name": "Problem Set"}, {"id": PID2, "name": "Problem Set 5"}]
+        orig = cli._refresh_projects_records
+        cli._refresh_projects_records = lambda strict=False, **kw: fresh
+        try:
+            folder = self.overleaf / "Problem Set 5"
+            folder.mkdir()
+            code, err = self._write(folder)
+        finally:
+            cli._refresh_projects_records = orig
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.refresh_calls[0][0], PID2)
+
+    def test_offline_with_stale_index_is_network_not_none(self):
+        # No network and a cached index > 60 s old: the failed re-fetch must
+        # not turn into "no project is named X" (and the opt-out advice).
+        self.index([{"id": PID, "name": "Other"}], ts=time.time() - 3600)
+
+        def offline(strict=False, **kw):
+            raise cli.NetworkUnavailable(cli._OFFLINE_HINT.format(detail="Connection refused"))
+        orig = cli._refresh_projects_records
+        cli._refresh_projects_records = offline
+        try:
+            folder = self.overleaf / "New Paper"
+            folder.mkdir()
+            code, err = self._write(folder)
+        finally:
+            cli._refresh_projects_records = orig
+        self.assertEqual(code, 0, err)
+        self.assertIn("could not reach Overleaf", err)
+        self.assertNotIn(cli.IGNORE_MARKER, err)
+        self.assertIn("could not reach Overleaf", json.loads(self.last_stdout)["systemMessage"])
+
+    def test_nonexistent_project_folder_is_not_auto_linked(self):
+        self.index([{"id": PID, "name": "Ghost"}])
+        f = self.overleaf / "Ghost" / "main.tex"
+        res = cli.resolve_project(f, verbose=False)
+        self.assertEqual(res["reason"], "unmanaged")
+        self.assertFalse((self.overleaf / "Ghost").exists())
+
+    def test_unexpected_resolution_error_blocks_writes_under_apps_overleaf(self):
+        folder = self.overleaf / "My Paper"
+        folder.mkdir()
+        f = folder / "main.tex"
+        f.write_text("x")
+
+        def broken(*a, **k):
+            raise RuntimeError("charset_normalizer exploded")
+        orig = cli.resolve_project
+        cli.resolve_project = broken
+        try:
+            code, err = self.run_hook({"tool_name": "Edit", "tool_input": {"file_path": str(f)}})
+            self.assertEqual(code, 2)
+            self.assertIn("charset_normalizer exploded", err)
+            code, _ = self.run_hook({"tool_name": "Read", "tool_input": {"file_path": str(f)}})
+            self.assertEqual(code, 0)
+            other = self.base / "repo" / "x.tex"
+            other.parent.mkdir()
+            other.write_text("x")
+            code, _ = self.run_hook({"tool_name": "Edit", "tool_input": {"file_path": str(other)}})
+            self.assertEqual(code, 0)
+        finally:
+            cli.resolve_project = orig
 
     def test_no_match_message_mentions_the_opt_out(self):
         self.index([{"id": PID, "name": "Other"}])
