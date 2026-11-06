@@ -1258,7 +1258,10 @@ def _extract_files(zip_bytes, folder, paths, protect_recent_seconds=30, *,
             # overwrite the local marker. The local marker is the source of
             # truth for this machine's link, and Overleaf's copy may be from
             # a different machine that picked a different project.
-            if pathlib.PurePosixPath(rel).name == PROJECT_MARKER:
+            # The opt-out file is per machine too: a copy that reached
+            # Overleaf (uploaded from someone's Dropbox) must not switch the
+            # hook off in every collaborator's folder.
+            if pathlib.PurePosixPath(rel).name in (PROJECT_MARKER, IGNORE_MARKER):
                 continue
             target = (folder / rel).resolve()
             try:
@@ -1425,11 +1428,15 @@ def resolve_project(start, *, verbose=True, allow_disambig_network=True, read_on
         if p == ignored or p.is_relative_to(ignored):
             res.update(folder=ignored, reason="ignored", detail=f"listed in ${IGNORE_ENV}")
             return res
+    # The opt-out file is for folders that are NOT Overleaf projects. It sits
+    # in the Dropbox folder, so it can also reach Overleaf and every
+    # collaborator; it therefore never beats a valid marker, and it only
+    # applies when the folder name does not resolve to a project (below).
+    ignore_at = None
     cur = p
     while True:
-        if (cur / IGNORE_MARKER).exists():
-            res.update(folder=cur, reason="ignored", detail=f"{cur / IGNORE_MARKER} exists")
-            return res
+        if ignore_at is None and (cur / IGNORE_MARKER).exists():
+            ignore_at = cur
         marker = cur / PROJECT_MARKER
         if marker.exists():
             try:
@@ -1468,35 +1475,73 @@ def resolve_project(start, *, verbose=True, allow_disambig_network=True, read_on
                         )
                 else:
                     _validate_marker_id_against_index(pid, cur, verbose=verbose)
+                    if ignore_at is not None and verbose:
+                        print(
+                            f"[overleaf-sync-now] WARN: ignoring {ignore_at / IGNORE_MARKER}: "
+                            f"{cur} is linked to Overleaf project {pid}. To opt a real project "
+                            f"out, list its folder in ${IGNORE_ENV} instead (the file would sync "
+                            f"to Overleaf and to collaborators).",
+                            file=sys.stderr,
+                        )
                     res.update(folder=cur, project_id=pid, reason="ok")
                     return res
         if cur.parent == cur:
             break
         cur = cur.parent
-    parts = p.parts
+
+    def _ignored():
+        res.update(folder=ignore_at, project_id=None, reason="ignored",
+                   detail=f"{ignore_at / IGNORE_MARKER} exists")
+        return res
+
+    folder = _apps_overleaf_folder(p)
+    if folder is not None and not folder.is_dir():
+        # A project folder that does not exist yet (a new project being
+        # created, or a mis-parsed path): nothing local can be stale, and
+        # auto-link must not create directories by writing a marker.
+        return _ignored() if ignore_at is not None else res
+    if folder is not None:
+        name = folder.name
+        outcome = {}
+        pid = _autolink_resolve(
+            name, folder, verbose=verbose,
+            allow_disambig_network=allow_disambig_network,
+            write_marker=not read_only and ignore_at is None, outcome=outcome,
+        )
+        res.update(folder=folder, name=name)
+        if pid:
+            if ignore_at is not None and verbose:
+                print(
+                    f"[overleaf-sync-now] WARN: ignoring {ignore_at / IGNORE_MARKER}: "
+                    f"{folder.name!r} is the name of an Overleaf project ({pid}). To opt it "
+                    f"out anyway, list the folder in ${IGNORE_ENV}.",
+                    file=sys.stderr,
+                )
+            res.update(project_id=pid, reason="ok")
+        elif ignore_at is not None:
+            return _ignored()
+        else:
+            res.update(
+                reason=outcome.get("reason") or "none",
+                candidates=outcome.get("candidates") or [],
+                detail=outcome.get("detail"),
+                numbered_base=outcome.get("numbered_base"),
+            )
+        return res
+    if ignore_at is not None:
+        return _ignored()
+    return res
+
+
+def _apps_overleaf_folder(path):
+    """The .../Apps/Overleaf/<name> folder containing `path` (a resolved,
+    absolute folder path), or None."""
+    parts = pathlib.Path(path).parts
     for i, part in enumerate(parts[:-1]):
         if part.lower() == "overleaf" and i > 0 and parts[i - 1].lower() == "apps":
             if i + 1 < len(parts):
-                name = parts[i + 1]
-                folder = pathlib.Path(*parts[: i + 2])
-                outcome = {}
-                pid = _autolink_resolve(
-                    name, folder, verbose=verbose,
-                    allow_disambig_network=allow_disambig_network,
-                    write_marker=not read_only, outcome=outcome,
-                )
-                res.update(folder=folder, name=name)
-                if pid:
-                    res.update(project_id=pid, reason="ok")
-                else:
-                    res.update(
-                        reason=outcome.get("reason") or "none",
-                        candidates=outcome.get("candidates") or [],
-                        detail=outcome.get("detail"),
-                        numbered_base=outcome.get("numbered_base"),
-                    )
-                return res
-    return res
+                return pathlib.Path(*parts[: i + 2])
+    return None
 
 
 def _autolink_resolve(name, folder, *, verbose=True, allow_disambig_network=True,
@@ -1529,17 +1574,24 @@ def _autolink_resolve(name, folder, *, verbose=True, allow_disambig_network=True
             print(f"[overleaf-sync-now] auto-link: could not fetch project list: {e}", file=sys.stderr)
         return None
     status_outcome = _resolve_by_name(name, records)
-    if status_outcome[0] == "none" and _index_age_seconds() > 60:
+    if status_outcome[0] in ("none", "numbered") and _index_age_seconds() > 60:
         # The cached index can be up to 24 h old, so a project created since
-        # then is missing from it. Re-fetch once before declaring "none".
+        # then is missing from it ("Problem Set 5" next to an older "Problem
+        # Set"). Re-fetch once before declaring "none" or "numbered".
         try:
-            records = _load_projects_records(force_refresh=True, strict=True)
+            records = _load_projects_records(force_refresh=True, strict=True, require_fresh=True)
             status_outcome = _resolve_by_name(name, records)
         except AuthExpired as e:
             outcome.update(reason="auth", detail=str(e))
             return None
-        except (RuntimeError, requests.exceptions.RequestException):
-            pass
+        except (RuntimeError, requests.exceptions.RequestException) as e:
+            # Offline / sandboxed: the stale list proves nothing about this
+            # name, so report "could not reach Overleaf", never "no project".
+            outcome.update(reason="network", detail=str(e))
+            if verbose:
+                print(f"[overleaf-sync-now] auto-link: could not refresh the project list: {e}",
+                      file=sys.stderr)
+            return None
     status = status_outcome[0]
     if status == "numbered":
         # A numbered duplicate folder. With several same-name projects the
@@ -1936,14 +1988,17 @@ def _index_record_by_id(records, project_id):
     return None
 
 
-def _load_projects_records(*, force_refresh=False, strict=False):
+def _load_projects_records(*, force_refresh=False, strict=False, require_fresh=False):
     """Return the list of project records, refreshing from Overleaf when
     the cache is missing/expired/wrong-version. May make a network call;
     use `_load_cached_projects_records` for the no-network variant.
 
     strict=True raises RuntimeError when the fetch fails and there is no
     cached index to fall back on (instead of returning []), so a resolver
-    can tell "project list unavailable" from "no such project"."""
+    can tell "project list unavailable" from "no such project".
+    require_fresh=True (with force_refresh) raises when the fetch fails even
+    if a cached index exists, so a re-fetch failure is never mistaken for
+    "the project is not in the list"."""
     if not force_refresh and INDEX_FILE.exists():
         try:
             with open(INDEX_FILE) as f:
@@ -1955,7 +2010,7 @@ def _load_projects_records(*, force_refresh=False, strict=False):
                 return cached.get("projects", []) or []
         except Exception:
             pass
-    return _refresh_projects_records(strict=strict)
+    return _refresh_projects_records(strict=strict, require_fresh=require_fresh)
 
 
 def _index_age_seconds():
@@ -1983,7 +2038,7 @@ def _load_cached_projects_records():
     return cached.get("projects", []) or []
 
 
-def _refresh_projects_records(strict=False):
+def _refresh_projects_records(strict=False, require_fresh=False):
     """Fetch /project, parse ol-prefetchedProjectsBlob, and persist a v2
     record list with the disambiguating fields (id, name, trashed, archived,
     lastUpdated, ownerId). Falls back to whatever's on disk when Overleaf
@@ -2003,12 +2058,12 @@ def _refresh_projects_records(strict=False):
         if _is_sandbox_block(e):
             raise NetworkUnavailable(_SANDBOX_HINT) from e
         cached = _load_cached_projects_records()
-        if strict and not cached:
+        if (strict and not cached) or require_fresh:
             raise _wrap_network_error(e, "fetching the project list") from e
         return cached
     if r.status_code != 200:
         cached = _load_cached_projects_records()
-        if strict and not cached:
+        if (strict and not cached) or require_fresh:
             raise RuntimeError(f"Overleaf project list returned HTTP {r.status_code}")
         return cached
     m = re.search(r'name="ol-prefetchedProjectsBlob"[^>]*\scontent="([^"]+)"', r.text)
@@ -2892,7 +2947,18 @@ def _cmd_hook(args):
         try:
             res = resolve_project(point, verbose=False)
         except Exception as e:
-            warnings.append(f"[overleaf-sync-now] hook: could not resolve project for {point}: {e}; skipping.")
+            apps = _apps_overleaf_folder(point if not is_file_target else point.parent)
+            if is_write and apps is not None:
+                # Fail closed under Apps/Overleaf/<name>/, as for any other
+                # folder whose project cannot be determined.
+                blocks.append(
+                    f"[overleaf-sync-now] Could not tell which Overleaf project {apps} belongs "
+                    f"to ({type(e).__name__}: {e}). {tool} blocked so a possibly-stale local "
+                    f"copy is not edited. Run `overleaf-sync-now status \"{apps}\"` to see the "
+                    f"error, then retry."
+                )
+            else:
+                warnings.append(f"[overleaf-sync-now] hook: could not resolve project for {point}: {e}; skipping.")
             continue
         reason = res["reason"]
         if reason == "ok":
