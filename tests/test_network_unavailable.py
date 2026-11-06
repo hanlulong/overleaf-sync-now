@@ -103,7 +103,7 @@ class _Env(unittest.TestCase):
         cli.WEB_REMOVED_FILE = self.data / "web-removed.json"
         cli._VALIDATION_FILE = self.data / ".validated-at"
         self.chain_calls = []
-        cli._resolve_cookies = lambda interactive=False: self.chain_calls.append(1)
+        cli._resolve_cookies = lambda interactive=False, **kw: self.chain_calls.append(1)
         self.net_error = dns_failure()
         self.status = None
         test = self
@@ -193,7 +193,7 @@ class GetSessionTests(_Env):
     def test_rejected_cookie_still_raises_authexpired(self):
         self.cookie()
         self.status = 302
-        cli._resolve_cookies = lambda interactive=False: None
+        cli._resolve_cookies = lambda interactive=False, **kw: None
         with self.assertRaises(cli.AuthExpired):
             cli.get_session()
 

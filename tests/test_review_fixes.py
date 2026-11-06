@@ -410,7 +410,7 @@ class GetSessionAuthTests(unittest.TestCase):
         # the hook BLOCKS the edit), not a plain RuntimeError (which the hook's
         # generic handler would pass through, editing a stale copy).
         cli._load_cache = lambda: None
-        cli._resolve_cookies = lambda interactive=False: None
+        cli._resolve_cookies = lambda interactive=False, **kw: None
         with self.assertRaises(cli.AuthExpired):
             cli.get_session()
 
@@ -423,7 +423,7 @@ class GetSessionAuthTests(unittest.TestCase):
         cli._check_cookies = lambda c, use_cache=True: (
             "unreachable", requests.exceptions.ConnectionError("[Errno 13] Permission denied"))
         called = []
-        cli._resolve_cookies = lambda interactive=False: called.append(1)
+        cli._resolve_cookies = lambda interactive=False, **kw: called.append(1)
         with self.assertRaises(cli.NetworkUnavailable) as cm:
             cli.get_session()
         self.assertNotIsInstance(cm.exception, cli.AuthExpired)

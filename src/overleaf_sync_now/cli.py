@@ -113,6 +113,8 @@ SESSION_COOKIE = "overleaf_session2"
 CHROMIUM_COOKIE_FNS = (
     "chrome", "edge", "brave", "vivaldi", "chromium", "opera", "firefox", "librewolf",
 )
+# Browsers the libraries' all-browsers `load()` adds; tried once each instead.
+EXTRA_COOKIE_FNS = ("opera_gx", "arc", "safari")
 # Layer 6b: how many recent dropbox-origin update entries to use as a
 # fingerprint of "this project is the local folder". Bounded to keep the
 # extra stat() calls negligible on a Dropbox folder (which can be slow).
@@ -334,7 +336,7 @@ def _try_rookiepy():
         import rookiepy
     except ImportError:
         return None
-    for fn_name in (*CHROMIUM_COOKIE_FNS, "load"):
+    for fn_name in (*CHROMIUM_COOKIE_FNS, *EXTRA_COOKIE_FNS):
         try:
             fn = getattr(rookiepy, fn_name, None)
             if not fn:
@@ -353,7 +355,10 @@ def _try_browser_cookie3():
         import browser_cookie3
     except ImportError:
         return None
-    for fn_name in CHROMIUM_COOKIE_FNS:
+    # One pass per browser. browser_cookie3.load() would repeat every browser
+    # above, and on macOS each Chromium-family lookup asks the Keychain for
+    # "<Browser> Safe Storage" (a password dialog per installed browser).
+    for fn_name in (*CHROMIUM_COOKIE_FNS, *EXTRA_COOKIE_FNS):
         try:
             fn = getattr(browser_cookie3, fn_name, None)
             if not fn:
@@ -364,13 +369,6 @@ def _try_browser_cookie3():
                 return cookies
         except Exception:
             continue
-    try:
-        cj = browser_cookie3.load(domain_name="overleaf.com")
-        cookies = {c.name: c.value for c in cj}
-        if SESSION_COOKIE in cookies:
-            return cookies
-    except Exception:
-        pass
     return None
 
 
@@ -410,8 +408,42 @@ def _try_playwright_profile():
     return None
 
 
-def _resolve_cookies_with_source(interactive=False):
+# Reading cookies from installed browsers' on-disk stores (rookiepy,
+# browser_cookie3, the Claude Code Playwright profile) asks the macOS Keychain
+# for each Chromium browser's "Safe Storage" key, which can raise a password
+# dialog per browser. That is acceptable when the user runs setup / install /
+# status / doctor, but not from the PreToolUse hook (it would fire on every
+# unauthenticated AI read or edit), so the hook turns it off. Other callers
+# (sync, run by agents too) back off for an hour after the chain failed.
+_BROWSER_EXTRACTION = {"allowed": True}
+_BROWSER_COOLDOWN_SECONDS = 3600
+
+
+def _browser_cooldown_file():
+    return pathlib.Path(CACHE_DIR) / ".browser-cookies-failed-at"
+
+
+def _browser_extraction_in_cooldown():
+    try:
+        with open(_browser_cooldown_file()) as f:
+            return (time.time() - float(f.read().strip())) < _BROWSER_COOLDOWN_SECONDS
+    except Exception:
+        return False
+
+
+def _mark_browser_extraction_failed():
+    try:
+        _atomic_write_text(_browser_cooldown_file(), str(time.time()))
+    except OSError:
+        pass
+
+
+def _resolve_cookies_with_source(interactive=False, *, browsers=None):
     """Walk the auth chain. Returns (cookies, source_label) or (None, None).
+
+    browsers: True tries the installed-browser extractors (setup, status,
+    doctor), False skips them (the hook), None decides automatically: on
+    unless the hook is running or they failed within the last hour.
 
     Raises NetworkUnavailable when Overleaf cannot be reached: a cookie that
     can't be checked is not an expired cookie, and walking on to the browser
@@ -428,13 +460,16 @@ def _resolve_cookies_with_source(interactive=False):
     # Persistent browser profile from `login` command (the proper fix for
     # Chrome 130+ app-bound encryption). Browser API can read HttpOnly cookies
     # that no on-disk extractor can decrypt without admin.
-    chain = (
-        ("`login` browser profile", _try_login_profile),
-        # rookiepy: Chrome 127+ friendly via Rust
-        ("rookiepy (installed browsers)", _try_rookiepy),
-        ("browser_cookie3 (installed browsers)", _try_browser_cookie3),
-        ("Claude Code Playwright profile", _try_playwright_profile),
-    )
+    if browsers is None:
+        browsers = _BROWSER_EXTRACTION["allowed"] and not _browser_extraction_in_cooldown()
+    chain = [("`login` browser profile", _try_login_profile)]
+    if browsers:
+        chain += [
+            # rookiepy: Chrome 127+ friendly via Rust
+            ("rookiepy (installed browsers)", _try_rookiepy),
+            ("browser_cookie3 (installed browsers)", _try_browser_cookie3),
+            ("Claude Code Playwright profile", _try_playwright_profile),
+        ]
     for label, fn in chain:
         found = fn()
         state, exc = _check_cookies(found)
@@ -451,11 +486,13 @@ def _resolve_cookies_with_source(interactive=False):
             return manual, "hidden terminal prompt"
         if state == "unreachable":
             raise NetworkUnavailable(_network_unavailable_message(exc))
+    if browsers:
+        _mark_browser_extraction_failed()
     return None, None
 
 
-def _resolve_cookies(interactive=False):
-    return _resolve_cookies_with_source(interactive=interactive)[0]
+def _resolve_cookies(interactive=False, **kw):
+    return _resolve_cookies_with_source(interactive=interactive, **kw)[0]
 
 
 def _prompt_manual_cookie():
@@ -2001,7 +2038,7 @@ def cmd_setup(args, *, force_noninteractive=False):
     # -> browser_cookie3 -> Playwright profile), so setup never reports
     # failure for a session that sync would find.
     try:
-        cookies, source = _resolve_cookies_with_source(interactive=interactive)
+        cookies, source = _resolve_cookies_with_source(interactive=interactive, browsers=True)
     except NetworkUnavailable as e:
         print(f"  - Could not reach Overleaf, so auth was not checked.\n    {e}")
         print("  - Re-run `overleaf-sync-now setup` (or `status`) once Overleaf is reachable.")
@@ -2211,7 +2248,7 @@ def cmd_status(args):
         else:
             # Cache failed; walk the full chain to predict sync behavior.
             try:
-                resolved = _resolve_cookies(interactive=False)
+                resolved = _resolve_cookies(interactive=False, browsers=True)
                 unreachable = None
             except NetworkUnavailable as e:
                 resolved, unreachable = None, e
@@ -2686,6 +2723,16 @@ def _hook_unresolved_message(res, tool):
 
 
 def cmd_hook(args):
+    # No keychain / browser-store access from the hook (see _BROWSER_EXTRACTION).
+    previous = _BROWSER_EXTRACTION["allowed"]
+    _BROWSER_EXTRACTION["allowed"] = False
+    try:
+        _cmd_hook(args)
+    finally:
+        _BROWSER_EXTRACTION["allowed"] = previous
+
+
+def _cmd_hook(args):
     try:
         data = json.load(sys.stdin)
     except Exception as e:
@@ -3814,7 +3861,7 @@ def cmd_doctor(args):
 
     # Best-available cookies
     try:
-        best = _resolve_cookies(interactive=False)
+        best = _resolve_cookies(interactive=False, browsers=True)
         unreachable = None
     except NetworkUnavailable as e:
         best, unreachable = None, e

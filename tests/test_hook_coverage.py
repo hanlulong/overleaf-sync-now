@@ -601,7 +601,7 @@ class CredentialHygieneTests(unittest.TestCase):
     def test_get_session_error_uses_recovery_text(self):
         orig = (cli._load_cache, cli._resolve_cookies)
         cli._load_cache = lambda: None
-        cli._resolve_cookies = lambda interactive=False: None
+        cli._resolve_cookies = lambda interactive=False, **kw: None
         try:
             with self.assertRaises(cli.AuthExpired) as cm:
                 cli.get_session()
@@ -672,7 +672,7 @@ class SaveCookieInputModesTests(unittest.TestCase):
 class SetupNoPrefixTests(unittest.TestCase):
     def test_setup_reports_source_without_cookie_prefix(self):
         orig = cli._resolve_cookies_with_source
-        cli._resolve_cookies_with_source = lambda interactive=False: (
+        cli._resolve_cookies_with_source = lambda interactive=False, **kw: (
             {cli.SESSION_COOKIE: "s%3ATOPSECRETVALUE"}, "cached cookie")
         out = io.StringIO()
         orig_out = sys.stdout
@@ -688,7 +688,7 @@ class SetupNoPrefixTests(unittest.TestCase):
 
     def test_setup_failure_recommends_login_not_browser(self):
         orig = cli._resolve_cookies_with_source
-        cli._resolve_cookies_with_source = lambda interactive=False: (None, None)
+        cli._resolve_cookies_with_source = lambda interactive=False, **kw: (None, None)
         out = io.StringIO()
         orig_out = sys.stdout
         sys.stdout = out
