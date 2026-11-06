@@ -974,6 +974,98 @@ def web_removed_paths(project_id, folder):
     return {p: n for p, n in entry.items() if _path_exists_under(folder, p)}
 
 
+# -------- keep-both conflicts and our own writes (persisted) --------
+#
+# conflicts-pending.json  {project_id: {path: conflict_copy}}: files a
+#   bootstrap / full pull KEPT (local newer than Overleaf's last change).
+#   The next agent write to such a path is blocked once, even when a Read
+#   did the pull, so the agent shows the user both versions first. An entry
+#   is dropped after that block, or when a later pull writes the file.
+# extracted.json  {project_id: {path: [mtime_ns, size]}}: files this tool
+#   itself wrote. A file still carrying that stamp was not saved locally
+#   since, so it never counts as a "local save" for the 30 s protect window
+#   or for keep-both.
+
+
+def _pending_conflicts_file():
+    return pathlib.Path(CACHE_DIR) / "conflicts-pending.json"
+
+
+def _extracted_file():
+    return pathlib.Path(CACHE_DIR) / "extracted.json"
+
+
+def _load_json_map(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"[overleaf-sync-now] WARNING: {path} is unreadable ({e}); ignoring it.", file=sys.stderr)
+        return {}
+
+
+def _save_json_map(path, data):
+    try:
+        _atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False))
+    except OSError as e:
+        print(f"[overleaf-sync-now] WARNING: could not save {path}: {e}", file=sys.stderr)
+
+
+def pending_conflicts(project_id):
+    entry = _load_json_map(_pending_conflicts_file()).get(project_id)
+    return dict(entry) if isinstance(entry, dict) else {}
+
+
+def _update_pending_conflicts(project_id, add=None, drop=()):
+    """Add {path: copy} entries and drop paths for one project."""
+    if not project_id or (not add and not drop):
+        return
+    path = _pending_conflicts_file()
+    data = _load_json_map(path)
+    entry = dict(data.get(project_id) or {})
+    before = dict(entry)
+    for rel in drop:
+        entry.pop(rel, None)
+    entry.update(add or {})
+    if entry == before:
+        return
+    if entry:
+        data[project_id] = entry
+    else:
+        data.pop(project_id, None)
+    _save_json_map(path, data)
+
+
+def _file_stamp(path):
+    try:
+        st = os.stat(str(path))
+        return [st.st_mtime_ns, st.st_size]
+    except OSError:
+        return None
+
+
+EXTRACTED_KEEP_PER_PROJECT = 2000
+
+
+def _record_extracted(project_id, stamps):
+    if not project_id or not stamps:
+        return
+    path = _extracted_file()
+    data = _load_json_map(path)
+    entry = dict(data.get(project_id) or {})
+    for rel, stamp in stamps.items():
+        entry.pop(rel, None)
+        if stamp:
+            entry[rel] = stamp
+    if len(entry) > EXTRACTED_KEEP_PER_PROJECT:
+        entry = dict(list(entry.items())[-EXTRACTED_KEEP_PER_PROJECT:])
+    data[project_id] = entry
+    _save_json_map(path, data)
+
+
 def refresh_project(project_id, folder, *, force=False, report=None):
     """Version-match refresh. Probes /updates, decides whether a zip download
     is actually needed, and if so extracts only the changed files into folder.
@@ -1245,6 +1337,8 @@ def _extract_files(zip_bytes, folder, paths, protect_recent_seconds=30, *,
     report.setdefault("conflicts", {})
     report.setdefault("protected", [])
     report.setdefault("backup_dir", None)
+    own = (_load_json_map(_extracted_file()).get(project_id) or {}) if project_id else {}
+    stamps = {}
 
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
         for info in z.infolist():
@@ -1279,14 +1373,28 @@ def _extract_files(zip_bytes, folder, paths, protect_recent_seconds=30, *,
             if target.exists():
                 try:
                     old_content = target.read_bytes()
-                except OSError:
-                    old_content = None
+                except OSError as e:
+                    # Can't back it up, so don't overwrite it. Counted as
+                    # protected: the version is held and the next sync retries.
+                    n_protected += 1
+                    report["protected"].append(rel)
+                    print(
+                        f"[overleaf-sync-now] SKIP {rel}: the local file can't be read ({e}), "
+                        f"so it can't be backed up; not overwriting it. Fix its permissions "
+                        f"and sync again.",
+                        file=sys.stderr,
+                    )
+                    continue
                 if old_content == new_content:
                     n_unchanged += 1
                     continue
                 try:
                     mtime = target.stat().st_mtime
                 except OSError:
+                    mtime = None
+                # A file that still carries the stamp of our own last write
+                # was not saved locally since: no protect window, no keep-both.
+                if mtime is not None and own.get(rel) and own.get(rel) == _file_stamp(target):
                     mtime = None
                 # Content differs. If the local file was modified very
                 # recently, the user is probably mid-save and our write
@@ -1344,7 +1452,13 @@ def _extract_files(zip_bytes, folder, paths, protect_recent_seconds=30, *,
                 raise
             n_written += 1
             report["written"].append(rel)
+            stamps[rel] = _file_stamp(target)
 
+    if project_id:
+        _record_extracted(project_id, stamps)
+        # Kept files wait for the user's decision (the hook blocks the next
+        # write to them once); a file we just wrote is no longer in conflict.
+        _update_pending_conflicts(project_id, add=report["conflicts"], drop=report["written"])
     if report["backup_dir"]:
         _prune_backups(project_id)
     return n_written, n_unchanged, n_protected
