@@ -2480,7 +2480,8 @@ HOME = pathlib.Path.home()
 SKILL_TARGETS = {
     "Claude Code": HOME / ".claude" / "skills" / "overleaf",
     # Codex CLI (and other Agent Skills clients) read user skills from
-    # ~/.agents/skills. ~/.codex/skills is the deprecated location.
+    # ~/.agents/skills (the documented user location); <= 0.4.x used
+    # ~/.codex/skills, and two copies make Codex list the skill twice.
     "Codex CLI": HOME / ".agents" / "skills" / "overleaf",
 }
 # Copies written by <= 0.4.x. Removed on install (when ours) so Codex does not

@@ -101,7 +101,7 @@ Writes a `.overleaf-project` marker. Only needed for non-standard folder layouts
 PreToolUse hook entrypoint for Claude Code and Codex CLI. Reads the tool-call JSON from stdin. **Not for manual use.**
 
 ### `install`
-Idempotent post-install setup. Copies `SKILL.md` into `~/.claude/skills/overleaf/` and `~/.agents/skills/overleaf/` (the Codex CLI user skills folder) and removes an old copy of ours from the deprecated `~/.codex/skills/overleaf/`. It never deletes a folder holding a different skill. It writes the Claude Code hook (exec form, matcher `Read|Edit|Write|Bash|PowerShell`, timeout 180 s) and a Codex CLI hook in `~/.codex/hooks.json` (matcher `apply_patch|Bash`), then runs the auth chain. Codex only runs a new or changed hook after the user trusts it with `/hooks`. Re-run after upgrading.
+Idempotent post-install setup. Copies `SKILL.md` into `~/.claude/skills/overleaf/` and `~/.agents/skills/overleaf/` (the Codex CLI user skills folder) and removes an old copy of ours from `~/.codex/skills/overleaf/` (where 0.4.x put it; a second copy makes Codex list the skill twice). It never deletes a folder holding a different skill. It writes the Claude Code hook (exec form, matcher `Read|Edit|Write|Bash|PowerShell`, timeout 180 s) and a Codex CLI hook in `~/.codex/hooks.json` (matcher `apply_patch|Bash`), then runs the auth chain. Codex only runs a new or changed hook after the user trusts it with `/hooks`. Re-run after upgrading.
 
 ### `uninstall`
 Removes our skill copies and both hooks. Cookies are preserved.

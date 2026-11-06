@@ -20,7 +20,7 @@ Everything `install` writes is **user-global**. The only file the tool ever writ
 | `<DATA_DIR>/web-removed.json` | Paths deleted or renamed on overleaf.com whose local copy still exists (since 0.5.0; POSIX `0o600`) |
 | `<DATA_DIR>/browser-profile/` | Persistent Playwright profile created by `login` (Chromium with the Overleaf session) |
 
-Versions up to 0.4.x copied the skill to `~/.codex/skills/overleaf/`, which Codex now treats as a deprecated location; `install` removes that copy (only if it is ours) so Codex doesn't list the skill twice. `install` and `uninstall` never delete a skill folder whose `SKILL.md` doesn't mention `overleaf-sync-now`.
+Versions up to 0.4.x copied the skill to `~/.codex/skills/overleaf/`. Codex documents `~/.agents/skills` as the user skills location, and a second copy makes it list the skill twice, so `install` removes that copy (only if it is ours) so Codex doesn't list the skill twice. `install` and `uninstall` never delete a skill folder whose `SKILL.md` doesn't mention `overleaf-sync-now`.
 
 `<DATA_DIR>` resolution order: (1) `$OVERLEAF_SYNC_DATA_DIR` if set; (2) `~/.claude/overleaf-data/` if it exists (legacy installs); (3) `~/.overleaf-sync/` (default for new installs).
 

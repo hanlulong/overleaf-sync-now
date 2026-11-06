@@ -3,7 +3,7 @@
 Pins:
   * the skill goes to ~/.claude/skills/overleaf and ~/.agents/skills/overleaf
     (the Codex / Agent Skills user location); an old copy of ours in the
-    deprecated ~/.codex/skills/overleaf is removed so Codex lists it once.
+    older ~/.codex/skills/overleaf location is removed so Codex lists it once.
   * nothing that is not ours is ever deleted (another skill named `overleaf`).
   * the Claude Code hook is exec form (`command` + `args`), matcher
     Read|Edit|Write|Bash|PowerShell, explicit timeout; an old v0.0.x entry
