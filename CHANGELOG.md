@@ -76,11 +76,13 @@ with `/hooks`.**
    0.164.0, which loads the entry without warnings.
 
 7. **No network is not an expired login.** Offline, behind a broken
-   proxy, during an Overleaf outage, or inside Codex CLI's default sandbox
-   (no network access), cookie validation failed like a rejected cookie: the
-   hook blocked Read/Edit with "No valid Overleaf cookies" and told the agent
-   to re-authenticate, and `status`/`doctor`/`save-cookie` said INVALID or
-   "rejected". The macOS sandbox detection never fired, because Seatbelt
+   proxy or during an Overleaf outage, cookie validation failed like a
+   rejected cookie: the Claude Code hook blocked Read/Edit with "No valid
+   Overleaf cookies" and told the agent to re-authenticate, and
+   `status`/`doctor`/`save-cookie` said INVALID or "rejected". Inside Codex
+   CLI's default sandbox (no network access), the `sync` and `status` the
+   agent ran reported an expired login the same way. (Codex runs hooks
+   themselves outside its sandbox.) The macOS sandbox detection never fired, because Seatbelt
    fails DNS (`[Errno 8]`) and connects (`[Errno 1] Operation not
    permitted`) with errors the old check didn't recognize. Validation is now
    three-way (accepted / refused / unreachable). Unreachable raises
@@ -96,14 +98,18 @@ with `/hooks`.**
    Overleaf's Dropbox sync was down, silently, even on a Read. Now a local
    file changed after Overleaf's last change to it is kept and Overleaf's
    copy is saved to `<DATA_DIR>/conflicts/<project>/<timestamp>/` with a
-   warning; a write to it is blocked once so the agent asks the user. Before
-   any overwrite, the previous bytes go to
-   `<DATA_DIR>/backups/<project>/<timestamp>/` (kept 30 days). The hook
-   prints a one-line summary whenever a refresh writes or skips files.
-   Targeted pulls and `--force` still take Overleaf's version.
-9. **The 30 s conflict block says exactly what to do**: wait 30 s, run the
-   printed `sync`, re-read, check both changes, retry, and stop and tell the
-   user if it repeats.
+   warning. The kept file is recorded in `<DATA_DIR>/conflicts-pending.json`,
+   and the first AI write to it after the pull is blocked once so the agent
+   asks the user, also when a Read did the pull. Before any overwrite, the
+   previous bytes go to `<DATA_DIR>/backups/<project>/<timestamp>/` (kept
+   30 days). The hook reports a one-line summary whenever a refresh writes,
+   keeps or skips files (see item 31 for how it is shown). Targeted pulls
+   and `--force` still take Overleaf's version.
+9. **The 30 s conflict block says exactly what to do**: run the printed
+   `overleaf-sync-now sync --wait "<folder>"` (new: it waits until the
+   local save is 30 s old, then pulls, so no `sleep`, which Claude Code's
+   Bash tool refuses), re-read, check both changes, retry, and stop and
+   tell the user if it repeats.
 10. **Numbered duplicate folders and decomposed names.** Auto-link compares
    names in Unicode NFC. A folder such as `Paper (1)` or `Paper 2` (Overleaf
    may number the folders of same-name projects) lists the `Paper` projects
@@ -111,6 +117,10 @@ with `/hooks`.**
    alone.
 11. **Opt-out for folders that are not Overleaf projects**: an empty
    `.overleaf-sync-ignore` file in the folder, or `$OVERLEAF_SYNC_IGNORE`.
+   The file syncs to Overleaf like any other, so it never overrides a
+   linked folder or one whose name matches a project, and a copy in the
+   Overleaf zip is never extracted; the environment variable (local to the
+   machine) opts out a real project.
 ### Fixed — credentials & security
 
 12. **The cookie never goes through the chat.** The auth-failure text shown
@@ -206,7 +216,70 @@ with `/hooks`.**
 30. **More docs:** a Prerequisites list (git, the Dropbox app, Overleaf's
     premium Dropbox sync), `login` recommended on every OS, per-browser and
     per-OS DevTools steps instead of "press F12", and SKILL.md trimmed from
-    17.9 KB to 9.1 KB, with background left to the docs.
+    17.9 KB to about 10 KB, with background left to the docs.
+
+### Fixed — third review round
+
+31. **Hook notes reach the user and the model.** Claude Code never shows
+    the model stderr from a hook that exits 0 (the user sees it only in
+    debug logs), and Codex ignores plain stdout, so the refresh summary,
+    the "kept local" warning and the offline note were seen by no one.
+    On exit 0 with something to report, the hook now prints one JSON
+    object: `systemMessage` (shown to the user) and
+    `hookSpecificOutput.additionalContext` (added to the model's context),
+    both documented for PreToolUse by Claude Code and Codex. Anything else
+    printed during a hook run goes to stderr.
+32. **A blocked write is probed again.** The 3 s write debounce was set
+    before the write guards ran, so the next Edit right after a block (the
+    usual multi-edit turn) skipped the probe and every guard, and the stale
+    edit landed. A block now clears the project's debounce.
+33. **`cd "$HOME/..."` and `cd ~/A\ B` are understood.** Variables in
+    `cd` targets were taken literally, so the hook auto-linked a bogus
+    `<cwd>/$HOME/.../Apps/Overleaf/<name>` path, created that tree with a
+    marker, pulled the web edit into it and advanced the cached version:
+    the real file stayed stale and the next write passed. `cd` targets now
+    get environment variables (`$HOME`, `${HOME}`, PowerShell `$env:NAME`)
+    and backslash escapes expanded, and an `Apps/Overleaf/<name>` folder
+    that does not exist is never auto-linked or created.
+34. **Numbered names and offline lookups.** A stale (up to 24 h) index
+    turned a new `Problem Set 5` next to an older `Problem Set` into a
+    "numbered duplicate" block, because the re-fetch only ran for "no such
+    project"; it now runs for both. When that re-fetch cannot reach
+    Overleaf, the result is "could not reach Overleaf" (exit 0 with a
+    note), not "no project is named X" with the opt-out advice.
+35. **Resolution errors fail closed.** An unexpected exception while
+    resolving a folder under `Apps/Overleaf/<name>/` let writes through; it
+    now blocks them with the error.
+36. **Protect window, precisely.** Guard 1b blocked any target saved in the
+    last 30 s when some other file was protected, naming the wrong file; it
+    now blocks only the protected targets. The tool's own extraction (its
+    size and mtime are recorded in `<DATA_DIR>/extracted.json`) no longer
+    counts as a local save, so a web edit right after a pull is not a false
+    conflict. A local file that can't be read (and so can't be backed up)
+    is skipped instead of overwritten.
+37. **More shell writes are recognized**: a redirect into `"$F"` or a
+    backtick expression, `find -fprintf/-fprint0/-fls`, and awk's
+    `print > FILE`.
+38. **`install` survives a read-only settings.json** (a symlink into a
+    nix/home-manager store): it prints the hook entry to add by hand, still
+    installs the Codex hook, and exits 1. `uninstall` also lists the config
+    backups (which still contain the hook entry) with `rm` commands and no
+    longer leaves an empty `PreToolUse` list.
+39. **Fewer keychain prompts from `doctor`.** It read every browser twice
+    (once per reader, then again for the "would succeed" check) and also
+    when Overleaf was unreachable; it now reads each browser once per
+    reader, reuses those results, and skips the browsers when its check of
+    the cached cookie could not reach Overleaf. "The local copy was not
+    refreshed" is now said only by `sync`, not by `status`, `doctor` or
+    `save-cookie`.
+40. **Docs:** Chrome's App-Bound Encryption dates from Chrome 127 (July
+    2024), not 130; a leaked cookie from the browser in use is ended by
+    signing out there (Clear Sessions ends every *other* session); the
+    keychain dialog can appear up to twice per browser and also from
+    `sync`; the README's Verify step runs from a project folder, the agent
+    prompt installs uv if missing, and the Related projects row names both
+    hooks; `--help` lists `sync --wait`, `doctor [folder]` and
+    `uninstall [FOLDER...]`.
 
 ### Tests
 
@@ -228,8 +301,15 @@ bootstrap / full pull / rewind with backups, the hook's refresh summary,
 numbered duplicate folders and NFD names, the opt-out, the keychain-free hook
 path, login's browser choice, the absolute hook path, CLAUDE_CONFIG_DIR /
 CODEX_HOME, symlinked settings.json, and uninstall's leftover report; and
-(`tests/test_skill_md.py`) the SKILL.md frontmatter and size budget.
-Suite: 213 tests.
+(`tests/test_skill_md.py`) the SKILL.md frontmatter and size budget. The
+third round adds the hook's JSON output, a Read-then-Edit of a kept file,
+a retry right after a protect-window block, `sync --wait`, `cd` targets
+with variables and escapes, a marker plus an opt-out file, a stale index
+for a numbered name and offline, a missing project folder, a crashing
+resolver, the tool's own writes and unreadable files in the protect window,
+the new shell write forms, a read-only settings.json, uninstall's backup
+list, and a keychain-free offline `doctor`.
+Suite: 236 tests.
 
 ## 0.4.0 — 2026-05-30
 
