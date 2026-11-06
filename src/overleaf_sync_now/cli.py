@@ -42,6 +42,9 @@ Refresh flow:
   2. If latest toV == cached toV for this project: no-op.
   3. Else walk updates back to cached toV; skip updates with origin.kind="dropbox"
      (those are the local->Dropbox->Overleaf round-trips of our own saves).
+     Web-side file adds/renames (`project_ops`) are pulled too; web-side
+     deletes/renames are recorded so the hook can block edits to the old path
+     (local files are never deleted).
   4. If anything web-origin remains, GET /project/<id>/download/zip and extract
      only the affected pathnames, writing atomically and only when content
      actually differs from local (so Dropbox upload pressure stays at zero
@@ -80,8 +83,23 @@ INDEX_FILE = CACHE_DIR / "projects.json"
 INDEX_TTL = 86400
 INDEX_FORMAT_VERSION = 2
 PLAYWRIGHT_PROFILE = pathlib.Path.home() / ".claude" / "playwright-profile"
+WEB_REMOVED_FILE = CACHE_DIR / "web-removed.json"
 PROJECT_MARKER = ".overleaf-project"
+# Read-type hook calls share one probe per project per 30 s. Write-type calls
+# (Edit/Write/apply_patch/non-read-only shell commands) use a much shorter
+# window so a web edit that lands between a Read and the following Edit is
+# still caught (the mid-turn window described in issue #2).
 DEBOUNCE_SECONDS = 30
+WRITE_DEBOUNCE_SECONDS = 3
+LATEX_EXTS = ("tex", "bib", "cls", "sty", "bst")
+_LATEX_PATH_RE = re.compile(r"\.(?:tex|bib|cls|sty|bst)$", re.IGNORECASE)
+_PROJECT_ID_RE = re.compile(r"[0-9a-f]{24}")
+# Claude Code's default command-hook timeout is 600 s; we write an explicit
+# value that comfortably covers a first-use bootstrap (full zip, 10-30 s) so
+# an old short timeout (v0.0.1 wrote 8 s) never kills the refresh mid-pull.
+HOOK_TIMEOUT_SECONDS = 180
+CLAUDE_HOOK_MATCHER = "Read|Edit|Write|Bash|PowerShell"
+CODEX_HOOK_MATCHER = "apply_patch|Bash"
 BASE = "https://www.overleaf.com"
 SESSION_COOKIE = "overleaf_session2"
 # Chromium-family + Firefox cookie backends to probe, in priority order, for
@@ -669,6 +687,134 @@ def _save_versions(versions):
     _atomic_write_text(VERSIONS_FILE, json.dumps(versions, indent=2))
 
 
+# -------- web-side file deletes / renames (project_ops) --------
+#
+# Overleaf's /updates reports file-level operations separately from text
+# edits: each update carries `project_ops`, a list of
+#   {"add": {"pathname": P}, "atV": V}
+#   {"rename": {"pathname": OLD, "newPathname": NEW}, "atV": V}
+#   {"remove": {"pathname": P}, "atV": V}
+# (services/project-history ChunkTranslator.js). The pathname of an added
+# file is NOT repeated in `pathnames`, so a walk that only reads `pathnames`
+# misses web-side adds and renames entirely.
+#
+# Adds and rename targets are pulled like any other web-origin change.
+# Removes and rename sources are recorded in WEB_REMOVED_FILE so the hook can
+# block an AI edit that would resurrect the old path through Dropbox. Local
+# files are never deleted by this tool; an entry is dropped once the local
+# file is gone (Dropbox caught up) or the path is re-created on the web.
+
+
+def _norm_overleaf_path(p):
+    return (p or "").lstrip("/")
+
+
+def _collect_web_file_ops(web_updates):
+    """Replay the project_ops of web-origin `updates` (newest-first, as
+    /updates returns them) in chronological order.
+
+    Returns (present, removed):
+      present: set of paths whose final state is "exists on Overleaf" because
+               a web add/rename created them (need pulling; clear any stale
+               removed-entry for them).
+      removed: {old_path: new_path_or_None} for paths whose final state is
+               "gone from Overleaf" (deleted, or renamed to new_path).
+    """
+    ops = []
+    for u_idx, u in enumerate(reversed(web_updates)):
+        for o_idx, op in enumerate(u.get("project_ops") or []):
+            if not isinstance(op, dict):
+                continue
+            at_v = op.get("atV")
+            if not isinstance(at_v, (int, float)):
+                at_v = u.get("fromV") if isinstance(u.get("fromV"), (int, float)) else 0
+            ops.append((at_v, u_idx, o_idx, op))
+    ops.sort(key=lambda t: (t[0], t[1], t[2]))
+    state = {}  # path -> ("present", None) | ("removed", new_path_or_None)
+    for _, _, _, op in ops:
+        if isinstance(op.get("add"), dict):
+            path = _norm_overleaf_path(op["add"].get("pathname"))
+            if path:
+                state[path] = ("present", None)
+        elif isinstance(op.get("rename"), dict):
+            old = _norm_overleaf_path(op["rename"].get("pathname"))
+            new = _norm_overleaf_path(op["rename"].get("newPathname"))
+            if old and new:
+                state[old] = ("removed", new)
+                state[new] = ("present", None)
+            elif old:
+                state[old] = ("removed", None)
+        elif isinstance(op.get("remove"), dict):
+            path = _norm_overleaf_path(op["remove"].get("pathname"))
+            if path:
+                state[path] = ("removed", None)
+    present = {p for p, (kind, _) in state.items() if kind == "present"}
+    removed = {p: new for p, (kind, new) in state.items() if kind == "removed"}
+    return present, removed
+
+
+def _load_web_removed():
+    if WEB_REMOVED_FILE.exists():
+        try:
+            with open(WEB_REMOVED_FILE) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception as e:
+            print(
+                f"[overleaf-sync-now] WARNING: {WEB_REMOVED_FILE} is corrupt ({e}); ignoring it.",
+                file=sys.stderr,
+            )
+    return {}
+
+
+def _record_web_file_ops(project_id, folder, present, removed):
+    """Merge newly observed web-side removes into the persisted map, clear
+    entries the web re-created, and prune entries whose local file is gone.
+    Prints a WARN for each newly recorded path. Never deletes local files.
+    Returns the project's current {old_path: new_path_or_None} map."""
+    folder = pathlib.Path(folder)
+    data = _load_web_removed()
+    before = dict(data.get(project_id) or {})
+    entry = dict(before)
+    for path in present:
+        entry.pop(path, None)
+    new_paths = {}
+    for path, new in removed.items():
+        if entry.get(path, "\0") != new:
+            new_paths[path] = new
+        entry[path] = new
+    entry = {path: new for path, new in entry.items() if _path_exists_under(folder, path)}
+    if entry != before:
+        if entry:
+            data[project_id] = entry
+        else:
+            data.pop(project_id, None)
+        try:
+            _atomic_write_text(WEB_REMOVED_FILE, json.dumps(data, indent=2))
+        except OSError as e:
+            print(f"[overleaf-sync-now] WARNING: could not save {WEB_REMOVED_FILE}: {e}", file=sys.stderr)
+    for path, new in sorted(new_paths.items()):
+        if path not in entry:
+            continue  # local copy already gone; nothing to warn about
+        what = f"renamed on Overleaf to {new}" if new else "deleted on Overleaf"
+        print(
+            f"[overleaf-sync-now] WARN: {path} was {what}, but the local copy still exists "
+            f"in {folder}. It was NOT deleted locally. AI edits to it are blocked until "
+            f"Dropbox removes it (or you delete it yourself).",
+            file=sys.stderr,
+        )
+    return entry
+
+
+def web_removed_paths(project_id, folder):
+    """The project's {old_path: new_path_or_None} map, pruned of entries whose
+    local file no longer exists (read-only: does not rewrite the file)."""
+    folder = pathlib.Path(folder)
+    entry = _load_web_removed().get(project_id) or {}
+    return {p: n for p, n in entry.items() if _path_exists_under(folder, p)}
+
+
 def refresh_project(project_id, folder, *, force=False):
     """Version-match refresh. Probes /updates, decides whether a zip download
     is actually needed, and if so extracts only the changed files into folder.
@@ -713,11 +859,13 @@ def refresh_project(project_id, folder, *, force=False):
     # compare will skip any file that already matches). Otherwise walk the
     # update history back to cached_toV and collect pathnames from web-origin
     # edits only — dropbox-origin updates are local's own round-trip.
+    web_present, web_removed = set(), {}
     if force or bootstrap:
         need_paths = None  # sentinel: extract all
     else:
         need_paths = set()
         all_covered = False
+        web_updates = []
         for u in updates:
             toV = u.get("toV")
             if toV is not None and toV <= cached_toV:
@@ -726,20 +874,36 @@ def refresh_project(project_id, folder, *, force=False):
             origin_kind = (u.get("meta", {}).get("origin") or {}).get("kind")
             if origin_kind == "dropbox":
                 continue
+            web_updates.append(u)
             for p in u.get("pathnames", []):
                 need_paths.add(p)
+        # File-level web ops (add / rename / remove). Adds and rename
+        # targets must be pulled; removes are recorded below.
+        web_present, web_removed = _collect_web_file_ops(web_updates)
+        need_paths |= web_present
+        has_file_ops = any(u.get("project_ops") for u in web_updates)
         if not all_covered:
             # Cached version is older than the oldest update we received in
             # the first page. Rather than paginate and risk missing a
             # web-origin edit, just pull the full zip and hash-diff.
             need_paths = None
 
-    if need_paths is not None and not need_paths:
-        # All changes were dropbox-origin. Local already has this content
-        # (or Dropbox will deliver it within seconds via multi-device sync).
-        versions[project_id] = latest_toV
-        _save_versions(versions)
-        return f"dropbox_echo (toV {cached_toV}->{latest_toV})"
+        if need_paths is not None and not need_paths:
+            if has_file_ops:
+                # Only web-side deletes (no content to pull). Never report
+                # this as a dropbox echo: it is a real web change.
+                _record_web_file_ops(project_id, folder, web_present, web_removed)
+                versions[project_id] = latest_toV
+                _save_versions(versions)
+                return (
+                    f"web_file_ops (toV {cached_toV}->{latest_toV}; "
+                    f"{len(web_removed)} path(s) deleted or renamed on Overleaf)"
+                )
+            # All changes were dropbox-origin. Local already has this content
+            # (or Dropbox will deliver it within seconds via multi-device sync).
+            versions[project_id] = latest_toV
+            _save_versions(versions)
+            return f"dropbox_echo (toV {cached_toV}->{latest_toV})"
 
     zip_bytes = download_zip(project_id)
     # --force implies "user explicitly asked to overwrite" — disable the
@@ -749,6 +913,8 @@ def refresh_project(project_id, folder, *, force=False):
     n_written, n_unchanged, n_protected = _extract_files(
         zip_bytes, folder, need_paths, protect_recent_seconds=protect
     )
+    if web_present or web_removed:
+        _record_web_file_ops(project_id, folder, web_present, web_removed)
     # Only advance the cached version when EVERY web-origin change actually
     # landed locally. If a file was protected (skipped because the local copy
     # was modified within the protect window), do NOT claim we're synced to
