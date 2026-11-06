@@ -635,7 +635,7 @@ def fetch_updates(project_id):
     if r.status_code in (401, 403):
         raise AuthExpired(
             f"Overleaf rejected /updates (HTTP {r.status_code}). "
-            "Cookies likely expired; re-auth via `overleaf-sync-now login`."
+            f"Cookies likely expired or were revoked.\n\n{_AUTH_RECOVERY}"
         )
     if r.status_code == 429:
         try:
@@ -662,7 +662,9 @@ def download_zip(project_id):
     except requests.exceptions.RequestException as e:
         raise _wrap_network_error(e, "on /download/zip") from e
     if r.status_code in (401, 403):
-        raise AuthExpired(f"Overleaf rejected /download/zip (HTTP {r.status_code}).")
+        raise AuthExpired(
+            f"Overleaf rejected /download/zip (HTTP {r.status_code}).\n\n{_AUTH_RECOVERY}"
+        )
     if r.status_code == 429:
         try:
             retry_after = int(r.headers.get("Retry-After", "60") or "60")
