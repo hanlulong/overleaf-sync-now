@@ -2436,9 +2436,10 @@ _SHELL_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 _SHELL_CD_RE = re.compile(
-    r"""(?:^|[;&|\n]|&&)\s*(?:cd|pushd|Set-Location|sl)\s+("[^"\n]+"|'[^'\n]+'|[^\s;&|]+)""",
+    r"""(?:^|[;&|\n]|&&)\s*(?:cd|pushd|Set-Location|sl)\s+("[^"\n]+"|'[^'\n]+'|(?:\\.|[^\s;&|])+)""",
     re.IGNORECASE,
 )
+_PS_ENV_RE = re.compile(r"\$\{?env:([A-Za-z_][A-Za-z0-9_]*)\}?", re.IGNORECASE)
 _PATCH_FILE_RE = re.compile(
     r"^\*\*\* (?:(?:Update|Add|Delete) File|Move to):\s*(.+?)\s*$", re.MULTILINE
 )
@@ -2487,8 +2488,10 @@ def _is_read_only_command(cmd):
     programs count as writes (fail closed)."""
     for target in _REDIRECT_RE.findall(cmd):
         t = target.strip("\"'")
-        if _is_latex_path(t) or any(ch in t for ch in "*?["):
-            return False
+        if _is_latex_path(t) or any(ch in t for ch in "*?[$`"):
+            return False  # a LaTeX file, a glob, or a target built at run time ("$F")
+    if re.search(r"\bprintf?\b[^;}'\"]*>", cmd):
+        return False  # awk '{print > FILENAME}' / print $0 > "out.tex"
     # Quoted strings may contain | ; & (regexes, sed scripts); fd
     # duplications like 2>&1 contain &. Neither separates commands.
     bare = re.sub(r'"(?:\\.|[^"\\])*"|\'[^\']*\'', " Q ", cmd)
@@ -2513,7 +2516,8 @@ def _is_read_only_command(cmd):
         if prog == "sed" and _SED_WRITE_RE.search(cmd):
             return False  # sed 's/a/b/w main.tex' (the script is masked in `seg`)
         if prog == "find" and any(
-            w in ("-exec", "-execdir", "-delete", "-ok", "-okdir", "-fprint") for w in rest
+            w in ("-exec", "-execdir", "-delete", "-ok", "-okdir", "-fprint", "-fprint0",
+                  "-fprintf", "-fls") for w in rest
         ):
             return False
         if prog == "git" and (
@@ -2544,6 +2548,16 @@ def _is_read_only_command(cmd):
     return True
 
 
+def _expand_shell_vars(text):
+    """Expand $NAME / ${NAME} (and PowerShell $env:NAME) from this process's
+    environment, which the hook shares with the agent's shell. Unknown
+    variables are left as they are."""
+    if "$" not in text:
+        return text
+    text = _PS_ENV_RE.sub(lambda m: os.environ.get(m.group(1), m.group(0)), text)
+    return os.path.expandvars(text)
+
+
 def _shell_candidate_paths(cmd, cwd, *, posix_escapes=True, cd_text=None):
     """Candidate LaTeX paths mentioned in a shell command, as absolute Paths.
     Globs are expanded (bounded). Paths need not exist. Relative paths are
@@ -2554,8 +2568,8 @@ def _shell_candidate_paths(cmd, cwd, *, posix_escapes=True, cd_text=None):
         tok = m.group(1) or m.group(2) or m.group(3)
         if not tok:
             continue
-        if "$" in tok:
-            tok = os.path.expandvars(tok)
+        if "$" in tok and not m.group(2):  # no expansion inside '...'
+            tok = _expand_shell_vars(tok)
         tokens.append(tok)
         if posix_escapes and m.group(3) and "\\" in tok:
             tokens.append(re.sub(r"\\(.)", r"\1", tok))
@@ -2564,7 +2578,14 @@ def _shell_candidate_paths(cmd, cwd, *, posix_escapes=True, cd_text=None):
     cwd = pathlib.Path(cwd)
     bases = [cwd]
     for m in _SHELL_CD_RE.finditer(cmd if cd_text is None else cd_text):
-        d = m.group(1).strip("\"'")
+        raw = m.group(1)
+        if raw[:1] == "'":
+            d = raw.strip("'")
+        else:
+            d = raw[1:-1] if raw[:1] == '"' else raw
+            if posix_escapes and raw[:1] != '"':
+                d = re.sub(r"\\(.)", r"\1", d)  # cd ~/A\ B
+            d = _expand_shell_vars(d)
         if d and d != "-":
             bases.append(cwd / pathlib.Path(d).expanduser())
     out, seen = [], set()
