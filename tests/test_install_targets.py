@@ -323,7 +323,6 @@ class InstallTargetsTests(unittest.TestCase):
 
 
     def test_uninstall_lists_markers_data_dir_and_session(self):
-        import tempfile as _tf
         from unittest import mock
         proj = self.home / "Dropbox" / "Apps" / "Overleaf" / "My JMP"
         proj.mkdir(parents=True)
