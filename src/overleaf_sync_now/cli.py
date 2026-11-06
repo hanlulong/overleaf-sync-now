@@ -285,15 +285,26 @@ def _load_cache():
     return None
 
 
-def _validate_cookies(cookies, *, use_cache=True):
-    """Validate cookies against Overleaf. Set use_cache=False to force a fresh
-    network probe (used by `doctor` and the periodic hook re-validation)."""
+def _check_cookies(cookies, *, use_cache=True):
+    """Check cookies against Overleaf. Returns (state, exc):
+
+      "ok"           Overleaf accepted the session
+      "missing"      no overleaf_session2 cookie to check (no request made)
+      "rejected"     Overleaf answered and refused it (401/403, or a redirect
+                     to the login page)
+      "unreachable"  no usable answer: offline, DNS or proxy failure, a
+                     sandbox that blocks the network, a timeout, or an
+                     Overleaf outage (429/5xx). Says nothing about the cookie.
+
+    `exc` is the exception (or a RuntimeError naming the HTTP status) for
+    "unreachable", else None. Set use_cache=False to force a fresh network
+    probe (doctor, status, save-cookie)."""
     if not cookies or SESSION_COOKIE not in cookies:
-        return False
+        return "missing", None
     # Hot path: cookie shape is right and we just validated successfully —
     # skip the network round-trip. Keeps the hook fast on every AI edit.
     if use_cache and _cookies_recently_validated():
-        return True
+        return "ok", None
     import requests
     s = requests.Session()
     s.headers.update({"User-Agent": "Mozilla/5.0"})
@@ -301,12 +312,19 @@ def _validate_cookies(cookies, *, use_cache=True):
         s.cookies.set(name, value, domain=".overleaf.com")
     try:
         r = s.get(f"{BASE}/project", allow_redirects=False, timeout=10)
-        ok = r.status_code == 200
-    except Exception:
-        ok = False
-    if ok:
+    except Exception as e:  # ConnectionError / Timeout / ProxyError / SSLError ...
+        return "unreachable", e
+    if r.status_code == 200:
         _mark_cookies_validated()
-    return ok
+        return "ok", None
+    if r.status_code == 429 or r.status_code >= 500:
+        return "unreachable", RuntimeError(f"Overleaf answered HTTP {r.status_code}")
+    return "rejected", None
+
+
+def _validate_cookies(cookies, *, use_cache=True):
+    """True only when Overleaf accepted the cookies (see _check_cookies)."""
+    return _check_cookies(cookies, use_cache=use_cache)[0] == "ok"
 
 
 def _try_rookiepy():
@@ -395,11 +413,18 @@ def _try_playwright_profile():
 def _resolve_cookies_with_source(interactive=False):
     """Walk the auth chain. Returns (cookies, source_label) or (None, None).
 
+    Raises NetworkUnavailable when Overleaf cannot be reached: a cookie that
+    can't be checked is not an expired cookie, and walking on to the browser
+    extractors would only add OS keychain prompts for nothing.
+
     `setup` reports the label so the user knows which source won; every
     other caller goes through `_resolve_cookies`."""
     cached = _load_cache()
-    if _validate_cookies(cached):
+    state, exc = _check_cookies(cached)
+    if state == "ok":
         return cached, "cached cookie"
+    if state == "unreachable":
+        raise NetworkUnavailable(_network_unavailable_message(exc))
     # Persistent browser profile from `login` command (the proper fix for
     # Chrome 130+ app-bound encryption). Browser API can read HttpOnly cookies
     # that no on-disk extractor can decrypt without admin.
@@ -412,14 +437,20 @@ def _resolve_cookies_with_source(interactive=False):
     )
     for label, fn in chain:
         found = fn()
-        if _validate_cookies(found):
+        state, exc = _check_cookies(found)
+        if state == "ok":
             _save_cache(found)
             return found, label
+        if state == "unreachable":
+            raise NetworkUnavailable(_network_unavailable_message(exc))
     if interactive:
         manual = _prompt_manual_cookie()
-        if _validate_cookies(manual):
+        state, exc = _check_cookies(manual)
+        if state == "ok":
             _save_cache(manual)
             return manual, "hidden terminal prompt"
+        if state == "unreachable":
+            raise NetworkUnavailable(_network_unavailable_message(exc))
     return None, None
 
 
@@ -487,26 +518,22 @@ def _mount_retries(session):
 def get_session(force_refresh=False):
     import requests
     cookies = None if force_refresh else _load_cache()
-    if not _validate_cookies(cookies):
+    state, exc = _check_cookies(cookies)
+    if state == "unreachable":
+        # Offline, or a sandbox that blocks the network. The cookie may be
+        # fine, so this must never become AuthExpired (which makes the hook
+        # block and steers the agent toward re-auth), and the browser
+        # extractors are skipped (they would only raise keychain prompts).
+        raise NetworkUnavailable(_network_unavailable_message(exc))
+    if state != "ok":
+        # May itself raise NetworkUnavailable if a candidate can't be checked.
         cookies = _resolve_cookies(interactive=False)
     if not cookies:
-        # Before declaring "cookies bad" (which steers agents toward re-auth),
-        # probe connectivity. If the outbound socket is blocked by the host
-        # shell, auth is probably fine and re-auth would fail identically.
-        cached = _load_cache()
-        if cached and SESSION_COOKIE in cached:
-            try:
-                requests.get(f"{BASE}/", timeout=5, allow_redirects=False)
-            except requests.exceptions.RequestException as probe_e:
-                if _is_sandbox_block(probe_e):
-                    raise RuntimeError(_SANDBOX_HINT) from probe_e
-        # Genuine missing/expired-cookie case (a sandbox block already
-        # returned above). Raise AuthExpired, NOT a plain RuntimeError: the
-        # PreToolUse hook blocks the edit (exit 2) on AuthExpired so the AI
-        # re-auths instead of silently editing a possibly-stale local copy —
-        # the precise data-loss this tool exists to prevent. A plain
-        # RuntimeError here would fall through to the hook's generic handler,
-        # which marks-synced and exits 0, passing the stale edit through.
+        # Genuine missing/expired-cookie case. Raise AuthExpired, NOT a plain
+        # RuntimeError: the PreToolUse hook blocks the edit (exit 2) on
+        # AuthExpired so the AI re-auths instead of silently editing a
+        # possibly-stale local copy — the precise data-loss this tool exists
+        # to prevent.
         raise AuthExpired(
             f"No valid Overleaf cookies (cache: {CACHE_FILE}).\n\n{_AUTH_RECOVERY}"
         )
@@ -549,6 +576,28 @@ class RateLimited(RuntimeError):
         super().__init__(f"Overleaf rate-limited; wait ~{retry_after}s and retry.")
 
 
+class NetworkUnavailable(RuntimeError):
+    """Overleaf could not be reached: offline, DNS or proxy failure, an
+    Overleaf outage, or a sandbox that blocks the network (Codex CLI's
+    default). Nothing is known about the cookie. The hook lets the call
+    through with a note; it never blocks or asks for re-auth on this."""
+
+
+def _exc_chain(exc):
+    """`exc` and everything it was raised from (__cause__ / __context__, and
+    urllib3's MaxRetryError.reason), outermost first."""
+    seen = set()
+    e = exc
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        yield e
+        nxt = e.__cause__ or e.__context__
+        if nxt is None:
+            reason = getattr(e, "reason", None)
+            nxt = reason if isinstance(reason, BaseException) else None
+        e = nxt
+
+
 def _is_network_exception(exc):
     """True if `exc`, or anything in its __cause__/__context__ chain, came from
     the HTTP stack (requests / urllib3 / socket). A plain OSError raised while
@@ -559,58 +608,110 @@ def _is_network_exception(exc):
         req_exc = requests.exceptions.RequestException
     except Exception:  # pragma: no cover - requests is a hard dependency
         req_exc = None
-    seen = set()
-    e = exc
-    while e is not None and id(e) not in seen:
-        seen.add(id(e))
+    for e in _exc_chain(exc):
+        if isinstance(e, NetworkUnavailable):
+            return True
         if req_exc is not None and isinstance(e, req_exc):
             return True
         mod = type(e).__module__ or ""
         if mod.startswith(("urllib3", "requests", "socket")):
             return True
-        e = e.__cause__ or e.__context__
     return False
 
 
+def _is_name_resolution_error(exc):
+    import socket
+    return any(
+        isinstance(e, socket.gaierror) or type(e).__name__ == "NameResolutionError"
+        for e in _exc_chain(exc)
+    )
+
+
 def _is_sandbox_block(exc):
-    """True if `exc` looks like the host shell blocking an outbound socket
-    (sandboxed shell, firewall policy) rather than a generic network failure.
-    Distinguishing these matters: retrying doesn't help here, and the tool
-    should stop reaching for auth-recovery commands (setup/login/doctor) that
-    would hit the same block.
+    """True if `exc` looks like the host blocking outbound connections (Codex
+    CLI's sandbox, a firewall policy) rather than a plain network outage.
+    Retrying doesn't help there, and setup/login/doctor hit the same block.
+
+    Codex CLI sets CODEX_SANDBOX_NETWORK_DISABLED=1 inside a sandbox without
+    network access. In its macOS Seatbelt sandbox, DNS fails
+    (NameResolutionError, [Errno 8]) and a connect to a literal IP fails with
+    [Errno 1] Operation not permitted (EPERM); on Windows a blocked socket is
+    WinError 10013.
 
     Only network exceptions qualify: a local PermissionError (read-only
-    Dropbox folder, file locked by another process) used to be misreported as
-    a sandbox block because it shares the "permission denied" wording."""
+    Dropbox folder, file locked by another process) shares the "permission
+    denied" wording but is not a sandbox block."""
     if not _is_network_exception(exc):
         return False
-    msg = str(exc).lower()
+    if os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED") == "1":
+        return True
+    import errno as _errno
+    msgs = []
+    for e in _exc_chain(exc):
+        if isinstance(e, OSError) and (
+            e.errno in (_errno.EPERM, _errno.EACCES) or getattr(e, "winerror", None) == 10013
+        ):
+            return True
+        msgs.append(str(e).lower())
+    msg = " ".join(msgs)
     markers = (
         "winerror 10013",                          # Windows WSAEACCES
         "forbidden by its access permissions",     # Windows human-readable form
         "eacces",                                  # POSIX symbolic
         "eperm",
+        "[errno 1]",                               # POSIX numeric EPERM (macOS Seatbelt)
+        "operation not permitted",
         "[errno 13]",                              # POSIX numeric EACCES
         "permission denied",
     )
-    return any(m in msg for m in markers)
+    if any(m in msg for m in markers):
+        return True
+    # DNS is the first thing the Seatbelt sandbox breaks: inside a Codex
+    # sandbox, a name-resolution failure is the sandbox, not the network.
+    return bool(os.environ.get("CODEX_SANDBOX")) and _is_name_resolution_error(exc)
 
 
 _SANDBOX_HINT = (
-    "Outbound HTTPS to Overleaf was blocked by the host environment "
-    "(likely a sandboxed shell -- Codex CLI, some CI runners). Auth is "
-    "probably fine; running setup/login/doctor will fail the same way. "
-    "Approve the `overleaf-sync-now` command prefix in your sandbox "
-    "policy, or re-run outside the sandbox."
+    "Could not reach Overleaf: this command runs in a sandbox that blocks network "
+    "access (Codex CLI's default sandbox does). This is not a login problem: the "
+    "cookie was not checked, and setup/login/doctor would fail the same way. Approve "
+    "running `overleaf-sync-now` with network access (outside the sandbox), or run it "
+    "from a normal terminal."
+)
+
+_OFFLINE_HINT = (
+    "Could not reach Overleaf ({detail}). This looks like no network connection "
+    "(offline, DNS or proxy failure) or an Overleaf outage, not a login problem: the "
+    "cookie was not checked, so do not run login or setup for this. The local copy was "
+    "not refreshed and may be stale; retry when the connection is back."
 )
 
 
+def _network_detail(exc):
+    """The most specific (innermost) message in the exception chain, short."""
+    detail = ""
+    for e in _exc_chain(exc):
+        text = str(e).strip()
+        if text:
+            detail = text
+    detail = detail or type(exc).__name__
+    return detail if len(detail) <= 160 else detail[:157] + "..."
+
+
+def _network_unavailable_message(exc):
+    if exc is not None and _is_sandbox_block(exc):
+        return _SANDBOX_HINT
+    if exc is None and os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED") == "1":
+        return _SANDBOX_HINT
+    return _OFFLINE_HINT.format(detail=_network_detail(exc) if exc is not None else "no response")
+
+
 def _wrap_network_error(e, context):
-    """Convert a requests exception into a RuntimeError with a specific
-    sandbox-block message when applicable, or a generic one otherwise."""
+    """Convert a requests exception into NetworkUnavailable, with the sandbox
+    message when the host blocked the connection."""
     if _is_sandbox_block(e):
-        return RuntimeError(_SANDBOX_HINT)
-    return RuntimeError(f"Network error {context}: {e}")
+        return NetworkUnavailable(_SANDBOX_HINT)
+    return NetworkUnavailable(_OFFLINE_HINT.format(detail=f"{context}: {_network_detail(e)}"))
 
 
 # -------- version-match refresh (/updates + /download/zip) --------
@@ -1633,10 +1734,10 @@ def _refresh_projects_records(strict=False):
         # Network failure / sandbox block during the project-list fetch.
         # Don't poison the cache; fall back to whatever we have.
         if _is_sandbox_block(e):
-            raise RuntimeError(_SANDBOX_HINT) from e
+            raise NetworkUnavailable(_SANDBOX_HINT) from e
         cached = _load_cached_projects_records()
         if strict and not cached:
-            raise RuntimeError(f"Network error fetching the Overleaf project list: {e}") from e
+            raise _wrap_network_error(e, "fetching the project list") from e
         return cached
     if r.status_code != 200:
         cached = _load_cached_projects_records()
@@ -1749,7 +1850,12 @@ def cmd_setup(args, *, force_noninteractive=False):
     # Same chain `sync` and the hook use (cached -> login profile -> rookiepy
     # -> browser_cookie3 -> Playwright profile), so setup never reports
     # failure for a session that sync would find.
-    cookies, source = _resolve_cookies_with_source(interactive=interactive)
+    try:
+        cookies, source = _resolve_cookies_with_source(interactive=interactive)
+    except NetworkUnavailable as e:
+        print(f"  - Could not reach Overleaf, so auth was not checked.\n    {e}")
+        print("  - Re-run `overleaf-sync-now setup` (or `status`) once Overleaf is reachable.")
+        return
     if cookies:
         print(f"  - Valid Overleaf session found via {source} ({SESSION_COOKIE}: present).")
         print(f"  - Cached at {CACHE_FILE}")
@@ -1942,30 +2048,27 @@ def cmd_status(args):
     print(f"Cookie file: {CACHE_FILE} ({'present' if CACHE_FILE.exists() else 'MISSING'})")
     cached = _load_cache()
     # Force a real network probe — status is a diagnostic, not a hot path.
-    cache_ok = _validate_cookies(cached, use_cache=False)
-    if cache_ok:
+    state, exc = _check_cookies(cached, use_cache=False)
+    if state == "ok":
         print("Cookie auth: OK (cache valid, sync would succeed)")
+    elif state == "unreachable":
+        # Offline or sandboxed: say so instead of a misleading INVALID.
+        print(f"Cookie auth: UNKNOWN — could not reach Overleaf, so the cookie was not checked.\n"
+              f"  {_network_unavailable_message(exc)}")
     else:
-        # Differentiate "cookies bad" from "network blocked" so a sandboxed
-        # shell doesn't make status print a misleading INVALID verdict.
-        sandboxed = False
-        if cached and SESSION_COOKIE in cached:
-            import requests
-            try:
-                requests.get(f"{BASE}/", timeout=5, allow_redirects=False)
-            except requests.exceptions.RequestException as e:
-                if _is_sandbox_block(e):
-                    sandboxed = True
-        if sandboxed:
-            print("Cookie auth: UNKNOWN — outbound HTTPS is blocked by the host "
-                  "shell (sandbox / firewall). Auth is probably fine. Approve "
-                  "the `overleaf-sync-now` command prefix or run outside the sandbox.")
-        elif quick:
+        if quick:
             print("Cookie auth: cache INVALID (chain not checked; pass without --quick for full check, or run `doctor`).")
         else:
             # Cache failed; walk the full chain to predict sync behavior.
-            resolved = _resolve_cookies(interactive=False)
-            if resolved:
+            try:
+                resolved = _resolve_cookies(interactive=False)
+                unreachable = None
+            except NetworkUnavailable as e:
+                resolved, unreachable = None, e
+            if unreachable is not None:
+                print(f"Cookie auth: UNKNOWN — could not reach Overleaf, so the cookie was not checked.\n"
+                      f"  {unreachable}")
+            elif resolved:
                 print("Cookie auth: OK (cache stale, but chain resolved; sync would succeed and refresh cache)")
             else:
                 print("Cookie auth: INVALID — sync would FAIL and the hook blocks AI edits. "
@@ -2511,12 +2614,16 @@ def cmd_hook(args):
                 # write failure): don't block; debounce so the next call
                 # doesn't retry immediately.
                 mark_synced(pid)
-                msg = str(e)
-                if _is_sandbox_block(e) or "Outbound HTTPS to Overleaf was blocked" in msg:
-                    # Permanent until the user/shell config changes. "Retry
-                    # after debounce" would be misleading.
-                    warnings.append(f"[overleaf-sync-now] {e}")
-                elif isinstance(e, OSError) and not _is_network_exception(e):
+                if isinstance(e, NetworkUnavailable) or _is_network_exception(e):
+                    # Offline or sandboxed: nothing is known about auth, so
+                    # never block or send the agent to re-auth (documented
+                    # policy: transient errors pass through with a note).
+                    text = str(e) if isinstance(e, NetworkUnavailable) else _network_unavailable_message(e)
+                    warnings.append(
+                        f"[overleaf-sync-now] {text}\n[overleaf-sync-now] {tool} allowed "
+                        f"without a refresh; the local copy may be stale."
+                    )
+                elif isinstance(e, OSError):
                     warnings.append(
                         f"[overleaf-sync-now] refresh could not write local files in {folder}: {e}"
                     )
@@ -3028,7 +3135,13 @@ def cmd_install(args):
     print()
     # Check if auth resolved during the setup that just ran. If not, surface
     # the fix up front so the user doesn't have to wait for the first sync.
-    if not _validate_cookies(_load_cache()):
+    auth_state, _ = _check_cookies(_load_cache())
+    if auth_state == "unreachable":
+        print("AUTH NOT CHECKED: Overleaf could not be reached from here (offline or a")
+        print("  sandbox without network). Run `overleaf-sync-now status` in a normal terminal")
+        print("  to check it; run `overleaf-sync-now login` there if it reports INVALID.")
+        print()
+    elif auth_state != "ok":
         print("AUTH NOT YET CAPTURED. To finish setup, run this in your own terminal:")
         print("    overleaf-sync-now login")
         print("  (A browser opens - log into Overleaf there. One-time; lasts weeks.)")
@@ -3387,7 +3500,16 @@ def cmd_save_cookie(args):
     cookies = {SESSION_COOKIE: value}
     # Force a fresh probe: a stale validation timestamp from a previous cookie
     # would falsely accept a brand-new value without checking it.
-    if not _validate_cookies(cookies, use_cache=False):
+    state, exc = _check_cookies(cookies, use_cache=False)
+    if state == "unreachable":
+        print(
+            f"ERROR: could not reach Overleaf to check this cookie, so nothing was saved.\n"
+            f"  {_network_unavailable_message(exc)}\n"
+            f"  Run `overleaf-sync-now save-cookie` again once Overleaf is reachable.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if state != "ok":
         print(
             f"ERROR: Overleaf rejected this cookie. Common causes:\n"
             f"  - Copied only part of the value (must be the entire long string)\n"
@@ -3420,8 +3542,14 @@ def cmd_doctor(args):
             # Doctor MUST do a real network check, not trust the cached
             # 'validated-at' timestamp. Otherwise it would just print 'OK'
             # for any cookie we touched in the last minute.
-            valid = _validate_cookies(cached, use_cache=False)
-            print(f"    -> Result: {'OK' if valid else 'INVALID (rejected by /project)'}")
+            state, exc = _check_cookies(cached, use_cache=False)
+            if state == "ok":
+                print("    -> Result: OK")
+            elif state == "unreachable":
+                print(f"    -> Result: UNKNOWN (could not reach Overleaf: {_network_detail(exc)})")
+                print(f"       {_network_unavailable_message(exc)}")
+            else:
+                print("    -> Result: INVALID (rejected by /project)")
     else:
         print("[1] Cached cookies: NONE")
     print()
@@ -3478,8 +3606,15 @@ def cmd_doctor(args):
     print()
 
     # Best-available cookies
-    best = _resolve_cookies(interactive=False)
-    if best:
+    try:
+        best = _resolve_cookies(interactive=False)
+        unreachable = None
+    except NetworkUnavailable as e:
+        best, unreachable = None, e
+    if unreachable is not None:
+        print("[4] Auth resolution: UNKNOWN (could not reach Overleaf; this is not an auth failure).")
+        print(f"    {unreachable}")
+    elif best:
         print(f"[4] Auth resolution: WOULD SUCCEED via the chain above")
     else:
         print("[4] Auth resolution: WOULD FAIL.")
@@ -3516,6 +3651,8 @@ def cmd_doctor(args):
                 print(f"    Probe:   FAILED ({type(e).__name__}: {e})")
         else:
             print(f"    Folder {folder} is not under any Overleaf project; can't probe /updates without a project ID.")
+    elif unreachable is not None:
+        print("    Skipped (Overleaf could not be reached; see [4])")
     else:
         print(f"    Skipped (auth resolution failed above; fix auth first)")
     print()

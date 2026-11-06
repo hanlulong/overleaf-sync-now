@@ -630,9 +630,9 @@ class CredentialHygieneTests(unittest.TestCase):
 
 class SaveCookieInputModesTests(unittest.TestCase):
     def setUp(self):
-        self._orig = {"_validate_cookies": cli._validate_cookies, "_save_cache": cli._save_cache}
+        self._orig = {"_check_cookies": cli._check_cookies, "_save_cache": cli._save_cache}
         self.saved = {}
-        cli._validate_cookies = lambda c, use_cache=True: True
+        cli._check_cookies = lambda c, use_cache=True: ("ok", None)
         cli._save_cache = lambda c: self.saved.update(c)
         self._stdin, self._stdout, self._stderr = sys.stdin, sys.stdout, sys.stderr
         sys.stdout = io.StringIO()

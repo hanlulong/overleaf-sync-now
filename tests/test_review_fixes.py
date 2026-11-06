@@ -394,7 +394,7 @@ class GetSessionAuthTests(unittest.TestCase):
         self._orig = {
             "_load_cache": cli._load_cache,
             "_resolve_cookies": cli._resolve_cookies,
-            "_validate_cookies": cli._validate_cookies,
+            "_check_cookies": cli._check_cookies,
         }
 
     def tearDown(self):
@@ -410,30 +410,25 @@ class GetSessionAuthTests(unittest.TestCase):
         with self.assertRaises(cli.AuthExpired):
             cli.get_session()
 
-    def test_sandbox_block_stays_plain_runtimeerror(self):
-        # A blocked outbound socket must NOT become AuthExpired — auth is
+    def test_sandbox_block_is_network_unavailable_not_authexpired(self):
+        # A blocked outbound socket must NOT become AuthExpired: auth is
         # probably fine and the hook should pass the edit through, not block.
+        # (Real exception shapes are covered in test_network_unavailable.py.)
         import requests
         cli._load_cache = lambda: {cli.SESSION_COOKIE: "v"}
-        cli._validate_cookies = lambda c, use_cache=True: False
-        cli._resolve_cookies = lambda interactive=False: None
-        orig_get = requests.get
-
-        def fake_get(*a, **k):
-            raise requests.exceptions.ConnectionError("[Errno 13] Permission denied")
-
-        requests.get = fake_get
-        try:
-            with self.assertRaises(RuntimeError) as cm:
-                cli.get_session()
-        finally:
-            requests.get = orig_get
+        cli._check_cookies = lambda c, use_cache=True: (
+            "unreachable", requests.exceptions.ConnectionError("[Errno 13] Permission denied"))
+        called = []
+        cli._resolve_cookies = lambda interactive=False: called.append(1)
+        with self.assertRaises(cli.NetworkUnavailable) as cm:
+            cli.get_session()
         self.assertNotIsInstance(cm.exception, cli.AuthExpired)
         self.assertEqual(str(cm.exception), cli._SANDBOX_HINT)
+        self.assertEqual(called, [])  # browser extraction skipped
 
     def test_retry_adapter_is_mounted(self):
         cli._load_cache = lambda: {cli.SESSION_COOKIE: "v"}
-        cli._validate_cookies = lambda c, use_cache=True: True
+        cli._check_cookies = lambda c, use_cache=True: ("ok", None)
         s = cli.get_session()
         adapter = s.get_adapter("https://www.overleaf.com")
         self.assertEqual(adapter.max_retries.total, 3)
@@ -515,9 +510,9 @@ class FindLinkedFolderTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class SaveCookieNormalizationTests(unittest.TestCase):
     def setUp(self):
-        self._orig = {"_validate_cookies": cli._validate_cookies, "_save_cache": cli._save_cache}
+        self._orig = {"_check_cookies": cli._check_cookies, "_save_cache": cli._save_cache}
         self.saved = {}
-        cli._validate_cookies = lambda c, use_cache=True: True
+        cli._check_cookies = lambda c, use_cache=True: ("ok", None)
         cli._save_cache = lambda c: self.saved.update(c)
 
     def tearDown(self):
@@ -627,7 +622,7 @@ class HookInstallTests(unittest.TestCase):
             "CODEX_HOME": cli.CODEX_HOME,
             "CODEX_HOOKS": cli.CODEX_HOOKS,
             "cmd_setup": cli.cmd_setup,
-            "_validate_cookies": cli._validate_cookies,
+            "_check_cookies": cli._check_cookies,
             "_load_cache": cli._load_cache,
         }
         cli.CLAUDE_SETTINGS = self.settings
@@ -636,7 +631,7 @@ class HookInstallTests(unittest.TestCase):
         cli.CODEX_HOME = pathlib.Path(self._tmp.name) / "no-codex"   # absent -> skipped
         cli.CODEX_HOOKS = cli.CODEX_HOME / "hooks.json"
         cli.cmd_setup = lambda *a, **k: None                # skip the auth wizard
-        cli._validate_cookies = lambda *a, **k: True        # skip the final auth probe/network
+        cli._check_cookies = lambda *a, **k: ("ok", None)   # skip the final auth probe/network
         cli._load_cache = lambda: {cli.SESSION_COOKIE: "x"}
 
     def tearDown(self):

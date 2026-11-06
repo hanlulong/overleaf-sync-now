@@ -37,7 +37,7 @@ class InstallTargetsTests(unittest.TestCase):
             (self.home / d).mkdir()
         self._orig = {name: getattr(cli, name) for name in (
             "SKILL_TARGETS", "LEGACY_SKILL_TARGETS", "CLAUDE_SETTINGS", "CODEX_HOME",
-            "CODEX_HOOKS", "cmd_setup", "_validate_cookies", "_load_cache", "_cli_path",
+            "CODEX_HOOKS", "cmd_setup", "_check_cookies", "_load_cache", "_cli_path",
         )}
         cli.SKILL_TARGETS = {
             "Claude Code": self.home / ".claude" / "skills" / "overleaf",
@@ -50,7 +50,7 @@ class InstallTargetsTests(unittest.TestCase):
         cli.CODEX_HOME = self.home / ".codex"
         cli.CODEX_HOOKS = cli.CODEX_HOME / "hooks.json"
         cli.cmd_setup = lambda *a, **k: None
-        cli._validate_cookies = lambda *a, **k: True
+        cli._check_cookies = lambda *a, **k: ("ok", None)
         cli._load_cache = lambda: {cli.SESSION_COOKIE: "x"}
         cli._cli_path = lambda: FAKE_BIN
         self._stdout, self._stderr = sys.stdout, sys.stderr
