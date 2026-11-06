@@ -3144,23 +3144,29 @@ def _cli_path():
     besides PATH this also looks at the running entry point, the scripts
     directory of this Python (the uv tool environment), and `uv tool dir
     --bin`."""
+    def usable(c):
+        return bool(c) and os.path.isfile(c) and os.access(c, os.X_OK)
+
     found = shutil.which("overleaf-sync-now")
-    candidates = [found] if found else []
+    if usable(found):
+        return os.path.abspath(found)
     argv0 = sys.argv[0] if sys.argv else ""
+    candidates = []
     if argv0 and os.path.basename(argv0).lower().startswith("overleaf-sync-now"):
         candidates.append(argv0)
     exe_dir = pathlib.Path(sys.executable).parent
     candidates += [str(exe_dir / "overleaf-sync-now"), str(exe_dir / "overleaf-sync-now.exe")]
+    for c in candidates:
+        if usable(c):
+            return os.path.abspath(c)
     try:
         out = subprocess.run(["uv", "tool", "dir", "--bin"], capture_output=True, text=True,
                              timeout=10, check=False).stdout.strip()
-        if out:
-            candidates += [str(pathlib.Path(out) / "overleaf-sync-now"),
-                           str(pathlib.Path(out) / "overleaf-sync-now.exe")]
     except (OSError, subprocess.SubprocessError):
-        pass
-    for c in candidates:
-        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+        out = ""
+    for name in ("overleaf-sync-now", "overleaf-sync-now.exe"):
+        c = str(pathlib.Path(out) / name) if out else ""
+        if usable(c):
             return os.path.abspath(c)
     return None
 
@@ -3336,7 +3342,10 @@ def _write_json_config(path, data, *, backup="once"):
     replacing the link would silently fork the config), keeps non-ASCII text
     as is, keeps the file mode, and saves the previous content first: once as
     <name>.bak-overleaf-sync-now (backup="once"), or as a timestamped copy
-    (backup="timestamped"). Returns the backup path written, if any."""
+    (backup="timestamped"). The backup sits next to `path` (e.g. in
+    ~/.claude/), not next to a symlink's target, so it never lands in a
+    dotfiles repository. Returns the backup path written, if any."""
+    path = pathlib.Path(path)
     real = pathlib.Path(os.path.realpath(str(path)))
     made = None
     mode = None
@@ -3346,9 +3355,9 @@ def _write_json_config(path, data, *, backup="once"):
         except OSError:
             mode = None
         if backup == "timestamped":
-            made = real.with_name(f"{real.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+            made = path.with_name(f"{path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
         else:
-            made = real.with_name(real.name + SETTINGS_BACKUP_SUFFIX)
+            made = path.with_name(path.name + SETTINGS_BACKUP_SUFFIX)
             if made.exists():
                 made = None
         if made is not None:

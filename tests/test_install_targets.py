@@ -313,7 +313,8 @@ class InstallTargetsTests(unittest.TestCase):
         self.assertIn("echo \u8bba\u6587 \u2713", text)
         self.assertNotIn("\\u8bba", text)
         self.assertTrue(any(cli._is_our_hook(h) for _, h in self.claude_handlers()))
-        backup = dotfiles / ("claude-settings.json" + cli.SETTINGS_BACKUP_SUFFIX)
+        backup = cli.CLAUDE_SETTINGS.with_name("settings.json" + cli.SETTINGS_BACKUP_SUFFIX)
+        self.assertFalse((dotfiles / ("claude-settings.json" + cli.SETTINGS_BACKUP_SUFFIX)).exists())
         self.assertEqual(backup.read_text(encoding="utf-8"), original)
         if os.name == "posix":
             self.assertEqual(real.stat().st_mode & 0o777, 0o600)
