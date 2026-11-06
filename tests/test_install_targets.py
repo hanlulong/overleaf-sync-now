@@ -52,7 +52,11 @@ class InstallTargetsTests(unittest.TestCase):
         cli.cmd_setup = lambda *a, **k: None
         cli._check_cookies = lambda *a, **k: ("ok", None)
         cli._load_cache = lambda: {cli.SESSION_COOKIE: "x"}
-        cli._cli_path = lambda: FAKE_BIN
+        # A real file, so the install-health check finds the hook's executable.
+        self.bin = str(self.home / "fake bin" / "overleaf-sync-now")
+        pathlib.Path(self.bin).parent.mkdir()
+        pathlib.Path(self.bin).write_text("#!/bin/sh\n")
+        cli._cli_path = lambda: self.bin
         self._stdout, self._stderr = sys.stdout, sys.stderr
         sys.stdout = self.out = io.StringIO()
         sys.stderr = self.err = io.StringIO()
@@ -116,7 +120,7 @@ class InstallTargetsTests(unittest.TestCase):
         self.assertEqual(len(ours), 1)
         matcher, h = ours[0]
         self.assertEqual(matcher, "Read|Edit|Write|Bash|PowerShell")
-        self.assertEqual(h["command"], FAKE_BIN)
+        self.assertEqual(h["command"], self.bin)
         self.assertEqual(h["args"], ["hook"])
         self.assertEqual(h["timeout"], cli.HOOK_TIMEOUT_SECONDS)
         self.assertNotIn("MultiEdit", matcher)
@@ -137,7 +141,7 @@ class InstallTargetsTests(unittest.TestCase):
     def test_user_longer_timeout_and_onfailure_kept(self):
         cli.CLAUDE_SETTINGS.write_text(json.dumps({"hooks": {"PreToolUse": [
             {"matcher": "Read|Edit|Write", "hooks": [{
-                "type": "command", "command": FAKE_BIN, "args": ["hook"],
+                "type": "command", "command": self.bin, "args": ["hook"],
                 "timeout": 400, "onFailure": "block"}]},
         ]}}))
         self.install()
@@ -158,7 +162,9 @@ class InstallTargetsTests(unittest.TestCase):
         self.assertEqual(groups[0]["matcher"], "apply_patch|Bash")
         h = groups[0]["hooks"][0]
         self.assertEqual(h["type"], "command")
-        self.assertEqual(h["command"], "'/opt/fake bin/overleaf-sync-now' hook")
+        import shlex
+        self.assertEqual(h["command"], f"{shlex.quote(self.bin)} hook")
+        self.assertIn("fake bin", h["command"])  # path with a space stays one word
         self.assertIn("commandWindows", h)
         self.assertTrue(cli._is_our_hook(h["commandWindows"]))
         self.assertGreaterEqual(h["timeout"], 120)
@@ -347,6 +353,17 @@ class InstallTargetsTests(unittest.TestCase):
     def test_health_ok_after_install(self):
         self.install()
         self.assertEqual(cli._install_health(), [])
+
+    def test_health_flags_bare_or_missing_hook_command(self):
+        self.install()
+        data = json.loads(cli.CLAUDE_SETTINGS.read_text())
+        handler = data["hooks"]["PreToolUse"][-1]["hooks"][0]
+        handler["command"] = "overleaf-sync-now"
+        cli.CLAUDE_SETTINGS.write_text(json.dumps(data))
+        self.assertIn("bare name", "\n".join(cli._install_health()))
+        handler["command"] = str(self.home / "gone" / "overleaf-sync-now")
+        cli.CLAUDE_SETTINGS.write_text(json.dumps(data))
+        self.assertIn("does not exist", "\n".join(cli._install_health()))
 
     def test_health_flags_stale_v00_install(self):
         # The owner's real state before 0.5.0: old skill copy, Edit|Write|

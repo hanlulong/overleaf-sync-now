@@ -3486,6 +3486,10 @@ def _install_health():
                     pass
                 if "args" not in h:
                     problems.append("Claude Code: hook is in shell form (fails under PowerShell); install writes exec form")
+                else:
+                    problem = _hook_command_problem(h.get("command"))
+                    if problem:
+                        problems.append(f"Claude Code: {problem}")
     if CODEX_HOME.exists():
         try:
             codex = json.loads(CODEX_HOOKS.read_text(encoding="utf-8")) if CODEX_HOOKS.exists() else {}
@@ -3500,7 +3504,31 @@ def _install_health():
                 problems.append(f"Codex CLI: no overleaf-sync-now PreToolUse hook in {CODEX_HOOKS}")
             elif not any("apply_patch" in m for m in ours):
                 problems.append(f"Codex CLI: hook matcher {ours[0]!r} does not cover apply_patch")
+            for g in groups:
+                for h in (g.get("hooks") or []) if isinstance(g, dict) else []:
+                    if isinstance(h, dict) and _is_our_hook(h) and os.name != "nt":
+                        import shlex
+                        try:
+                            first = shlex.split(str(h.get("command") or ""))[:1]
+                        except ValueError:
+                            first = []
+                        problem = _hook_command_problem(first[0] if first else "")
+                        if problem:
+                            problems.append(f"Codex CLI: {problem}")
     return problems
+
+
+def _hook_command_problem(cmd):
+    """Why a hook's executable may fail to start (exit 127, which lets the
+    tool call through), or None."""
+    if not cmd:
+        return "hook has no command"
+    if not os.path.isabs(str(cmd)):
+        return (f"hook runs the bare name {cmd!r}, which fails wherever it is not on PATH; "
+                f"install writes the full path")
+    if not os.path.isfile(str(cmd)):
+        return f"hook command {cmd} does not exist (CLI moved or uninstalled); re-run install"
+    return None
 
 
 def _print_install_health(indent=""):
