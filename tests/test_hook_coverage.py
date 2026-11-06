@@ -132,6 +132,18 @@ class FailClosedResolutionTests(_HookHarness):
         self.assertEqual(self.refresh_calls, [])
         self.assertFalse((f.parent / cli.PROJECT_MARKER).exists())
 
+    def test_no_auth_fd_redirect_into_tex_blocks(self):
+        # `1>` / `&>` are writes too; they used to be classified as reads.
+        self._no_auth()
+        f = self._target()
+        for redirect in ("1>", "&>"):
+            code, err = self.run_hook({
+                "tool_name": "Bash", "cwd": str(self.base),
+                "tool_input": {"command": f"echo x {redirect}'{f}'"},
+            })
+            self.assertEqual(code, 2, (redirect, err))
+            self.assertIn("Bash blocked", err)
+
     def test_no_auth_no_marker_read_warns_only(self):
         self._no_auth()
         f = self._target()
@@ -346,6 +358,32 @@ class ReadOnlyClassifierTests(unittest.TestCase):
             "Set-Content main.tex x",
         ):
             self.assertFalse(cli._is_read_only_command(cmd), cmd)
+
+    def test_fd_numbered_and_combined_redirects_are_writes(self):
+        for cmd in (
+            "echo x 1>main.tex", "echo x 2>main.tex", "echo x &>main.tex", "echo x &>>main.tex",
+            "echo x >&main.tex", "echo x >|main.tex", "echo x 1>'/a b/main.tex'",
+        ):
+            self.assertFalse(cli._is_read_only_command(cmd), cmd)
+
+    def test_fd_duplication_stays_a_read(self):
+        for cmd in (
+            "cat main.tex 2>&1", "cat main.tex >&2", "cat main.tex 1>&2", "cat main.tex >&-",
+            "grep x main.tex 2>/dev/null",
+        ):
+            self.assertTrue(cli._is_read_only_command(cmd), cmd)
+
+    def test_output_options_of_read_only_programs_are_writes(self):
+        for cmd in (
+            "sort -o main.tex main.tex", "sort -uo main.tex a.tex", "sort --output=main.tex a.tex",
+            "uniq a.tex main.tex", "git diff --output=main.tex", "git diff --output main.tex",
+        ):
+            self.assertFalse(cli._is_read_only_command(cmd), cmd)
+        for cmd in (
+            "sort -u -k2 refs.bib", "uniq -c main.tex", "uniq -f 2 main.tex",
+            "uniq main.tex 2>/dev/null", "uniq main.tex > /tmp/out.txt",
+        ):
+            self.assertTrue(cli._is_read_only_command(cmd), cmd)
 
 
 # ---------------------------------------------------------------------------

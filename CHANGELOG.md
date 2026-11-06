@@ -43,8 +43,12 @@ with `/hooks`.**
    `.tex/.bib/.cls/.sty/.bst` paths (quoted paths, `cd <dir> && …`, globs in
    the project folder); the Codex hook matches `apply_patch|Bash` and parses
    `*** Update File:` / `*** Add File:` / `*** Delete File:` / `*** Move to:`
-   lines. Every project a call touches is refreshed. `MultiEdit` (no longer
-   a Claude Code tool) is dropped from the matcher.
+   lines. Every project a call touches is refreshed. A shell command counts
+   as a read only when every program in it is a known reader and nothing is
+   written to a LaTeX file: output redirections (`>`, `>>`, `1>`, `2>`,
+   `&>`), `sed -i`, `sort -o`, `uniq IN OUT`, `git … --output` and unknown
+   programs count as writes. `MultiEdit` (no longer a Claude Code tool) is
+   dropped from the matcher.
 4. **Write guard.** If the refresh just pulled newer web content into the
    file a write is about to change, the write is blocked with a "re-read
    first" message, so a whole-file Write planned against the old content

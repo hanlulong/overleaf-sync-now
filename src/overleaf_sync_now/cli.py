@@ -2072,7 +2072,12 @@ _READ_ONLY_PROGRAMS = {
     "compare-object", "format-hex", "write-output", "write-host",
 }
 _READ_ONLY_GIT = {"diff", "log", "show", "status", "blame", "grep", "ls-files"}
-_REDIRECT_RE = re.compile(r"(?<![0-9&])>>?\s*(\"[^\"]*\"|'[^']*'|[^\s;&|]+)")
+# Output redirections: >, >>, 1>, 2>, &>, &>>, >|, and >&file. Only fd
+# duplication (2>&1, >&2, >&-) is not a write: the target group can't start
+# with '&', and the optional '&' after '>' is taken only before a filename.
+_REDIRECT_RE = re.compile(
+    r"(?:\d+|&)?>>?\|?(?:&(?![\d-]))?\s*(\"[^\"]*\"|'[^']*'|[^\s;&|]+)"
+)
 
 
 def _command_text(tool_input):
@@ -2119,8 +2124,31 @@ def _is_read_only_command(cmd):
             w in ("-exec", "-execdir", "-delete", "-ok", "-okdir", "-fprint") for w in rest
         ):
             return False
-        if prog == "git" and (not rest or rest[0] not in _READ_ONLY_GIT):
+        if prog == "git" and (
+            not rest or rest[0] not in _READ_ONLY_GIT
+            or any(w.startswith("--output") for w in rest)  # git diff --output=x
+        ):
             return False
+        if prog == "sort" and any(
+            w.startswith("--output")
+            or (w.startswith("-") and not w.startswith("--") and "o" in w[1:])
+            for w in rest
+        ):
+            return False  # sort -o FILE
+        if prog == "uniq":
+            operands, skip = [], False
+            for w in rest:
+                if skip:
+                    skip = False
+                elif re.match(r"(?:\d+|&)?[<>]", w):
+                    # a redirection (`2>/dev/null`, or `>` followed by its target)
+                    skip = bool(re.fullmatch(r"(?:\d+|&)?[<>]{1,2}[|&]?", w))
+                elif w in ("-f", "-s", "-w"):
+                    skip = True  # option taking a separate value
+                elif not w.startswith("-") or w == "-":
+                    operands.append(w)
+            if len(operands) >= 2:
+                return False  # uniq INPUT OUTPUT
     return True
 
 
