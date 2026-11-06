@@ -54,8 +54,9 @@ dependencies = [
     # gracefully when rookiepy is absent.
     "rookiepy>=0.5; python_version < '3.13' and platform_system != 'Linux'",
     # Bundled (small, ~10MB) so `overleaf-sync-now login` works in uv-managed
-    # tool venvs (which ship without pip and so can't lazy-install). The big
-    # ~150MB Chromium download is still on-demand at first `login`.
+    # tool venvs (which ship without pip and so can't lazy-install). `login`
+    # uses the installed Chrome or Edge; only if neither starts does it
+    # download Chromium (~300 MB with its headless shell).
     "playwright>=1.49",
     # patchright is a maintained Playwright fork that patches the CDP
     # Runtime.Enable leak and command-flag fingerprints that Google's
