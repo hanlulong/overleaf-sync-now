@@ -11,7 +11,7 @@
 
 You write a paper in Overleaf with Dropbox sync enabled. You edit on overleaf.com from another device, then come back to your laptop and ask Claude Code (or Codex CLI) to keep working on the paper. The AI agent reads the local `.tex` file — but Overleaf only pushes web edits to Dropbox **every 10–20 minutes**, so the local copy is stale. The AI proceeds to edit the stale file and saves it back, **silently overwriting your fresh web edits**. The tool call reports success. Paragraphs you wrote on the web vanish.
 
-`overleaf-sync-now` is an **agent skill** (plus a CLI and a Claude Code PreToolUse hook) that closes this gap. Before every AI Read / Edit / Write of a `.tex` / `.bib` / `.cls` / `.sty` / `.bst` file under `Apps/Overleaf/`, it probes Overleaf's version history and pulls down anything new — without changing your existing Dropbox setup, so cross-device sync still works exactly as before.
+`overleaf-sync-now` is an **agent skill** (plus a CLI and PreToolUse hooks for Claude Code and Codex CLI) that closes this gap. Before every AI read or edit of a `.tex` / `.bib` / `.cls` / `.sty` / `.bst` file under `Apps/Overleaf/` (Read / Edit / Write, Bash or PowerShell commands, Codex `apply_patch`), it probes Overleaf's version history and pulls down anything new — without changing your existing Dropbox setup, so cross-device sync still works exactly as before.
 
 ### Is this for you?
 
@@ -28,10 +28,12 @@ If you only ever edit locally *or* only ever edit on the web, your local copy is
 In Claude Code or Codex CLI, paste this prompt:
 
 ```text
-Install overleaf-sync-now from https://github.com/hanlulong/overleaf-sync-now using uv tool install, then run `overleaf-sync-now install`.
+Install overleaf-sync-now v0.5.0 with `uv tool install --from git+https://github.com/hanlulong/overleaf-sync-now@v0.5.0 overleaf-sync-now`, then run `overleaf-sync-now install`.
 ```
 
-The agent installs everything and runs setup. **Restart the agent afterward** (`/exit` then `claude` in Claude Code; equivalent in Codex).
+The agent installs everything and runs setup. **Restart the agent afterward** (`/exit` then `claude` in Claude Code; equivalent in Codex). In **Codex CLI**, also run `/hooks` once and trust the `overleaf-sync-now` hook: Codex skips new hooks until you do.
+
+If setup reports that auth was not captured, run `overleaf-sync-now login` yourself in a terminal (a browser opens; log into Overleaf there). Never paste your Overleaf cookie into an AI chat.
 
 *On Windows with Chrome 130 or later, also run `overleaf-sync-now login` once — Chrome's new App-Bound Encryption blocks the silent cookie path. [Details](docs/authentication.md#why-chrome-130-needs-the-login-path).*
 
@@ -42,7 +44,7 @@ The agent installs everything and runs setup. **Restart the agent afterward** (`
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh && \
   export PATH="$HOME/.local/bin:$PATH" && \
-  uv tool install --from git+https://github.com/hanlulong/overleaf-sync-now overleaf-sync-now && \
+  uv tool install --from git+https://github.com/hanlulong/overleaf-sync-now@v0.5.0 overleaf-sync-now && \
   overleaf-sync-now install
 ```
 
@@ -50,7 +52,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh && \
 ```powershell
 irm https://astral.sh/uv/install.ps1 | iex
 $env:PATH = "$env:USERPROFILE\.local\bin;$env:PATH"
-uv tool install --from git+https://github.com/hanlulong/overleaf-sync-now overleaf-sync-now
+uv tool install --from git+https://github.com/hanlulong/overleaf-sync-now@v0.5.0 overleaf-sync-now
 overleaf-sync-now install
 ```
 
@@ -58,7 +60,7 @@ overleaf-sync-now install
 
 ### Verify
 
-After restart, edit any `.tex` file under `Dropbox/Apps/Overleaf/<project>/` — the hook fires automatically. Or check manually:
+After restart, edit any `.tex` file under `Dropbox/Apps/Overleaf/<project>/` — the hook fires automatically (in Codex, after you trust it with `/hooks`). Or check manually:
 
 ```bash
 overleaf-sync-now status   # cookie + linked project
@@ -91,17 +93,30 @@ When nothing changed on the Overleaf side, the hot path is ~0.3–1 s (a single 
   <img src="docs/workflow.svg" alt="Workflow: AI agent edit triggers PreToolUse hook, which probes Overleaf's version history (/updates), and only when web-side edits exist does it download the zip and extract changed files. Then the AI edits the fresh local file." width="100%">
 </p>
 
-1. The **PreToolUse hook** intercepts every `Read` / `Edit` / `Write` / `MultiEdit` of `.tex` / `.bib` / `.cls` / `.sty` / `.bst` files. Other tools and other file types pass through.
+1. The **PreToolUse hook** runs before every Claude Code `Read` / `Edit` / `Write` / `Bash` / `PowerShell` call and every Codex CLI `apply_patch` / `Bash` call that touches a `.tex` / `.bib` / `.cls` / `.sty` / `.bst` file. Shell commands are scanned for LaTeX paths; Codex patches are parsed for the files they change. Other tools and other file types pass through.
 2. **Auto-link** maps `…/Apps/Overleaf/<name>/` to its Overleaf project ID via a 24-hour-cached project list. On a unique match the tool drops a tiny `.overleaf-project` marker into the folder so future resolution is deterministic — no manual setup needed. Override or pre-seed it with `overleaf-sync-now link <id>` when names differ or two projects share a name.
 3. **Resolver safety net** (since 0.3.0): the cached project list keeps trashed/archived flags, lastUpdated, and ownerId. Trashed and archived projects are filtered out of auto-link, and if two living projects still share a name the tool refuses to guess — it lists the candidates and asks you to pick. A sync-time fingerprint check warns if the linked project's recent Dropbox-origin updates touch files not present locally (the "I linked the wrong project" smoke detector).
 4. **Version-match probe**: `GET /project/<id>/updates` returns Overleaf's history (`fromV` / `toV` / changed pathnames / origin). The tool caches the latest `toV` per project.
    - Latest `toV` matches cached → skip, no download.
    - Updates exist but are all Dropbox-origin (echoes of our own local saves round-tripping through Dropbox) → skip, no download.
-   - A web-origin update exists → `GET /project/<id>/download/zip` and extract only the changed pathnames, hash-compared so unchanged files aren't rewritten.
+   - A web-origin update exists → `GET /project/<id>/download/zip` and extract only the changed pathnames (including files added or renamed on the web), hash-compared so unchanged files aren't rewritten.
 5. **Data-safety guard**: extraction never overwrites a local file modified in the last 30 seconds — protects an in-progress local save that hasn't yet propagated Dropbox → Overleaf. Override with `sync --force`.
-6. **Debounce**: 30 s per project. A flurry of AI edits share one probe.
+6. **Debounce**: reads share one probe per project per 30 s; writes probe again after 3 s, so a web edit made between the agent's read and its edit is still caught.
+7. **Fail closed on writes** (since 0.5.0): the hook blocks a write (exit 2, with the reason shown to the agent) when it can't tell which Overleaf project the folder is (not logged in, no project with that name, or several), when the refresh just pulled newer content into the file being edited (the agent must re-read first), or when the file was deleted or renamed on overleaf.com. Reads are never blocked. Network failures and rate limits never block.
 
 For deeper details, see [`docs/architecture.md`](docs/architecture.md).
+
+---
+
+## Known limitations
+
+- **A web edit made while the agent is mid-edit can still be lost.** The hook runs just before each tool call. If someone edits the same file on overleaf.com after that probe (while the model is writing its change), the hook cannot see it. The agent's write replaces the whole file, Dropbox uploads it, and the web edit is overwritten: last writer wins, nothing is merged. Version 0.5.0 narrows this window: every write probes again, and if that probe pulls new content into the file being edited, the write is blocked until the agent re-reads the file. The gap between that final probe and the write itself remains. Avoid editing a file on the web while an agent is editing it. If it happens, the overwritten text is still in the project's History on overleaf.com. [Issue #2](https://github.com/hanlulong/overleaf-sync-now/issues/2) describes this failure mode in detail.
+- **Shell commands are scanned, not understood.** The hook sees LaTeX paths written literally in a Bash or PowerShell command (including quoted paths, `cd <dir> && …`, and `*.tex` globs). Paths built at run time (shell variables other than environment variables, `find -exec`, a script that opens files itself) are invisible to it. Telling read-only commands from writes is a heuristic; unknown programs count as writes.
+- **Web-side deletes and renames are not mirrored locally.** The tool never deletes local files. A file deleted or renamed on overleaf.com stays on disk until Dropbox removes it; until then, AI edits to it are blocked and reads get a note.
+- **The `.overleaf-project` marker syncs into your Overleaf project.** Auto-link writes this small JSON file (the project id and when it was linked) into the project folder, so Dropbox uploads it and collaborators can see it. It holds no credentials.
+- **Codex CLI needs one manual step.** Codex skips new or changed hooks until you trust them with `/hooks`. The Windows variant of the Codex hook (`commandWindows`) is untested.
+- **A hook that fails to start or times out does not block the tool call** (the Claude Code and Codex default). In Claude Code 2.1.295 or later you can add `"onFailure": "block"` to the hook entry in `~/.claude/settings.json` to make such failures block instead; `install` keeps that setting when it rewrites the entry.
+- **overleaf.com only.** Self-hosted Overleaf / Server Pro is not supported.
 
 ---
 
@@ -112,7 +127,7 @@ overleaf-sync-now --version                              # print package version
 overleaf-sync-now install                                # one-shot setup (idempotent)
 overleaf-sync-now login                                  # browser-assisted login (Chrome 130+ Windows)
 overleaf-sync-now setup                                  # auth wizard (auto-detect from existing browsers)
-overleaf-sync-now save-cookie <value>                    # paste a cookie value directly (last-resort)
+overleaf-sync-now save-cookie                            # headless only: type the cookie at a hidden prompt yourself
 overleaf-sync-now sync [folder] [--force]                # refresh against Overleaf; --force re-extracts
 overleaf-sync-now status [folder] [--quick]              # cookie validity + linked project (source, name, trashed/archived flags, lastUpdated, cached toV)
 overleaf-sync-now projects [--refresh]                   # list projects with NAME | PROJECT_ID | FLAGS (T/A/DUP) | LAST_UPDATED, sorted by recency

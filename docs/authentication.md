@@ -6,12 +6,12 @@
 
 | # | Source | Notes |
 |---|---|---|
-| 1 | **Cached cookie** (`<DATA_DIR>/cookies.json` — default `~/.overleaf-sync/cookies.json`; legacy `~/.claude/overleaf-data/cookies.json`) | After first successful auth. Validated against Overleaf on every use. Run `overleaf-sync-now status` to see the resolved data dir. |
+| 1 | **Cached cookie** (`<DATA_DIR>/cookies.json` — default `~/.overleaf-sync/cookies.json`; legacy `~/.claude/overleaf-data/cookies.json`) | After first successful auth. Re-validated against Overleaf at most once a minute (a successful check is cached for 60 s). Run `overleaf-sync-now status` to see the resolved data dir. |
 | 2 | **Browser via `login` profile** | Persistent patchright/Playwright-managed Chromium (patchright preferred since 0.3.2; vanilla Playwright fallback). Created by `overleaf-sync-now login`. **The proper fix for Chrome 130+ Windows.** |
 | 3 | **`rookiepy`** | Rust cookie reader; handles Chrome 127–129 better than `browser_cookie3`. Still defeated by Chrome 130+ App-Bound Encryption. |
 | 4 | **`browser_cookie3`** | Chrome / Edge / Firefox / Brave / Vivaldi / Opera / Chromium / LibreWolf via DPAPI. Defeated by Chrome 127+ on Windows without admin. |
 | 5 | **Claude Code Playwright MCP profile** (`~/.claude/playwright-profile/`) | If you've used the [Playwright MCP](https://github.com/microsoft/playwright-mcp) and logged into overleaf.com there. |
-| 6 | **Manual paste prompt** | Interactive only. Last resort. |
+| 6 | **Hidden prompt** | Interactive `setup` only: you type the cookie yourself (input hidden). Last resort. |
 
 ## When to use which
 
@@ -19,7 +19,7 @@
 |---|---|
 | Most macOS / Linux users, or Windows + Chrome ≤126 | Auto-detect (chain steps 1–5) just works. |
 | **Windows + Chrome 130 or later** | Run `overleaf-sync-now login` once. A managed browser opens, you log into Overleaf there, the session persists for weeks. |
-| Server / no display | `overleaf-sync-now save-cookie "<value>"` after copying the cookie from another machine's DevTools. |
+| Server / no display | Run `overleaf-sync-now save-cookie` yourself and paste the cookie (copied from another machine's DevTools) at its hidden prompt. |
 
 ## Why Chrome 130+ needs the `login` path
 
@@ -42,10 +42,14 @@ If you can't change the account, fall back to [manual paste](#manual-paste-fallb
 
 ## Manual paste fallback
 
-If everything else fails (no browser available, locked-down environment), copy the cookie from another machine and pass it directly:
+If everything else fails (no browser available, locked-down environment), copy the cookie from another machine and save it **yourself, in your own terminal**:
 
 ```bash
-overleaf-sync-now save-cookie "<value of overleaf_session2>"
+overleaf-sync-now save-cookie            # prompts; input is hidden
+# or pipe it in (here: the macOS clipboard), so it never touches shell history:
+pbpaste | overleaf-sync-now save-cookie -
 ```
 
 To get the value: open DevTools on overleaf.com → **Application → Cookies → `overleaf_session2`**. Copy the `Value` column.
+
+**Never paste the cookie into an AI chat, and don't pass it as a command-line argument.** It grants full access to your Overleaf account. Text you give an agent is stored in the model provider's transcript and in local session logs; an argument is visible in the process list and your shell history. (`save-cookie <value>` still works for old scripts but prints a warning.) If a cookie has leaked, sign out of Overleaf in the browser it came from: that ends the session on Overleaf's side. Then run `overleaf-sync-now login` again.

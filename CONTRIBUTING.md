@@ -29,7 +29,7 @@ uv tool install --reinstall --from . overleaf-sync-now
 
 ## Running the unit tests
 
-The unit test suite under `tests/` covers the project resolver, marker handling, atomic-write concurrency, POSIX file perms, the version-match refresh decision, the zip-slip + recent-mtime guards in `_extract_files`, the `cmd_hook` exit-code contract, `get_session` auth/retry behavior, and `save-cookie` normalization. No external dependencies — just `unittest` (HTTP/cookie paths are monkeypatched):
+The unit test suite under `tests/` covers the project resolver, marker handling, atomic-write concurrency, POSIX file perms, the version-match refresh decision, the zip-slip + recent-mtime guards in `_extract_files`, the `cmd_hook` exit-code contract and fail-closed resolution, Bash/PowerShell/apply_patch path extraction, the write guards, `project_ops` handling, install/uninstall against a fake HOME (Claude settings, `~/.agents/skills`, Codex `hooks.json`), `get_session` auth/retry behavior, and `save-cookie` input modes. No external dependencies — just `unittest` (HTTP/cookie paths are monkeypatched):
 
 ```bash
 python -m unittest discover tests

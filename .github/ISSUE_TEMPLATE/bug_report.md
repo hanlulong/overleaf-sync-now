@@ -23,6 +23,13 @@ labels: bug
 
 ## Diagnostic dump
 
+> **Before pasting, redact anything private.** This issue is public. `doctor` and
+> `status` never print cookie values, but they do show local paths, project ids
+> and folder names; `projects` lists every project name in your account, which
+> may include unpublished paper titles. Replace those with placeholders such as
+> `0123456789abcdef01234567` or `My Paper`. **Never paste your
+> `overleaf_session2` cookie.**
+
 <details>
 <summary><code>overleaf-sync-now doctor</code> output</summary>
 
