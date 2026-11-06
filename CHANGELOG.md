@@ -169,7 +169,8 @@ with `/hooks`.**
     `license-files`, setuptools >= 77).
 23. **CI:** `actions/checkout` v7.0.1 and `actions/setup-python` v7.1.0,
     Python 3.10-3.14, a weekly scheduled run, a check that the wheel ships
-    `SKILL.md`, and Dependabot for the action pins.
+    `SKILL.md`, Dependabot for the action pins, and a weekly link check
+    of the docs (lychee; schedule and manual runs only, never a PR gate).
 24. **Docs:** README gains a "Known limitations" section and pins install
     commands to `@v0.5.0`. Corrected against the code: 429 handling (manual
     `sync` exits 1 and prints the wait; it does not retry), the 60 s

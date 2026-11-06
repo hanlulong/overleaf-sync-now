@@ -64,3 +64,23 @@ jobs:
       - name: Wheel ships SKILL.md
         shell: bash
         run: python -c "import sys, zipfile, glob; names = zipfile.ZipFile(glob.glob('dist/*.whl')[0]).namelist(); sys.exit(0 if 'overleaf_sync_now/SKILL.md' in names else 1)"
+
+  links:
+    name: link check (weekly)
+    # External sites flake, so this runs on the weekly schedule and on
+    # demand only; it never gates a pull request.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: lycheeverse/lychee-action@v2.9.0
+        with:
+          # Code blocks are skipped by default (install commands such as
+          # git+https://...@v0.5.0 are not links); '@v' excludes them anyway.
+          args: >-
+            --no-progress --max-retries 3 --retry-wait-time 5
+            --accept 200,206,429
+            --exclude '@v[0-9]'
+            README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md 'docs/*.md'
+            src/overleaf_sync_now/SKILL.md
+          fail: true
