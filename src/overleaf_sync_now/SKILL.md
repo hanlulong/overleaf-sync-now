@@ -116,6 +116,7 @@ The hook runs before Read / Edit / Write / Bash / PowerShell (Claude Code) and a
 | `... N living Overleaf projects are named ...` | Show the user the candidate ids and ask which one this folder is. Then run the printed `overleaf-sync-now link <project_id> "<folder>"`. Do not pick one yourself. |
 | `... no living ... Overleaf project is named ...` | The folder name doesn't match a project (renamed, trashed, or a different account). Ask the user for the project id from the Overleaf URL, then run `link`. |
 | `Refreshed from Overleaf: newer web edits were just pulled into ...` | The file changed on the web since you last saw it. Re-read it, redo the edit on the new content, and retry. |
+| `Conflict: ... changed on Overleaf while a local save from the last 30 s ...` | Both sides changed the file within seconds. Wait about 30 seconds, re-read it, check that both the web edit and the recent local change are there, then redo the edit. Tell the user if it repeats. |
 | `... was renamed on Overleaf to NEW` | Edit `NEW` instead (it was pulled locally). |
 | `... was deleted on Overleaf` | Ask the user whether the file should come back before touching it. |
 

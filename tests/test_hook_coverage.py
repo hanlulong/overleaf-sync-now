@@ -434,6 +434,24 @@ class WriteGuardTests(_HookHarness):
         self.assertEqual(code, 2)
         self.assertIn("intro.tex", err)
 
+    def test_write_blocked_when_target_was_protected(self):
+        # Local save seconds ago + a pending web change: the refresh leaves
+        # the file alone (protect window), so the write must not proceed.
+        folder = self.project("Paper")
+        self.on_refresh = lambda pid, f: ("refreshed (wrote 0, unchanged 0, protected 1 (recent "
+                                          "local edits; version held at 5 ...))")
+        code, err = self.run_hook({"tool_name": "Write", "tool_input": {"file_path": str(folder / "main.tex")}})
+        self.assertEqual(code, 2)
+        self.assertIn("Conflict", err)
+
+    def test_protected_other_file_does_not_block(self):
+        folder = self.project("Paper", files=("main.tex", "intro.tex"))
+        old = time.time() - 120
+        os.utime(folder / "main.tex", (old, old))
+        self.on_refresh = lambda pid, f: "refreshed (wrote 0, unchanged 0, protected 1 (...))"
+        code, err = self.run_hook({"tool_name": "Write", "tool_input": {"file_path": str(folder / "main.tex")}})
+        self.assertEqual(code, 0, err)
+
     def test_edit_of_web_renamed_path_blocks(self):
         folder = self.project("Paper", files=("intro.tex",))
         cli._atomic_write_text(cli.WEB_REMOVED_FILE, json.dumps({PID: {"intro.tex": "sections/intro.tex"}}))
@@ -441,7 +459,6 @@ class WriteGuardTests(_HookHarness):
         self.assertEqual(code, 2)
         self.assertIn("renamed on Overleaf to sections/intro.tex", err)
         # Reads are allowed, with a note.
-        state = json.loads(cli.STATE_FILE.read_text()) if cli.STATE_FILE.exists() else {}
         code, err = self.run_hook({"tool_name": "Read", "tool_input": {"file_path": str(folder / "intro.tex")}})
         self.assertEqual(code, 0)
         self.assertIn("renamed on Overleaf", err)

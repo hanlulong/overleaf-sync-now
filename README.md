@@ -102,7 +102,7 @@ When nothing changed on the Overleaf side, the hot path is ~0.3–1 s (a single 
    - A web-origin update exists → `GET /project/<id>/download/zip` and extract only the changed pathnames (including files added or renamed on the web), hash-compared so unchanged files aren't rewritten.
 5. **Data-safety guard**: extraction never overwrites a local file modified in the last 30 seconds — protects an in-progress local save that hasn't yet propagated Dropbox → Overleaf. Override with `sync --force`.
 6. **Debounce**: reads share one probe per project per 30 s; writes probe again after 3 s, so a web edit made between the agent's read and its edit is still caught.
-7. **Fail closed on writes** (since 0.5.0): the hook blocks a write (exit 2, with the reason shown to the agent) when it can't tell which Overleaf project the folder is (not logged in, no project with that name, or several), when the refresh just pulled newer content into the file being edited (the agent must re-read first), or when the file was deleted or renamed on overleaf.com. Reads are never blocked. Network failures and rate limits never block.
+7. **Fail closed on writes** (since 0.5.0): the hook blocks a write (exit 2, with the reason shown to the agent) when it can't tell which Overleaf project the folder is (not logged in, no project with that name, or several), when the refresh just pulled newer content into the file being edited (the agent must re-read first), when the file changed on the web but was also saved locally in the last 30 s (a conflict the refresh can't resolve), or when the file was deleted or renamed on overleaf.com. Reads are never blocked. Network failures and rate limits never block.
 
 For deeper details, see [`docs/architecture.md`](docs/architecture.md).
 

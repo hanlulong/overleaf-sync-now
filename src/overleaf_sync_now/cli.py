@@ -2040,7 +2040,6 @@ def cmd_status(args):
 # open files themselves) cannot be seen; see README "Known limitations".
 
 _READ_TOOLS = ("Read",)
-_WRITE_TOOLS = ("Edit", "Write", "apply_patch")
 _SHELL_TOOLS = ("Bash", "PowerShell")
 
 _LATEX_MENTION_RE = re.compile(r"\.(?:tex|bib|cls|sty|bst)(?![\w])", re.IGNORECASE)
@@ -2347,9 +2346,10 @@ def cmd_hook(args):
         before = _latex_snapshot(folder, targets) if is_write else None
         window = WRITE_DEBOUNCE_SECONDS if is_write else DEBOUNCE_SECONDS
         refreshed = False
+        status = ""
         if not is_debounced(pid, window=window):
             try:
-                refresh_project(pid, folder)
+                status = refresh_project(pid, folder) or ""
                 mark_synced(pid)
                 refreshed = True
             except RateLimited as e:
@@ -2420,6 +2420,31 @@ def cmd_hook(args):
                     f"pulled into {shown}. Re-read the file(s) before editing; this {tool} "
                     f"was planned against the old content and was blocked so it does not "
                     f"overwrite them."
+                )
+        # Write guard 1b: a web change is pending for a file the refresh had
+        # to leave alone because it was saved locally in the last 30 s (the
+        # protect window; the cached version is held). Both sides changed
+        # the file, so a write now would overwrite the web edit.
+        if refreshed and "protected" in str(status):
+            now = time.time()
+            if targets:
+                recent = []
+                for p in targets:
+                    try:
+                        if now - os.stat(str(p)).st_mtime < 30:
+                            recent.append(_rel_posix(p, folder) or str(p))
+                    except OSError:
+                        pass
+            else:
+                recent = ["files in this project"]
+            if recent:
+                blocks.append(
+                    f"[overleaf-sync-now] Conflict: {', '.join(recent[:5])} changed on Overleaf "
+                    f"while a local save from the last 30 s may not have reached Overleaf yet, "
+                    f"so the web version was not pulled. {tool} blocked so it does not overwrite "
+                    f"the web edit. Wait about 30 seconds, re-read the file, check that both the "
+                    f"web edit and the recent local change are present, then redo the edit. Tell "
+                    f"the user if this repeats."
                 )
         # Write guard 2: the target was deleted or renamed on the web.
         gone = web_removed_paths(pid, folder)
