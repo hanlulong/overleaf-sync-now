@@ -503,8 +503,14 @@ class SaveCookieNormalizationTests(unittest.TestCase):
         self.assertEqual(self.saved, {})
 
     def test_no_args_usage(self):
-        with self.assertRaises(SystemExit) as cm:
-            cli.cmd_save_cookie([])
+        # No argument + non-interactive stdin with nothing on it -> usage.
+        orig_in = sys.stdin
+        sys.stdin = io.StringIO("")
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                cli.cmd_save_cookie([])
+        finally:
+            sys.stdin = orig_in
         self.assertEqual(cm.exception.code, 2)
 
 

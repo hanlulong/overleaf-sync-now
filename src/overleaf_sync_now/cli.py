@@ -6,7 +6,9 @@ Subcommands:
                                 the cookie via DevTools Protocol (the proper fix for Chrome
                                 130+ app-bound encryption). One-time, persists for weeks.
   setup                         Auth setup (auto-detect from existing browsers/profiles)
-  save-cookie <value>           Persist a manually-pasted overleaf_session2 cookie value
+  save-cookie [-]               Save an overleaf_session2 cookie typed at a hidden prompt
+                                (or piped on stdin with `-`). Headless fallback only; the
+                                user runs it in their own terminal, never via an agent.
   link <project_id> [folder]    Mark a folder as belonging to an Overleaf project (override)
   sync [folder] [--force]       Refresh the linked folder against Overleaf. Probes
                                 /project/<id>/updates and downloads the zip only when
@@ -376,49 +378,57 @@ def _try_playwright_profile():
     return None
 
 
-def _resolve_cookies(interactive=False):
+def _resolve_cookies_with_source(interactive=False):
+    """Walk the auth chain. Returns (cookies, source_label) or (None, None).
+
+    `setup` reports the label so the user knows which source won; every
+    other caller goes through `_resolve_cookies`."""
     cached = _load_cache()
     if _validate_cookies(cached):
-        return cached
+        return cached, "cached cookie"
     # Persistent browser profile from `login` command (the proper fix for
     # Chrome 130+ app-bound encryption). Browser API can read HttpOnly cookies
     # that no on-disk extractor can decrypt without admin.
-    via_login = _try_login_profile()
-    if _validate_cookies(via_login):
-        _save_cache(via_login)
-        return via_login
-    # rookiepy: Chrome 127+ friendly via Rust
-    via_rookie = _try_rookiepy()
-    if _validate_cookies(via_rookie):
-        _save_cache(via_rookie)
-        return via_rookie
-    via_browser = _try_browser_cookie3()
-    if _validate_cookies(via_browser):
-        _save_cache(via_browser)
-        return via_browser
-    via_playwright = _try_playwright_profile()
-    if _validate_cookies(via_playwright):
-        _save_cache(via_playwright)
-        return via_playwright
+    chain = (
+        ("`login` browser profile", _try_login_profile),
+        # rookiepy: Chrome 127+ friendly via Rust
+        ("rookiepy (installed browsers)", _try_rookiepy),
+        ("browser_cookie3 (installed browsers)", _try_browser_cookie3),
+        ("Claude Code Playwright profile", _try_playwright_profile),
+    )
+    for label, fn in chain:
+        found = fn()
+        if _validate_cookies(found):
+            _save_cache(found)
+            return found, label
     if interactive:
         manual = _prompt_manual_cookie()
         if _validate_cookies(manual):
             _save_cache(manual)
-            return manual
-    return None
+            return manual, "hidden terminal prompt"
+    return None, None
+
+
+def _resolve_cookies(interactive=False):
+    return _resolve_cookies_with_source(interactive=interactive)[0]
 
 
 def _prompt_manual_cookie():
+    """Interactive, user-only fallback. Reads the value with getpass so it is
+    not echoed to the terminal (or captured by a screen recording / terminal
+    scrollback)."""
+    import getpass
     print()
     print("Could not auto-detect a logged-in Overleaf session.")
+    print("Preferred fix: Ctrl+C and run `overleaf-sync-now login` (opens a browser).")
     print()
-    print("Manual setup:")
+    print("Manual fallback (type it here yourself; never paste it into an AI chat):")
     print("  1. Open https://www.overleaf.com in any browser and log in.")
     print("  2. Press F12 -> Application tab -> Storage -> Cookies -> https://www.overleaf.com")
     print(f"  3. Find the row named '{SESSION_COOKIE}' and copy the entire 'Value' field.")
     print()
     try:
-        value = input(f"Paste the {SESSION_COOKIE} cookie value here: ").strip()
+        value = getpass.getpass(f"Paste the {SESSION_COOKIE} value (input hidden): ").strip()
     except (EOFError, KeyboardInterrupt):
         return None
     if not value:
@@ -484,14 +494,7 @@ def get_session(force_refresh=False):
         # RuntimeError here would fall through to the hook's generic handler,
         # which marks-synced and exits 0, passing the stale edit through.
         raise AuthExpired(
-            f"No valid Overleaf cookies (cache: {CACHE_FILE}).\n"
-            f"\n"
-            f"AGENT RECOVERY (do this — do NOT just tell the user 'log in'; on Windows + Chrome 130+ the browser has the cookie but app-bound encryption blocks our extractor):\n"
-            f"  1. Run: overleaf-sync-now doctor\n"
-            f"  2. Ask the user: 'Paste your overleaf_session2 cookie value. Open https://www.overleaf.com (logged in), F12 -> Application -> Cookies -> https://www.overleaf.com -> overleaf_session2 -> copy the Value field (long string starting with s%3A...).'\n"
-            f"  3. Run: overleaf-sync-now save-cookie \"<pasted-value>\"\n"
-            f"  4. Verify: overleaf-sync-now status\n"
-            f"  5. Retry the original command."
+            f"No valid Overleaf cookies (cache: {CACHE_FILE}).\n\n{_AUTH_RECOVERY}"
         )
     s = requests.Session()
     s.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
@@ -505,6 +508,26 @@ class AuthExpired(RuntimeError):
     """Cookies invalid or expired; user needs to re-auth."""
 
 
+# Shown to the model on every auth failure (hook exit 2, sync, doctor). It is
+# deliberately login-first and never routes the session cookie through the
+# agent: a cookie pasted into a chat lands in the model provider's transcript
+# and in local session logs, and as a command-line argument it is visible in
+# the process list and shell history.
+_AUTH_RECOVERY = (
+    "HOW TO FIX (tell the user; the cookie must never pass through this chat):\n"
+    "  1. The user runs, in their own terminal:  overleaf-sync-now login\n"
+    "     A browser window opens; they log into Overleaf there (works on Chrome 130+).\n"
+    "     Do not suggest logging into Overleaf in their everyday browser instead:\n"
+    "     Chrome 130+ app-bound encryption blocks reading cookies from it.\n"
+    "  2. Only on a machine with no display for `login`: the user runs\n"
+    "       overleaf-sync-now save-cookie\n"
+    "     in their own terminal and pastes the overleaf_session2 value at the hidden prompt.\n"
+    "  3. NEVER ask the user to paste the cookie into this chat, and never pass it as a\n"
+    "     command-line argument. It grants full access to their Overleaf account.\n"
+    "  4. Afterwards, run `overleaf-sync-now status` to verify, then retry."
+)
+
+
 class RateLimited(RuntimeError):
     """Overleaf returned 429. Pass `retry_after` (seconds) when known."""
     def __init__(self, retry_after=60):
@@ -512,12 +535,41 @@ class RateLimited(RuntimeError):
         super().__init__(f"Overleaf rate-limited; wait ~{retry_after}s and retry.")
 
 
+def _is_network_exception(exc):
+    """True if `exc`, or anything in its __cause__/__context__ chain, came from
+    the HTTP stack (requests / urllib3 / socket). A plain OSError raised while
+    writing a local file is NOT a network exception, even though its message
+    may also say "Permission denied"."""
+    try:
+        import requests
+        req_exc = requests.exceptions.RequestException
+    except Exception:  # pragma: no cover - requests is a hard dependency
+        req_exc = None
+    seen = set()
+    e = exc
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        if req_exc is not None and isinstance(e, req_exc):
+            return True
+        mod = type(e).__module__ or ""
+        if mod.startswith(("urllib3", "requests", "socket")):
+            return True
+        e = e.__cause__ or e.__context__
+    return False
+
+
 def _is_sandbox_block(exc):
     """True if `exc` looks like the host shell blocking an outbound socket
     (sandboxed shell, firewall policy) rather than a generic network failure.
     Distinguishing these matters: retrying doesn't help here, and the tool
     should stop reaching for auth-recovery commands (setup/login/doctor) that
-    would hit the same block."""
+    would hit the same block.
+
+    Only network exceptions qualify: a local PermissionError (read-only
+    Dropbox folder, file locked by another process) used to be misreported as
+    a sandbox block because it shares the "permission denied" wording."""
+    if not _is_network_exception(exc):
+        return False
     msg = str(exc).lower()
     markers = (
         "winerror 10013",                          # Windows WSAEACCES
@@ -1434,37 +1486,27 @@ def cmd_setup(args, *, force_noninteractive=False):
         and not os.environ.get("OVERLEAF_SYNC_NONINTERACTIVE")
     )
     print("Setting up Overleaf sync...")
-    cached = _load_cache()
-    if _validate_cookies(cached):
-        print(f"  - Cached cookies still valid ({SESSION_COOKIE}={cached[SESSION_COOKIE][:12]}...).")
-        return
-    via_browser = _try_browser_cookie3()
-    if _validate_cookies(via_browser):
-        _save_cache(via_browser)
-        print(f"  - Found valid cookies in your regular browser.")
-        print(f"  - Saved to {CACHE_FILE}")
-        return
-    via_pw = _try_playwright_profile()
-    if _validate_cookies(via_pw):
-        _save_cache(via_pw)
-        print("  - Found valid cookies in Claude Code Playwright profile.")
-        print(f"  - Saved to {CACHE_FILE}")
+    # Same chain `sync` and the hook use (cached -> login profile -> rookiepy
+    # -> browser_cookie3 -> Playwright profile), so setup never reports
+    # failure for a session that sync would find.
+    cookies, source = _resolve_cookies_with_source(interactive=interactive)
+    if cookies:
+        print(f"  - Valid Overleaf session found via {source} ({SESSION_COOKIE}: present).")
+        print(f"  - Cached at {CACHE_FILE}")
         return
     if not interactive:
         print()
-        print("AUTO-DETECT FAILED. Next steps:")
-        print("  1. Open https://www.overleaf.com in Chrome/Edge/Firefox/Brave/etc. and log in.")
-        print("  2. Re-run `overleaf-sync-now setup`.")
-        print("OR (for the manual paste fallback) run `overleaf-sync-now setup` from an interactive terminal.")
+        print("AUTO-DETECT FAILED. Next step (the user runs this in their own terminal):")
+        print("    overleaf-sync-now login")
+        print("  A browser window opens; log into Overleaf there. Works on Chrome 130+,")
+        print("  where logging into your everyday browser does NOT help (app-bound")
+        print("  encryption blocks reading its cookies).")
+        print("  No display (server/SSH)? Run `overleaf-sync-now save-cookie` in a terminal")
+        print("  and paste the cookie at its hidden prompt. Never paste it into an AI chat.")
         print()
         print("Sync will not work until cookies are obtained.")
         return
-    manual = _prompt_manual_cookie()
-    if _validate_cookies(manual):
-        _save_cache(manual)
-        print(f"  - Saved to {CACHE_FILE}")
-        return
-    print("ERROR: Could not authenticate.", file=sys.stderr)
+    print("ERROR: Could not authenticate. Run `overleaf-sync-now login`.", file=sys.stderr)
     sys.exit(1)
 
 
@@ -1486,7 +1528,7 @@ def cmd_link(args):
     if not re.fullmatch(r"[0-9a-f]{24}", project_id):
         print(
             f"ERROR: '{project_id}' is not a valid Overleaf project ID.\n"
-            f"  Expected: 24 lowercase hex characters (e.g. 69cd66411a29169cb64109e0)\n"
+            f"  Expected: 24 lowercase hex characters (e.g. 0123456789abcdef01234567)\n"
             f"  Found in the URL: https://www.overleaf.com/project/<project_id>",
             file=sys.stderr,
         )
@@ -1651,8 +1693,9 @@ def cmd_status(args):
             if resolved:
                 print("Cookie auth: OK (cache stale, but chain resolved; sync would succeed and refresh cache)")
             else:
-                print("Cookie auth: INVALID — sync would FAIL. Run `doctor` for details, "
-                      "or run `overleaf-sync-now login` (or `save-cookie <value>`).")
+                print("Cookie auth: INVALID — sync would FAIL and the hook blocks AI edits. "
+                      "Fix: the user runs `overleaf-sync-now login` in their own terminal "
+                      "(headless: `overleaf-sync-now save-cookie`, hidden prompt).")
     print()
     if not project_id:
         print(f"Folder: {folder.resolve()}")
@@ -1972,6 +2015,11 @@ def _build_launch_kwargs(kind, profile_dir, *, headless, channel):
     return kwargs
 
 
+def _pkg_version():
+    from . import __version__
+    return __version__
+
+
 def _ensure_playwright_browser():
     """Ensure Chromium is downloaded for whichever backend the adapter prefers.
     Idempotent. ~150MB on first run.
@@ -1987,7 +2035,7 @@ def _ensure_playwright_browser():
         print(
             "[overleaf-sync-now] Neither patchright nor playwright is installed.\n"
             "  Reinstall the tool:\n"
-            "  uv tool install --reinstall --from git+https://github.com/hanlulong/overleaf-sync-now overleaf-sync-now",
+            f"  uv tool install --reinstall --from git+https://github.com/hanlulong/overleaf-sync-now@v{_pkg_version()} overleaf-sync-now",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -2134,15 +2182,17 @@ def cmd_login(args):
         print("  4. Re-run `overleaf-sync-now login` and use email+password on the Overleaf form.", file=sys.stderr)
         print("     Google never sees this flow and never blocks it.", file=sys.stderr)
         print(file=sys.stderr)
-        print("Fallback if you can't change the account:", file=sys.stderr)
-        print("  Copy the `overleaf_session2` cookie from your normal browser's DevTools and run:", file=sys.stderr)
-        print("    overleaf-sync-now save-cookie \"<value>\"", file=sys.stderr)
+        print("Fallback if you can't change the account: copy the `overleaf_session2` cookie", file=sys.stderr)
+        print("from your normal browser's DevTools, then run this in your terminal and paste it", file=sys.stderr)
+        print("at the hidden prompt (never into an AI chat):", file=sys.stderr)
+        print("    overleaf-sync-now save-cookie", file=sys.stderr)
         sys.exit(1)
 
     if not captured:
         print("\nERROR: did not capture a valid Overleaf session cookie within 5 minutes.", file=sys.stderr)
-        print("If you did log in but it wasn't detected, try `overleaf-sync-now save-cookie <value>`", file=sys.stderr)
-        print("with your overleaf_session2 cookie value (DevTools -> Application -> Cookies).", file=sys.stderr)
+        print("If you did log in but it wasn't detected, run `overleaf-sync-now save-cookie` in this", file=sys.stderr)
+        print("terminal and paste your overleaf_session2 value (DevTools -> Application -> Cookies)", file=sys.stderr)
+        print("at the hidden prompt. Never paste it into an AI chat.", file=sys.stderr)
         sys.exit(1)
 
     _save_cache(captured)
@@ -2204,23 +2254,49 @@ def _try_login_profile():
     return None
 
 
-def cmd_save_cookie(args):
-    """Save an overleaf_session2 cookie value (passed as an arg) to the cache.
+_SAVE_COOKIE_USAGE = (
+    "Usage (run it yourself in a terminal; never via an AI agent or chat):\n"
+    "  overleaf-sync-now save-cookie        prompt for the value (input hidden)\n"
+    "  overleaf-sync-now save-cookie -      read the value from stdin\n"
+    f"Get the value from your browser: open https://www.overleaf.com (logged in), "
+    f"press F12 -> Application -> Cookies -> https://www.overleaf.com -> find "
+    f"'{SESSION_COOKIE}' -> copy Value.\n"
+    "Prefer `overleaf-sync-now login` whenever a browser can open on this machine."
+)
 
-    For AI-agent use: when the auth chain fails (e.g., Chrome 127+ app-bound
-    encryption on Windows defeats browser_cookie3), the agent asks the user
-    to paste the cookie value, then calls this command to persist it.
+
+def cmd_save_cookie(args):
+    """Save an overleaf_session2 cookie value to the cache. Headless fallback
+    for machines where `login` cannot open a browser.
+
+    The user runs this in their own terminal. The value is read with getpass
+    (no argument, interactive terminal) or from stdin (`-`, or no argument
+    with piped input) so it never lands in shell history, the process list,
+    or an agent transcript. A value passed as an argument still works for
+    backward compatibility, with a warning.
     """
-    if not args:
+    if not args or args[0] == "-":
+        from_stdin = bool(args) or not sys.stdin.isatty()
+        try:
+            if from_stdin:
+                value = sys.stdin.read()
+            else:
+                import getpass
+                value = getpass.getpass(f"Paste the {SESSION_COOKIE} value (input hidden): ")
+        except (EOFError, KeyboardInterrupt):
+            value = ""
+        value = (value or "").strip()
+        if not value:
+            print(_SAVE_COOKIE_USAGE, file=sys.stderr)
+            sys.exit(2)
+    else:
         print(
-            "Usage: save-cookie <session-cookie-value>\n"
-            f"Get the value from your browser: open https://www.overleaf.com "
-            f"(logged in), press F12 -> Application -> Cookies -> "
-            f"https://www.overleaf.com -> find '{SESSION_COOKIE}' -> copy Value.",
+            "WARNING: a cookie passed as a command-line argument is visible in the process "
+            "list and your shell history (and in the transcript, if an AI agent ran this). "
+            "Next time run `overleaf-sync-now save-cookie` with no argument instead.",
             file=sys.stderr,
         )
-        sys.exit(2)
-    value = args[0].strip()
+        value = args[0].strip()
     # Strip surrounding quotes (common copy/paste artifact from terminals
     # that auto-quote pasted text, or users hand-quoting).
     while value and value[0] in ('"', "'") and value[-1] == value[0]:
@@ -2293,7 +2369,7 @@ def cmd_doctor(args):
                 raw = fn(["overleaf.com", ".overleaf.com", "www.overleaf.com"])
                 cookies = {c["name"]: c["value"] for c in raw}
                 if SESSION_COOKIE in cookies:
-                    print(f"     {fn_name:10s}: {SESSION_COOKIE} found ({cookies[SESSION_COOKIE][:10]}...)")
+                    print(f"     {fn_name:10s}: {SESSION_COOKIE} present")
                 else:
                     print(f"     {fn_name:10s}: no overleaf.com cookies (not logged in here?)")
             except Exception as e:
@@ -2314,7 +2390,7 @@ def cmd_doctor(args):
                 cj = fn(domain_name="overleaf.com")
                 cookies = {c.name: c.value for c in cj}
                 if SESSION_COOKIE in cookies:
-                    print(f"    {fn_name:10s}: {SESSION_COOKIE} found ({cookies[SESSION_COOKIE][:10]}...)")
+                    print(f"    {fn_name:10s}: {SESSION_COOKIE} present")
                 else:
                     print(f"    {fn_name:10s}: no overleaf.com cookies (not logged in here?)")
             except Exception as e:
@@ -2339,17 +2415,7 @@ def cmd_doctor(args):
     else:
         print("[4] Auth resolution: WOULD FAIL.")
         print()
-        print("AGENT RECOVERY (do not just tell the user to 'log in' - on Windows + Chrome 130+")
-        print("the browser already has the cookie but app-bound encryption blocks every automatic")
-        print("extractor; only manual paste works):")
-        print()
-        print("  1. Ask the user: 'Open https://www.overleaf.com in your browser (already logged in).")
-        print("     Press F12 -> Application tab -> Cookies -> https://www.overleaf.com -> find the")
-        print("     row named overleaf_session2 -> copy its Value (long string starting with s%3A).")
-        print("     Paste it.'")
-        print("  2. Take their pasted value as <COOKIE>.")
-        print("  3. Run: overleaf-sync-now save-cookie \"<COOKIE>\"")
-        print("  4. Verify: overleaf-sync-now status")
+        print(_AUTH_RECOVERY)
     print()
 
     # [5] Version-match endpoint health (the new default refresh path).
