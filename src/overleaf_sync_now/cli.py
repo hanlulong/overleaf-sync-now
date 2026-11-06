@@ -508,6 +508,18 @@ def _resolve_cookies(interactive=False, **kw):
     return _resolve_cookies_with_source(interactive=interactive, **kw)[0]
 
 
+# Where to find the cookie in a browser, for the user (not the agent). macOS
+# has no F12 key by default, Safari hides its developer tools, and Firefox
+# and Safari call the pane Storage rather than Application.
+_DEVTOOLS_STEPS = (
+    "open https://www.overleaf.com (logged in), then the browser's developer tools:\n"
+    "       Chrome / Edge / Firefox: F12 or Ctrl+Shift+I (Windows, Linux), Cmd+Option+I (macOS)\n"
+    "       Safari: Settings > Advanced > \"Show features for web developers\", then Cmd+Option+I\n"
+    "     Go to Application > Cookies (Chrome, Edge) or Storage > Cookies (Firefox, Safari)\n"
+    "     > https://www.overleaf.com, find the row named 'overleaf_session2' and copy its Value."
+)
+
+
 def _prompt_manual_cookie():
     """Interactive, user-only fallback. Reads the value with getpass so it is
     not echoed to the terminal (or captured by a screen recording / terminal
@@ -518,9 +530,7 @@ def _prompt_manual_cookie():
     print("Preferred fix: Ctrl+C and run `overleaf-sync-now login` (opens a browser).")
     print()
     print("Manual fallback (type it here yourself; never paste it into an AI chat):")
-    print("  1. Open https://www.overleaf.com in any browser and log in.")
-    print("  2. Press F12 -> Application tab -> Storage -> Cookies -> https://www.overleaf.com")
-    print(f"  3. Find the row named '{SESSION_COOKIE}' and copy the entire 'Value' field.")
+    print(f"  1. In any browser, {_DEVTOOLS_STEPS}")
     print()
     try:
         value = getpass.getpass(f"Paste the {SESSION_COOKIE} value (input hidden): ").strip()
@@ -3692,9 +3702,50 @@ def _pkg_version():
     return __version__
 
 
+_PROFILE_CHANNEL_FILE = ".overleaf-sync-channel"
+
+
+def _launch_profile(p, kind, profile_dir, *, headless, channels):
+    """Open the persistent `login` profile with the first browser channel
+    that starts ("chrome", "msedge", or None = Playwright's Chromium).
+    Returns (context, channel) or (None, None)."""
+    for channel in channels:
+        try:
+            kwargs = _build_launch_kwargs(kind, profile_dir, headless=headless, channel=channel)
+            return p.chromium.launch_persistent_context(**kwargs), channel
+        except Exception:
+            continue
+    return None, None
+
+
+def _record_profile_channel(profile_dir, channel):
+    try:
+        (pathlib.Path(profile_dir) / _PROFILE_CHANNEL_FILE).write_text(channel or "chromium")
+    except OSError:
+        pass
+
+
+def _profile_channels(profile_dir):
+    """Channel order for reopening the profile: the browser `login` used
+    first (a profile is best read by the browser that wrote it), then the
+    rest, so no Chromium download is needed when Chrome or Edge exists."""
+    order = ["chrome", "msedge", None]
+    try:
+        used = (pathlib.Path(profile_dir) / _PROFILE_CHANNEL_FILE).read_text().strip()
+    except OSError:
+        used = ""
+    if used in ("chrome", "msedge", "chromium"):
+        first = None if used == "chromium" else used
+        order.remove(first)
+        order.insert(0, first)
+    return order
+
+
 def _ensure_playwright_browser():
-    """Ensure Chromium is downloaded for whichever backend the adapter prefers.
-    Idempotent. ~150MB on first run.
+    """Download Playwright's Chromium for whichever backend the adapter
+    prefers. Idempotent. Only called when neither Chrome nor Edge is
+    installed: about 300 MB (Chromium plus its headless shell), stored in the
+    Playwright cache (see _playwright_cache_dir).
 
     Both patchright and playwright are pyproject.toml deps, so import is
     guaranteed; only the browser binary is lazy-downloaded. We run the
@@ -3712,7 +3763,8 @@ def _ensure_playwright_browser():
         )
         sys.exit(1)
     print(
-        f"[overleaf-sync-now] Ensuring Chromium is available via {kind} (one-time, ~150MB on first run)...",
+        f"[overleaf-sync-now] Chrome and Edge could not be started, so downloading Chromium via "
+        f"{kind} (one-time, about 300 MB, into {_playwright_cache_dir()})...",
         file=sys.stderr,
     )
     try:
@@ -3747,7 +3799,6 @@ def cmd_login(args):
         print("Nothing to do. If you want to force a fresh login anyway, delete the cache file and re-run.")
         return
 
-    _ensure_playwright_browser()
     sync_playwright, kind = _import_sync_playwright()
     if sync_playwright is None:
         print(
@@ -3776,18 +3827,16 @@ def cmd_login(args):
     print()
 
     with sync_playwright() as p:
-        ctx = None
-        # Prefer system Chrome (no download); fall back to bundled Chromium.
-        for channel in ("chrome", "msedge", None):
-            try:
-                kwargs = _build_launch_kwargs(kind, profile_dir, headless=False, channel=channel)
-                ctx = p.chromium.launch_persistent_context(**kwargs)
-                break
-            except Exception:
-                continue
+        # Prefer the installed Chrome or Edge (no download); fetch Playwright's
+        # Chromium only when neither starts.
+        ctx, channel = _launch_profile(p, kind, profile_dir, headless=False, channels=("chrome", "msedge"))
+        if not ctx:
+            _ensure_playwright_browser()
+            ctx, channel = _launch_profile(p, kind, profile_dir, headless=False, channels=(None,))
         if not ctx:
             print("ERROR: Could not launch any browser. Make sure Chrome, Edge, or Chromium is installed.", file=sys.stderr)
             sys.exit(1)
+        _record_profile_channel(profile_dir, channel)
 
         # Clear stale overleaf.com cookies so we don't accidentally capture an
         # expired session left over from a previous run of `login`.
@@ -3863,7 +3912,7 @@ def cmd_login(args):
     if not captured:
         print("\nERROR: did not capture a valid Overleaf session cookie within 5 minutes.", file=sys.stderr)
         print("If you did log in but it wasn't detected, run `overleaf-sync-now save-cookie` in this", file=sys.stderr)
-        print("terminal and paste your overleaf_session2 value (DevTools -> Application -> Cookies)", file=sys.stderr)
+        print("terminal and paste your overleaf_session2 value (browser developer tools > Cookies)", file=sys.stderr)
         print("at the hidden prompt. Never paste it into an AI chat.", file=sys.stderr)
         sys.exit(1)
 
@@ -3908,8 +3957,10 @@ def _try_login_profile():
         return None
     try:
         with sync_playwright() as p:
-            kwargs = _build_launch_kwargs(kind, profile_dir, headless=True, channel=None)
-            ctx = p.chromium.launch_persistent_context(**kwargs)
+            ctx, _ = _launch_profile(p, kind, profile_dir, headless=True,
+                                     channels=_profile_channels(profile_dir))
+            if ctx is None:
+                raise RuntimeError("no browser could open the login profile")
             try:
                 cookies = ctx.cookies("https://www.overleaf.com")
                 target = {c["name"]: c["value"] for c in cookies if "overleaf" in c.get("domain", "")}
@@ -3930,9 +3981,7 @@ _SAVE_COOKIE_USAGE = (
     "Usage (run it yourself in a terminal; never via an AI agent or chat):\n"
     "  overleaf-sync-now save-cookie        prompt for the value (input hidden)\n"
     "  overleaf-sync-now save-cookie -      read the value from stdin\n"
-    f"Get the value from your browser: open https://www.overleaf.com (logged in), "
-    f"press F12 -> Application -> Cookies -> https://www.overleaf.com -> find "
-    f"'{SESSION_COOKIE}' -> copy Value.\n"
+    f"Get the value from your browser: {_DEVTOOLS_STEPS}\n"
     "Prefer `overleaf-sync-now login` whenever a browser can open on this machine."
 )
 

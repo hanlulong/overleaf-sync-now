@@ -119,3 +119,95 @@ class OnePassPerBrowserTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LoginBrowserChoiceTests(unittest.TestCase):
+    """`login` uses the installed Chrome or Edge and downloads Playwright's
+    Chromium (about 300 MB) only when neither starts; the hook-side reader
+    reopens the profile with the browser that wrote it."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data = pathlib.Path(self._tmp.name) / "data"
+        self.launched, self.downloads, self.fail = [], [], set()
+        test = self
+
+        class Page:
+            url = "https://www.overleaf.com/project"
+
+            def goto(self, url):
+                pass
+
+        class Ctx:
+            pages = [Page()]
+
+            def clear_cookies(self, **kw):
+                pass
+
+            def cookies(self, url):
+                return [{"name": cli.SESSION_COOKIE, "value": "v", "domain": ".overleaf.com"}]
+
+            def close(self):
+                pass
+
+        class Chromium:
+            def launch_persistent_context(self, **kw):
+                test.launched.append(kw.get("channel"))
+                if kw.get("channel") in test.fail:
+                    raise RuntimeError("not installed")
+                return Ctx()
+
+        class PW:
+            chromium = Chromium()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        self._orig = {name: getattr(cli, name) for name in (
+            "CACHE_DIR", "CACHE_FILE", "_import_sync_playwright", "_ensure_playwright_browser",
+            "_check_cookies", "_save_cache", "_login_profile_in_cooldown",
+        )}
+        cli.CACHE_DIR = self.data
+        cli.CACHE_FILE = self.data / "cookies.json"
+        cli._import_sync_playwright = lambda: (PW, "patchright")
+        cli._ensure_playwright_browser = lambda: self.downloads.append(1)
+        cli._check_cookies = lambda c, use_cache=True: (("ok", None) if c else ("missing", None))
+        cli._save_cache = lambda c: None
+        cli._login_profile_in_cooldown = lambda: False
+        self._streams = (sys.stdin, sys.stdout, sys.stderr)
+        tty = io.StringIO()
+        tty.isatty = lambda: True
+        sys.stdin, sys.stdout, sys.stderr = tty, io.StringIO(), io.StringIO()
+
+    def tearDown(self):
+        sys.stdin, sys.stdout, sys.stderr = self._streams
+        for k, v in self._orig.items():
+            setattr(cli, k, v)
+        self._tmp.cleanup()
+
+    def test_installed_chrome_means_no_download(self):
+        cli.cmd_login([])
+        self.assertEqual(self.launched, ["chrome"])
+        self.assertEqual(self.downloads, [])
+        profile = self.data / "browser-profile"
+        self.assertEqual(cli._profile_channels(profile)[0], "chrome")
+
+    def test_download_only_when_chrome_and_edge_fail(self):
+        self.fail = {"chrome", "msedge"}
+        cli.cmd_login([])
+        self.assertEqual(self.launched, ["chrome", "msedge", None])
+        self.assertEqual(self.downloads, [1])
+        profile = self.data / "browser-profile"
+        self.assertEqual(cli._profile_channels(profile), [None, "chrome", "msedge"])
+
+    def test_profile_reader_reuses_the_login_browser(self):
+        self.fail = {"chrome"}
+        cli.cmd_login([])                       # Edge wrote the profile
+        self.launched.clear()
+        (self.data / "browser-profile" / "Default" / "Network").mkdir(parents=True)
+        (self.data / "browser-profile" / "Default" / "Network" / "Cookies").write_text("")
+        self.assertEqual(cli._try_login_profile(), {cli.SESSION_COOKIE: "v"})
+        self.assertEqual(self.launched, ["msedge"])
