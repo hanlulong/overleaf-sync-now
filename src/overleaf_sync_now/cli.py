@@ -2741,7 +2741,10 @@ def _install_health():
                 if _is_our_skill_dir(target):
                     problems.append(f"{tool}: {skill} differs from this version's SKILL.md (stale copy)")
                 else:
-                    problems.append(f"{tool}: {skill} is a different skill named `overleaf`")
+                    problems.append(
+                        f"{tool}: {skill} is a different skill named `overleaf`; install will not "
+                        f"overwrite it (move or rename it to install ours there)"
+                    )
         except OSError as e:
             problems.append(f"{tool}: cannot read {skill}: {e}")
     if not any_copy:
@@ -2802,7 +2805,7 @@ def _print_install_health(indent=""):
     if not problems:
         print(f"{indent}Install:   OK (skill copies match this version; hooks look current)")
         return
-    print(f"{indent}Install:   NEEDS ATTENTION — re-run `overleaf-sync-now install`:")
+    print(f"{indent}Install:   NEEDS ATTENTION (re-running `overleaf-sync-now install` fixes most of this):")
     for prob in problems:
         print(f"{indent}  - {prob}")
     if CODEX_HOME.exists():
