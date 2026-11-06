@@ -23,10 +23,12 @@ with `/hooks`.**
    pulled; a file renamed on the web could be edited under its old name and
    re-uploaded by Dropbox. Adds and rename targets are now pulled; deletes
    and rename sources are recorded in `<DATA_DIR>/web-removed.json` with a
-   stderr warning, and the hook blocks edits to the old path (local files
-   are never deleted), including through a symlinked Dropbox folder such as
-   `~/Dropbox` -> `~/Library/CloudStorage/Dropbox`. A non-Dropbox update
-   carrying file ops is never reported as `dropbox_echo`.
+   stderr warning, and the hook blocks edits to the old path, including
+   through a symlinked Dropbox folder such as `~/Dropbox` ->
+   `~/Library/CloudStorage/Dropbox`. Local files are never deleted by the
+   tool; the agent may delete the outdated copy (`rm`, `git rm`,
+   `Remove-Item`, `*** Delete File:`). A non-Dropbox update carrying file
+   ops is never reported as `dropbox_echo`.
 2. **Unresolved Overleaf folders fail closed.** For a file under
    `Apps/Overleaf/<name>/` whose project can't be determined — not logged in
    yet (the default state right after `install`), no living project with

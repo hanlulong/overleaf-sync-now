@@ -50,7 +50,7 @@ Shell commands are classified as reads when every command in them is a known rea
 | **7. Decide** | • Latest `toV` matches cache → no-op. • All new updates are `origin.kind == "dropbox"` (echoes of our own local saves round-tripping) → no-op, advance cache. • A web-origin update exists (text edits, or file adds/renames/deletes in `project_ops`) → continue. |
 | **8. Conditional zip pull** | `GET /project/<id>/download/zip`, hash-compare each entry against local, write only the files whose contents actually differ (including files added or renamed on the web). Web-side deletes and rename sources go to `web-removed.json`; local files are never deleted. |
 | **9. Recent-mtime guard** | Files modified locally in the last 30 s are skipped (with a `SKIP <path>` warning to stderr) — protects an in-progress local save not yet propagated Dropbox → Overleaf. `--force` disables. |
-| **10. Write guards** | For writes only: if step 8 just rewrote a file this call is about to change → exit 2, "re-read first". If step 9 had to skip a target that also changed on the web → exit 2, "conflict, wait and re-read". If the target was deleted or renamed on the web and the local copy still exists → exit 2. |
+| **10. Write guards** | For writes only: if step 8 just rewrote a file this call is about to change → exit 2, "re-read first". If step 9 had to skip a target that also changed on the web → exit 2, "conflict, wait and re-read". If the target was deleted or renamed on the web and the local copy still exists → exit 2, unless the call only deletes it (`rm`, `git rm`, `Remove-Item`, `del`, `*** Delete File:`). |
 
 ## Exit codes (hook)
 

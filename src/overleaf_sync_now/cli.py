@@ -2152,9 +2152,10 @@ def _is_read_only_command(cmd):
     return True
 
 
-def _shell_candidate_paths(cmd, cwd, *, posix_escapes=True):
+def _shell_candidate_paths(cmd, cwd, *, posix_escapes=True, cd_text=None):
     """Candidate LaTeX paths mentioned in a shell command, as absolute Paths.
-    Globs are expanded (bounded). Paths need not exist."""
+    Globs are expanded (bounded). Paths need not exist. Relative paths are
+    tried against `cwd` and every `cd <dir>` in `cd_text` (default: `cmd`)."""
     import glob as _glob
     tokens = []
     for m in _SHELL_PATH_RE.finditer(cmd):
@@ -2170,7 +2171,7 @@ def _shell_candidate_paths(cmd, cwd, *, posix_escapes=True):
         return []
     cwd = pathlib.Path(cwd)
     bases = [cwd]
-    for m in _SHELL_CD_RE.finditer(cmd):
+    for m in _SHELL_CD_RE.finditer(cmd if cd_text is None else cd_text):
         d = m.group(1).strip("\"'")
         if d and d != "-":
             bases.append(cwd / pathlib.Path(d).expanduser())
@@ -2199,6 +2200,92 @@ def _patch_paths(text, cwd):
         p = pathlib.Path(m.group(1).strip().strip("\"'")).expanduser()
         out.append(p if p.is_absolute() else cwd / p)
     return out
+
+
+_PATCH_HEADER_RE = re.compile(
+    r"^\*\*\* ((?:Update|Add|Delete) File|Move to):\s*(.+?)\s*$", re.MULTILINE
+)
+# Programs (and PowerShell aliases) whose operands are only deleted.
+_DELETE_PROGRAMS = {"rm", "unlink", "del", "erase", "remove-item", "ri"}
+
+
+def _path_key(p):
+    return os.path.normcase(str(_real_path(p)))
+
+
+def _pure_delete_targets(data):
+    """Keys (_path_key) of the LaTeX files this tool call only deletes: Codex
+    `*** Delete File:` lines, or shell segments that run rm / git rm /
+    unlink / Remove-Item / del / erase on them. A path the call also names
+    anywhere else (an Update/Move, a redirect, cp/mv, another program) is not
+    included, so `rm a.tex && echo x > a.tex` still counts as editing a.tex.
+    Used to let the agent delete the outdated local copy of a file that was
+    deleted or renamed on Overleaf (deleting it cannot re-create it)."""
+    import shlex
+    tool = data.get("tool_name") or ""
+    tool_input = data.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        return set()
+    cwd = pathlib.Path(data.get("cwd") or os.getcwd())
+    text = _command_text(tool_input)
+    deleted, other = set(), set()
+    if tool == "apply_patch" or (tool in _SHELL_TOOLS and "*** Begin Patch" in text):
+        for m in _PATCH_HEADER_RE.finditer(text):
+            fp = pathlib.Path(m.group(2).strip().strip("\"'")).expanduser()
+            key = _path_key(fp if fp.is_absolute() else cwd / fp)
+            (deleted if m.group(1) == "Delete File" else other).add(key)
+        if tool == "apply_patch":
+            return deleted - other
+        text = re.sub(r"\*\*\* Begin Patch.*?(?:\*\*\* End Patch|\Z)", " ", text, flags=re.S)
+    if tool not in _SHELL_TOOLS:
+        return set()
+    posix = tool == "Bash"
+    try:
+        lex = shlex.shlex(text.replace("\n", " ; "), posix=posix, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return set()  # unbalanced quotes: no exemption
+    segments, cur = [], []
+    for tok in tokens:
+        if tok and set(tok) <= set(";&|"):
+            segments.append(cur)
+            cur = []
+        else:
+            cur.append(tok if posix else tok.strip("\"'"))
+    segments.append(cur)
+
+    def paths_of(words):
+        quoted = " ".join('"' + w.replace('"', "") + '"' for w in words)
+        return {_path_key(p) for p in _shell_candidate_paths(
+            quoted, cwd, posix_escapes=False, cd_text=text)}
+
+    for words in segments:
+        words = list(words)
+        while words and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=\S*", words[0]):
+            words.pop(0)
+        if not words:
+            continue
+        prog = os.path.basename(words[0]).lower()
+        if prog.endswith(".exe"):
+            prog = prog[:-4]
+        rest = words[1:]
+        if prog == "git" and rest[:1] == ["rm"]:
+            prog, rest = "git rm", rest[1:]
+        # An output redirection makes the segment a write, except fd
+        # duplication (`2>&1`, `>&2`, `>&-`).
+        redirect = False
+        for i, w in enumerate(rest):
+            if ">" in w and not (
+                re.fullmatch(r"\d*>&\d*-?", w)
+                and (w[-1] != "&" or (i + 1 < len(rest) and re.fullmatch(r"\d+|-", rest[i + 1])))
+            ):
+                redirect = True
+        if (prog in _DELETE_PROGRAMS or prog == "git rm") and not redirect:
+            deleted |= paths_of([w for w in rest if not w.startswith("-")])
+        else:
+            other |= paths_of(words)
+    return deleted - other
 
 
 def _hook_targets(data):
@@ -2379,6 +2466,7 @@ def cmd_hook(args):
             warnings.append(msg + f"\n[overleaf-sync-now] {tool} allowed, but the local copy "
                                   f"may be stale; edits will be blocked until this is fixed.")
 
+    deletes = None  # computed on demand by write guard 2
     for pid, entry in projects.items():
         folder = entry["folder"]
         targets = entry["paths"]
@@ -2486,23 +2574,31 @@ def cmd_hook(args):
                     f"the user if this repeats."
                 )
         # Write guard 2: the target was deleted or renamed on the web.
+        # Deleting the outdated local copy is fine (it cannot re-create the
+        # file on Overleaf); anything else that touches the old path is not.
         gone = web_removed_paths(pid, folder)
+        if gone and deletes is None:
+            deletes = _pure_delete_targets(data)
         for p in targets:
             rel = _rel_posix(p, folder)
             if rel and rel in gone:
+                if _path_key(p) in deletes:
+                    continue
                 new = gone[rel]
                 if new:
                     blocks.append(
                         f"[overleaf-sync-now] {rel} was renamed on Overleaf to {new} (refreshed "
                         f"locally). {tool} blocked: editing the old path would re-create it on "
-                        f"Overleaf through Dropbox. Edit {new} instead."
+                        f"Overleaf through Dropbox. Edit {new} instead. Deleting the outdated "
+                        f"local {rel} is allowed."
                     )
                 else:
                     blocks.append(
                         f"[overleaf-sync-now] {rel} was deleted on Overleaf. {tool} blocked: "
                         f"editing it would re-create it on Overleaf through Dropbox. Ask the "
-                        f"user whether to restore it; if so, they can delete the outdated local "
-                        f"copy or re-create the file on Overleaf first."
+                        f"user. If it should stay deleted, delete the outdated local copy "
+                        f"(deleting it is allowed). If it should come back, the user re-creates "
+                        f"it on Overleaf first; edits are allowed again after the next refresh."
                     )
 
     for w in warnings:

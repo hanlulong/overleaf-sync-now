@@ -83,7 +83,7 @@ Refresh the project that owns `folder` (or current dir) against Overleaf.
 
 Data-safety: by default, `sync` refuses to overwrite a local file modified within the last 30 seconds, and prints `SKIP <path>` to stderr. This protects an in-progress local save that hasn't yet propagated Dropbox → Overleaf. When a protected file *also* had a web-origin change in the pulled zip, `sync` does **not** advance the cached version — it reports `version held at <toV>` and re-offers that web change on the next sync (once the local file ages out of the 30 s window), so the web edit is never silently dropped. Pass `--force` to overwrite local with the Overleaf copy immediately.
 
-When to invoke: when the user says "pull latest from Overleaf", or before editing when no hook is active (see "When to invoke this skill"). Web-side file adds and renames are pulled too; a file deleted or renamed on the web is never deleted locally, but edits to the old path are blocked.
+When to invoke: when the user says "pull latest from Overleaf", or before editing when no hook is active (see "When to invoke this skill"). Web-side file adds and renames are pulled too; a file deleted or renamed on the web is never deleted locally, but edits to the old path are blocked (deleting it is allowed).
 
 ### `status [folder]`
 Reports data dir, cookie validity, linked project, last-sync time, and cached Overleaf version (`toV`). Distinguishes sandbox-blocked network from real auth failures.
@@ -117,8 +117,8 @@ The hook runs before Read / Edit / Write / Bash / PowerShell (Claude Code) and a
 | `... no living ... Overleaf project is named ...` | The folder name doesn't match a project (renamed, trashed, or a different account). Ask the user for the project id from the Overleaf URL, then run `link`. |
 | `Refreshed from Overleaf: newer web edits were just pulled into ...` | The file changed on the web since you last saw it. Re-read it, redo the edit on the new content, and retry. |
 | `Conflict: ... changed on Overleaf while a local save from the last 30 s ...` | Both sides changed the file within seconds. Wait about 30 seconds, re-read it, check that both the web edit and the recent local change are there, then redo the edit. Tell the user if it repeats. |
-| `... was renamed on Overleaf to NEW` | Edit `NEW` instead (it was pulled locally). |
-| `... was deleted on Overleaf` | Ask the user whether the file should come back before touching it. |
+| `... was renamed on Overleaf to NEW` | Edit `NEW` instead (it was pulled locally). You may delete the old local copy. |
+| `... was deleted on Overleaf` | Ask the user. If it should stay deleted, delete the local copy (allowed). If it should come back, the user re-creates it on Overleaf first. |
 
 Network or sandbox failures and HTTP 429 never block; the call proceeds with a warning.
 

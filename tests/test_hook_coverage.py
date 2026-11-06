@@ -514,6 +514,34 @@ class WriteGuardTests(_HookHarness):
         code, err = self.run_hook({"tool_name": "Write", "tool_input": {"file_path": str(folder / "old.tex")}})
         self.assertEqual(code, 0, err)
 
+    def test_deleting_outdated_copy_of_web_removed_path_is_allowed(self):
+        # The block message tells the agent to delete the outdated local
+        # copy; a pure delete cannot re-create the file on Overleaf.
+        folder = self.project("Paper", files=("old.tex", "gone.tex"))
+        cli._atomic_write_text(cli.WEB_REMOVED_FILE, json.dumps(
+            {PID: {"old.tex": None, "gone.tex": "sections/gone.tex"}}))
+        allowed = [
+            ("Bash", "rm old.tex"), ("Bash", "rm -f old.tex gone.tex 2>&1"),
+            ("Bash", "git rm -q old.tex"), ("PowerShell", "Remove-Item old.tex -Force"),
+            ("PowerShell", "del gone.tex"),
+            ("apply_patch", "*** Begin Patch\n*** Delete File: old.tex\n*** End Patch\n"),
+        ]
+        for tool, cmd in allowed:
+            code, err = self.run_hook({"tool_name": tool, "cwd": str(folder), "tool_input": {"command": cmd}})
+            self.assertEqual(code, 0, (tool, cmd, err))
+        blocked = [
+            ("Bash", "mv old.tex other.tex"), ("Bash", "rm old.tex && echo x > old.tex"),
+            ("Bash", "sed -i 's/a/b/' gone.tex; rm gone.tex"), ("PowerShell", "Set-Content old.tex x"),
+            ("apply_patch", "*** Begin Patch\n*** Update File: old.tex\n*** Move to: new.tex\n@@\n-a\n+b\n*** End Patch\n"),
+        ]
+        for tool, cmd in blocked:
+            code, err = self.run_hook({"tool_name": tool, "cwd": str(folder), "tool_input": {"command": cmd}})
+            self.assertEqual(code, 2, (tool, cmd, err))
+        _, err = self.run_hook({"tool_name": "Write", "tool_input": {"file_path": str(folder / "old.tex")}})
+        self.assertIn("deleting it is allowed", err)
+        _, err = self.run_hook({"tool_name": "Write", "tool_input": {"file_path": str(folder / "gone.tex")}})
+        self.assertIn("Deleting the outdated local gone.tex is allowed", err)
+
     # -- the same guards when the Dropbox root is reached through a symlink
     #    (~/Dropbox -> ~/Library/CloudStorage/Dropbox on macOS). The resolver
     #    returns the resolved folder, so the targets must be resolved too.
