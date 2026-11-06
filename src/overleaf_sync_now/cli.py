@@ -35,6 +35,9 @@ Project-folder mapping (since 0.3.0):
      name; auto-resolving via fingerprint match against /updates Dropbox-
      origin pathnames when ambiguous; auto-writing the marker on success).
   3. Else, no link — the hook exits 0 (other tools pass through).
+  A folder under Apps/Overleaf/<name>/ that cannot be resolved (no auth,
+  no matching project, ambiguous name) makes the hook BLOCK writes (exit 2)
+  and warn on reads, instead of silently passing the edit through.
 
 Refresh flow:
   1. GET /project/<id>/updates -- cheap probe (~0.3s, ~30 KB) that returns the
@@ -1059,9 +1062,37 @@ def _extract_files(zip_bytes, folder, paths, protect_recent_seconds=30):
 def find_linked_folder(start, *, verbose=True, allow_disambig_network=True, read_only=False):
     """Resolve `start` (a file or folder path) to (linked_folder, project_id).
 
-    Returns (None, None) when nothing resolves. `verbose` controls whether
-    diagnostic messages are printed to stderr — the hook passes False so
-    repeated keystrokes don't spam.
+    Returns (None, None) when nothing resolves; `resolve_project` returns the
+    same lookup with the reason attached (the hook needs it to fail closed).
+    """
+    res = resolve_project(
+        start, verbose=verbose, allow_disambig_network=allow_disambig_network,
+        read_only=read_only,
+    )
+    if res["reason"] == "ok":
+        return res["folder"], res["project_id"]
+    return None, None
+
+
+def resolve_project(start, *, verbose=True, allow_disambig_network=True, read_only=False):
+    """Resolve `start` (a file or folder path; it need not exist yet) to its
+    Overleaf project. Returns a dict:
+
+      folder       linked folder (Path) or, when unresolved under
+                   Apps/Overleaf/<name>/, that <name> folder; else None
+      project_id   24-hex id on success, else None
+      reason       "ok"         resolved (marker or auto-link)
+                   "unmanaged"  not under a marker or Apps/Overleaf/<name>/
+                   "auth"       under Apps/Overleaf/<name>/, no valid cookies
+                   "none"       ... no living Overleaf project has that name
+                   "ambiguous"  ... several living projects share that name
+                   "network"    ... project list unavailable (network/sandbox)
+      name         the <name> folder component, when applicable
+      candidates   ambiguous candidate records
+      detail       error text for auth/network
+
+    `verbose` controls whether diagnostic messages are printed to stderr — the
+    hook passes False so repeated keystrokes don't spam.
 
     `allow_disambig_network` controls whether ambiguity may be resolved by
     fingerprinting candidates' /updates against local files (Layer 6a, costs
@@ -1072,7 +1103,9 @@ def find_linked_folder(start, *, verbose=True, allow_disambig_network=True, read
     auto-link. Used by `status` so a diagnostic command doesn't surprise
     the user by creating files.
     """
-    p = pathlib.Path(start).resolve()
+    res = {"folder": None, "project_id": None, "reason": "unmanaged",
+           "name": None, "candidates": [], "detail": None}
+    p = pathlib.Path(start).expanduser().resolve()
     if p.is_file():
         p = p.parent
     cur = p
@@ -1083,6 +1116,18 @@ def find_linked_folder(start, *, verbose=True, allow_disambig_network=True, read
                 with open(marker) as f:
                     pid = json.load(f).get("project_id")
             except Exception:
+                pid = None
+            if pid and not (isinstance(pid, str) and _PROJECT_ID_RE.fullmatch(pid)):
+                # Markers round-trip through the Dropbox bridge, so anyone
+                # with access to the Overleaf project can rewrite them. Only a
+                # real 24-hex project id may ever reach a request URL.
+                if verbose:
+                    print(
+                        f"[overleaf-sync-now] WARN: ignoring {marker}: project_id {pid!r} is "
+                        f"not a 24-character hex Overleaf id. Fix it with "
+                        f"`overleaf-sync-now link <project_id> {cur}`.",
+                        file=sys.stderr,
+                    )
                 pid = None
             if pid:
                 # Reject markers placed at the shared `Apps/Overleaf/` level.
@@ -1103,7 +1148,8 @@ def find_linked_folder(start, *, verbose=True, allow_disambig_network=True, read
                         )
                 else:
                     _validate_marker_id_against_index(pid, cur, verbose=verbose)
-                    return cur, pid
+                    res.update(folder=cur, project_id=pid, reason="ok")
+                    return res
         if cur.parent == cur:
             break
         cur = cur.parent
@@ -1113,40 +1159,70 @@ def find_linked_folder(start, *, verbose=True, allow_disambig_network=True, read
             if i + 1 < len(parts):
                 name = parts[i + 1]
                 folder = pathlib.Path(*parts[: i + 2])
+                outcome = {}
                 pid = _autolink_resolve(
                     name, folder, verbose=verbose,
                     allow_disambig_network=allow_disambig_network,
-                    write_marker=not read_only,
+                    write_marker=not read_only, outcome=outcome,
                 )
+                res.update(folder=folder, name=name)
                 if pid:
-                    return folder, pid
-                return None, None
-    return None, None
+                    res.update(project_id=pid, reason="ok")
+                else:
+                    res.update(
+                        reason=outcome.get("reason") or "none",
+                        candidates=outcome.get("candidates") or [],
+                        detail=outcome.get("detail"),
+                    )
+                return res
+    return res
 
 
-def _autolink_resolve(name, folder, *, verbose=True, allow_disambig_network=True, write_marker=True):
+def _autolink_resolve(name, folder, *, verbose=True, allow_disambig_network=True,
+                      write_marker=True, outcome=None):
     """Auto-link `folder` (an .../Apps/Overleaf/<name>/ directory) to a
     project ID. Writes a `.overleaf-project` marker on success so future
     resolution skips the index lookup entirely (unless write_marker=False).
 
-    Returns the project_id on success, None on no-match or unresolved
-    ambiguity. When verbose, prints a clear error to stderr listing the
-    candidates and the exact `link` command to run.
+    Returns the project_id on success, None otherwise. When `outcome` (a dict)
+    is passed, it is filled with "reason" ("auth" / "network" / "none" /
+    "ambiguous"), "candidates" and "detail" so callers can fail closed.
+    When verbose, prints a clear error to stderr listing the candidates and
+    the exact `link` command to run.
     """
-    # Broad except: get_session can raise RuntimeError for auth/network/sandbox
-    # issues, and requests can raise its own exceptions on top. We never want
-    # an auto-link probe to crash the calling command (esp. the hook) — at
-    # worst it should fail closed and let the user run `setup`/`login`.
+    if outcome is None:
+        outcome = {}
+    import requests
+    # Auth failures propagate as a reason, never as a silent None: the hook
+    # must block writes when it cannot tell which project a folder is.
     try:
-        records = _load_projects_records()
-    except Exception as e:
+        records = _load_projects_records(strict=True)
+    except AuthExpired as e:
+        outcome.update(reason="auth", detail=str(e))
+        if verbose:
+            print("[overleaf-sync-now] auto-link: not logged in to Overleaf; cannot look up the project list.", file=sys.stderr)
+        return None
+    except (RuntimeError, requests.exceptions.RequestException) as e:
+        outcome.update(reason="network", detail=str(e))
         if verbose:
             print(f"[overleaf-sync-now] auto-link: could not fetch project list: {e}", file=sys.stderr)
         return None
-    outcome = _resolve_by_name(name, records)
-    status = outcome[0]
+    status_outcome = _resolve_by_name(name, records)
+    if status_outcome[0] == "none" and _index_age_seconds() > 60:
+        # The cached index can be up to 24 h old, so a project created since
+        # then is missing from it. Re-fetch once before declaring "none".
+        try:
+            records = _load_projects_records(force_refresh=True, strict=True)
+            status_outcome = _resolve_by_name(name, records)
+        except AuthExpired as e:
+            outcome.update(reason="auth", detail=str(e))
+            return None
+        except (RuntimeError, requests.exceptions.RequestException):
+            pass
+    status = status_outcome[0]
+    outcome["reason"] = status if status != "ok" else None
     if status == "ok":
-        pid = outcome[1]
+        pid = status_outcome[1]
         if write_marker:
             try:
                 _write_marker(folder, pid, project_name=name, source="auto-link")
@@ -1172,7 +1248,8 @@ def _autolink_resolve(name, folder, *, verbose=True, allow_disambig_network=True
             )
         return None
     if status == "ambiguous":
-        candidates = outcome[1]
+        candidates = status_outcome[1]
+        outcome["candidates"] = candidates
         # Layer 6a: probe /updates for each candidate and pick the unique
         # one whose recent dropbox-origin pathnames map to local files.
         if allow_disambig_network and len(candidates) <= 5:
@@ -1191,6 +1268,7 @@ def _autolink_resolve(name, folder, *, verbose=True, allow_disambig_network=True
                     except OSError as e:
                         if verbose:
                             print(f"[overleaf-sync-now] auto-link: marker write failed ({e}); proceeding without marker", file=sys.stderr)
+                outcome["reason"] = None
                 return pid
         if verbose:
             print(
@@ -1211,6 +1289,7 @@ def _autolink_resolve(name, folder, *, verbose=True, allow_disambig_network=True
                 file=sys.stderr,
             )
         return None
+    outcome["reason"] = "none"
     return None  # unknown status
 
 
@@ -1494,10 +1573,14 @@ def _index_record_by_id(records, project_id):
     return None
 
 
-def _load_projects_records(*, force_refresh=False):
+def _load_projects_records(*, force_refresh=False, strict=False):
     """Return the list of project records, refreshing from Overleaf when
     the cache is missing/expired/wrong-version. May make a network call;
-    use `_load_cached_projects_records` for the no-network variant."""
+    use `_load_cached_projects_records` for the no-network variant.
+
+    strict=True raises RuntimeError when the fetch fails and there is no
+    cached index to fall back on (instead of returning []), so a resolver
+    can tell "project list unavailable" from "no such project"."""
     if not force_refresh and INDEX_FILE.exists():
         try:
             with open(INDEX_FILE) as f:
@@ -1509,7 +1592,16 @@ def _load_projects_records(*, force_refresh=False):
                 return cached.get("projects", []) or []
         except Exception:
             pass
-    return _refresh_projects_records()
+    return _refresh_projects_records(strict=strict)
+
+
+def _index_age_seconds():
+    """Seconds since the cached project index was written (inf if none)."""
+    try:
+        with open(INDEX_FILE) as f:
+            return time.time() - float(json.load(f).get("ts", 0))
+    except Exception:
+        return float("inf")
 
 
 def _load_cached_projects_records():
@@ -1528,11 +1620,12 @@ def _load_cached_projects_records():
     return cached.get("projects", []) or []
 
 
-def _refresh_projects_records():
+def _refresh_projects_records(strict=False):
     """Fetch /project, parse ol-prefetchedProjectsBlob, and persist a v2
     record list with the disambiguating fields (id, name, trashed, archived,
     lastUpdated, ownerId). Falls back to whatever's on disk when Overleaf
-    is unhappy so we don't lose a previously-good index.
+    is unhappy so we don't lose a previously-good index. With strict=True,
+    a failed fetch with nothing on disk raises RuntimeError instead.
     """
     import requests
     s = get_session()
@@ -1546,9 +1639,15 @@ def _refresh_projects_records():
         # Don't poison the cache; fall back to whatever we have.
         if _is_sandbox_block(e):
             raise RuntimeError(_SANDBOX_HINT) from e
-        return _load_cached_projects_records()
+        cached = _load_cached_projects_records()
+        if strict and not cached:
+            raise RuntimeError(f"Network error fetching the Overleaf project list: {e}") from e
+        return cached
     if r.status_code != 200:
-        return _load_cached_projects_records()
+        cached = _load_cached_projects_records()
+        if strict and not cached:
+            raise RuntimeError(f"Overleaf project list returned HTTP {r.status_code}")
+        return cached
     m = re.search(r'name="ol-prefetchedProjectsBlob"[^>]*\scontent="([^"]+)"', r.text)
     records = []
     if m:
@@ -1738,7 +1837,22 @@ def cmd_sync(args):
     force = "--force" in args
     args = [a for a in args if not a.startswith("--")]
     folder = pathlib.Path(args[0] if args else ".")
-    linked, project_id = find_linked_folder(folder)
+    res = resolve_project(folder)
+    linked, project_id = res["folder"], res["project_id"]
+    if res["reason"] == "auth":
+        print(f"ERROR: {res.get('detail')}", file=sys.stderr)
+        sys.exit(1)
+    if res["reason"] == "network":
+        print(f"ERROR: could not fetch the Overleaf project list: {res.get('detail')}", file=sys.stderr)
+        sys.exit(1)
+    if res["reason"] in ("none", "ambiguous"):
+        # resolve_project (verbose) already printed the candidates / hints.
+        print(
+            f"ERROR: could not auto-link {linked} (reason: {res['reason']}). "
+            f"Link it explicitly: `overleaf-sync-now link <project_id> \"{linked}\"`.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     if not project_id:
         print(
             f"ERROR: {folder.resolve()} is not under any Overleaf project.\n"
