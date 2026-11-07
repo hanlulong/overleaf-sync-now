@@ -16,7 +16,7 @@ Subcommands:
                                 a web-origin change has actually happened. --force always
                                 re-extracts. --wait waits (up to 2 min) for files saved
                                 locally in the last 30 s to age out, then pulls them.
-  status [folder]               Show data dir, cookie validity, and link/sync state
+  status [folder] [--quick]     Show data dir, cookie validity, and link/sync state
   projects [--refresh]          List your Overleaf projects (name + ID)
   doctor [folder]               Verbose diagnostic dump of the auth chain
   hook                          PreToolUse hook entrypoint for Claude Code and Codex CLI
@@ -4732,6 +4732,55 @@ COMMANDS = {
     "hook": cmd_hook,
 }
 
+# The options each subcommand accepts. main() rejects anything else that
+# starts with '-' (exit 2) so a typo or an old flag such as `sync --dry-run`
+# fails instead of being ignored. `hook` is left out on purpose: clients call
+# it with fixed args and it ignores extra ones (`hook --quiet` included).
+ALLOWED_FLAGS = {
+    "install": set(),
+    "uninstall": {"--remove-markers"},
+    "setup": set(),
+    "login": set(),
+    "save-cookie": set(),
+    "link": set(),
+    "sync": {"--force", "--wait"},
+    "status": {"--quick"},
+    "doctor": set(),
+    "projects": {"--refresh"},
+}
+
+
+def _subcommand_usage(cmd):
+    """The entry for `cmd` in the module docstring's Subcommands list: the
+    line that starts with `cmd` plus its deeper-indented continuation lines.
+    Falls back to the whole docstring when there is no such entry."""
+    doc = __doc__ or ""
+    lines = doc.splitlines()
+    try:
+        start = lines.index("Subcommands:") + 1
+    except ValueError:
+        return doc
+    block = []
+    for line in lines[start:]:
+        if not line.strip():
+            break
+        if line.startswith("  ") and not line.startswith("   "):
+            if block:
+                break
+            if line.split()[0] == cmd:
+                block.append(line)
+        elif block:
+            block.append(line)
+    return "\n".join(block) if block else doc
+
+
+def _print_subcommand_usage(cmd, file=None):
+    block = _subcommand_usage(cmd)
+    first, _, rest = block.partition("\n")
+    print(f"usage: overleaf-sync-now {first.strip()}", file=file)
+    if rest:
+        print(rest, file=file)
+
 
 def main():
     if len(sys.argv) < 2:
@@ -4749,7 +4798,27 @@ def main():
         print(f"Unknown subcommand: {arg!r}\n", file=sys.stderr)
         print(__doc__)
         sys.exit(2)
-    COMMANDS[arg](sys.argv[2:])
+    rest = sys.argv[2:]
+    if arg != "hook":
+        # `<command> --help` used to run the command (`uninstall --help`
+        # removed the hooks), because only argv[1] was checked for help and
+        # the commands drop unknown '--' options.
+        if "-h" in rest or "--help" in rest:
+            _print_subcommand_usage(arg)
+            print("Run `overleaf-sync-now --help` for all commands.")
+            sys.exit(0)
+        # A bare '-' is a positional only for save-cookie (read from stdin).
+        # A folder whose name starts with '-' can be written as ./-name.
+        bad = [
+            a for a in rest
+            if a.startswith("-") and a not in ALLOWED_FLAGS[arg]
+            and not (a == "-" and arg == "save-cookie")
+        ]
+        if bad:
+            print(f"overleaf-sync-now {arg}: unknown option {bad[0]!r}", file=sys.stderr)
+            _print_subcommand_usage(arg, file=sys.stderr)
+            sys.exit(2)
+    COMMANDS[arg](rest)
 
 
 if __name__ == "__main__":

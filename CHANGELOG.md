@@ -2,6 +2,24 @@
 
 All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://semver.org/).
 
+## 0.5.1 — 2026-11-07
+
+### Fixed
+
+- **`<command> --help` ran the command.** `uninstall --help` removed the
+  hooks and skill copies, `install --help` reinstalled, `setup`, `status`
+  and `doctor --help` read browser cookie stores, and `save-cookie --help`
+  sent "--help" to Overleaf as a cookie. Every subcommand now prints its
+  usage for `-h` / `--help` and exits 0.
+
+### Changed
+
+- **Unknown options exit 2 instead of being ignored.** For example,
+  `sync --dry-run` used to run a real pull. The removed `sync --no-wait`
+  and `--legacy` now fail the same way. Write a folder whose name starts
+  with `-` as `./-name`. The `hook` entry point still ignores its
+  arguments.
+
 ## 0.5.0 — 2026-11-07
 
 Hardening release from a second audit. The tool's one job is to stop an AI

@@ -1,7 +1,7 @@
 ---
 name: overleaf
 description: "Pull the latest Overleaf web edits into a local Dropbox-synced Overleaf folder before an AI agent reads or edits it, so the agent never works on a stale .tex/.bib copy (Overleaf's Dropbox sync lags 10-20 minutes). Use when reading or editing .tex/.bib/.cls/.sty/.bst files under Apps/Overleaf/PROJECT/, when the user asks to pull latest from Overleaf or sync Overleaf, mentions a stale or out-of-date Overleaf or Dropbox copy, or wants to set up Overleaf Dropbox sync for an AI agent. Claude Code and Codex CLI run the refresh automatically through a PreToolUse hook; run `overleaf-sync-now sync` by hand when no hook is active. When auth fails, the user runs `overleaf-sync-now login` in their own terminal; never ask them to paste the Overleaf session cookie into the chat."
-argument-hint: "sync [folder] [--force] [--wait] | status [folder] | link <project_id> [folder] | install | login | setup | doctor"
+argument-hint: "sync [folder] [--force] [--wait] | status [folder] [--quick] | link <project_id> [folder] | install | login | setup | doctor"
 user-invocable: true
 ---
 
@@ -66,7 +66,7 @@ On a first sync (and after a long gap), the whole project is compared. A local f
 | Command | Use |
 |---|---|
 | `overleaf-sync-now sync [folder] [--force] [--wait]` | Refresh now. Skips the download when nothing changed on the web. `--wait` first lets files saved locally in the last 30 s age out, then pulls them. `--force` re-extracts everything and ignores the 30 s guard. |
-| `overleaf-sync-now status [folder]` | Data dir, auth state, linked project, last sync, install health. |
+| `overleaf-sync-now status [folder] [--quick]` | Data dir, auth state, linked project, last sync, install health. `--quick` checks only the saved session. |
 | `overleaf-sync-now link <project_id> [folder]` | Write the marker by hand (non-standard folders, duplicate names). |
 | `overleaf-sync-now projects [--refresh]` | List the user's projects (name, id, flags). |
 | `overleaf-sync-now doctor [folder]` | Full diagnostic of the auth chain plus a live probe. |
