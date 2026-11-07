@@ -4,6 +4,11 @@ All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://sem
 
 ## 0.5.1 — 2026-11-07
 
+Fix release from a review of 0.5.0. **After upgrading, re-run
+`overleaf-sync-now install`** so the installed skill copies get the new
+SKILL.md (`status` shows `Install: NEEDS ATTENTION` until you do). The
+hook entries themselves are unchanged.
+
 ### Fixed
 
 - **`<command> --help` ran the command.** `uninstall --help` removed the
@@ -82,6 +87,11 @@ All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://sem
   no `meta.origin` is pinned as a web edit.
 - The `@v<version>` install pins in README.md and docs/operations.md and
   the `blob/v<version>/` links in SKILL.md must match `__version__`.
+- New tests for per-command `--help` and unknown options (including an
+  end-to-end `uninstall --help` that must leave the hook configs
+  untouched), the subfolder `link` refusal, the hook's wrong-project note,
+  file modes after a refresh, and `status --quick`. Suite: 283 tests (236
+  in 0.5.0).
 
 ### CI
 
