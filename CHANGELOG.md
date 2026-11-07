@@ -21,6 +21,13 @@ All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://sem
   now included in the hook's note whenever a refresh pulls or bootstraps a
   project (a probe that finds no change stays silent, so it does not repeat
   on every tool call). Manual `sync` prints it as before.
+- **A refresh reset a file's permissions to the default** (a read-only or
+  0600 file became 0644). It now keeps them on macOS and Linux. olsync
+  2.0.1 fixed the same class of problem.
+- **The keep-both block no longer suggests a `diff` against a conflict copy
+  that was deleted.** The block itself stays (the local file may still hold
+  edits Overleaf never received); its message now says the saved copy is
+  gone and points to the project's History on overleaf.com.
 
 ### Changed
 

@@ -1455,6 +1455,14 @@ def _extract_files(zip_bytes, folder, paths, protect_recent_seconds=30, *,
             try:
                 with open(tmp, "wb") as f:
                     f.write(new_content)
+                if os.name == "posix" and target.exists():
+                    # The replace would otherwise reset the file's mode to
+                    # the umask default (a 0600 or read-only file became
+                    # 0644). Windows keeps no POSIX mode bits to carry over.
+                    try:
+                        shutil.copymode(str(target), str(tmp))
+                    except OSError:
+                        pass
                 _replace_with_retry(tmp, target)
             except Exception:
                 try:
@@ -3355,6 +3363,18 @@ def _cmd_hook(args, out=None):
             else:
                 hit = dict(conflicts)
             for rel, copy in sorted(hit.items())[:5]:
+                if not pathlib.Path(copy).exists():
+                    # The saved copy was deleted (or the data dir moved):
+                    # the warning still holds, but there is nothing to diff.
+                    blocks.append(
+                        f"[overleaf-sync-now] Conflict: {rel} differs from Overleaf's copy and "
+                        f"was changed locally after Overleaf last changed it, so it may hold "
+                        f"edits Overleaf never received. Overleaf's saved copy ({copy}) is no "
+                        f"longer there. {tool} blocked: compare the file with the project's "
+                        f"History on overleaf.com and ask the user which version to keep. Then "
+                        f"retry the edit; this check does not repeat for this file."
+                    )
+                    continue
                 blocks.append(
                     f"[overleaf-sync-now] Conflict: {rel} differs from Overleaf's copy, and the "
                     f"local file was changed after Overleaf last changed it, so it may hold edits "
