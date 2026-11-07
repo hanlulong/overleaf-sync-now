@@ -481,7 +481,11 @@ class WriteGuardTests(_HookHarness):
         def refresh(pid, folder):
             target = folder / rel
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text("NEWER WEB CONTENT")
+            # Not the length of project()'s "ORIGINAL <name>": the guard
+            # compares (mtime, size), and Windows file times advance in ~16 ms
+            # ticks, so a same-size rewrite this soon after project() can
+            # look unchanged. A real refresh lands long after the last write.
+            target.write_text("NEWER WEB CONTENT for " + rel)
             return "refreshed (wrote 1)"
         self.on_refresh = refresh
 

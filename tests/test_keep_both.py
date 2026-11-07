@@ -89,7 +89,9 @@ class _Env(unittest.TestCase):
     def local(self, rel, text, minutes_ago):
         p = self.folder / rel
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(text)
+        # Bytes as given: on Windows write_text turns "\n" into "\r\n", and
+        # the file would then differ from the zip's copy.
+        p.write_bytes(text.encode("utf-8"))
         t = NOW - minutes_ago * 60
         os.utime(p, (t, t))
         return p
