@@ -60,7 +60,7 @@ dependencies = [
     "playwright>=1.49",
     # patchright is a maintained Playwright fork that patches the CDP
     # Runtime.Enable leak and command-flag fingerprints that Google's
-    # `disallowed_useragent` gate detects. Same `sync_playwright` API, so the
+    # automated-browser sign-in check detects. Same `sync_playwright` API, so the
     # adapter in cli.py just prefers it when present. Vanilla playwright stays
     # as a fallback.
     "patchright>=1.40",

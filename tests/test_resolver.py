@@ -350,6 +350,21 @@ class FilePermsTests(unittest.TestCase):
         mode = target.stat().st_mode & 0o777
         self.assertEqual(mode, 0o600, f"got {oct(mode)}")
 
+    def test_login_channel_file_gets_0o600(self):
+        # 0.5.2: `login` records its browser in browser-profile/ with the
+        # private-write helper, as SECURITY.md promises for <DATA_DIR>.
+        profile = cli.CACHE_DIR / "browser-profile"
+        profile.mkdir()
+        old_umask = os.umask(0o022)
+        try:
+            cli._record_profile_channel(profile, "msedge")
+        finally:
+            os.umask(old_umask)
+        target = profile / cli._PROFILE_CHANNEL_FILE
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(cli._profile_channels(profile)[0], "msedge")
+        self.assertEqual([p.name for p in profile.iterdir()], [cli._PROFILE_CHANNEL_FILE])
+
     def test_outside_data_dir_keeps_default_perms(self):
         # .overleaf-project markers in user folders must remain readable so
         # the local Dropbox client / Overleaf bridge can do whatever they

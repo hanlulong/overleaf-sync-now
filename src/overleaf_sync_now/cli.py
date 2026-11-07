@@ -4201,8 +4201,10 @@ def _launch_profile(p, kind, profile_dir, *, headless, channels):
 
 
 def _record_profile_channel(profile_dir, channel):
+    # The profile lives under <DATA_DIR>, so _atomic_write_text makes this
+    # file 0o600 on POSIX, like every other file the tool writes there.
     try:
-        (pathlib.Path(profile_dir) / _PROFILE_CHANNEL_FILE).write_text(channel or "chromium")
+        _atomic_write_text(pathlib.Path(profile_dir) / _PROFILE_CHANNEL_FILE, channel or "chromium")
     except OSError:
         pass
 
@@ -4338,10 +4340,11 @@ def cmd_login(args):
         last_status = 0
         while time.time() < deadline:
             try:
-                # Detect Google's `disallowed_useragent` block page so we can
-                # surface a targeted recovery message instead of timing out
-                # silently. URLs to watch: `/signin/rejected`,
-                # `/disallowed_useragent`.
+                # Detect Google's sign-in block pages so we can surface a
+                # targeted recovery message instead of timing out silently.
+                # URLs to watch: `/signin/rejected`, and
+                # `/disallowed_useragent` (Google's error for embedded
+                # webviews).
                 try:
                     current_url = (page.url or "").lower()
                     if "signin/rejected" in current_url or "disallowed_useragent" in current_url:

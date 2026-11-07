@@ -46,7 +46,7 @@ When `sync` or the hook reports `No valid Overleaf cookies`, or `setup` / `insta
 
 **Never ask the user to paste the session cookie into the chat, and never put it on a command line.** It grants full access to their Overleaf account, and a chat or an argument ends up in transcripts, logs and shell history. If the user pastes one anyway, don't repeat or use it. If it came from the browser they are using, they sign out of Overleaf there (Clear Sessions under Account Settings > Sessions ends every *other* session); then they run `login`.
 
-If `login` hits Google's *"This browser or app may not be secure"* page, the user sets an Overleaf password at https://www.overleaf.com/user/password/reset and signs in with email and password instead. Don't try to work around Google's check. Background: [docs/authentication.md](https://github.com/hanlulong/overleaf-sync-now/blob/v0.5.1/docs/authentication.md).
+If `login` hits Google's *"This browser or app may not be secure"* page, the user sets an Overleaf password at https://www.overleaf.com/user/password/reset and signs in with email and password instead. Don't try to work around Google's check. Background: [docs/authentication.md](https://github.com/hanlulong/overleaf-sync-now/blob/v0.5.2/docs/authentication.md).
 
 ## No network vs. bad login
 
@@ -75,4 +75,4 @@ On a first sync (and after a long gap), the whole project is compared. A local f
 | `overleaf-sync-now install` / `uninstall` | Set up / remove the skill and hooks. `uninstall` lists what it leaves behind. |
 | `overleaf-sync-now login` / `setup` / `save-cookie` | Auth, run by the **user** in their own terminal (see above). |
 
-`hook` is the hook entry point; never run it by hand. More: [README](https://github.com/hanlulong/overleaf-sync-now#readme), [troubleshooting](https://github.com/hanlulong/overleaf-sync-now/blob/v0.5.1/docs/troubleshooting.md).
+`hook` is the hook entry point; never run it by hand. More: [README](https://github.com/hanlulong/overleaf-sync-now#readme), [troubleshooting](https://github.com/hanlulong/overleaf-sync-now/blob/v0.5.2/docs/troubleshooting.md).
