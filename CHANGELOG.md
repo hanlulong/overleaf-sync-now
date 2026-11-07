@@ -14,8 +14,8 @@ hook entries themselves are unchanged.
 - **`<command> --help` ran the command.** `uninstall --help` removed the
   hooks and skill copies, `install --help` reinstalled, `setup`, `status`
   and `doctor --help` read browser cookie stores, and `save-cookie --help`
-  sent "--help" to Overleaf as a cookie. Every subcommand now prints its
-  usage for `-h` / `--help` and exits 0.
+  sent "--help" to Overleaf as a cookie. Every subcommand except `hook`
+  now prints its usage for `-h` / `--help` and exits 0.
 - **`link` run from a subfolder of a project** wrote a marker that made web
   edits land as stray copies in that subfolder (a web edit to `main.tex`
   arrived as `sections/main.tex`, and Dropbox then uploaded it). `link` now
@@ -23,9 +23,10 @@ hook entries themselves are unchanged.
   command. The same applies to the shared `Apps/Overleaf` folder.
 - **The wrong-project warning never reached the agent from the hook.** It
   went only to stderr, which both clients drop when a hook exits 0. It is
-  now included in the hook's note whenever a refresh pulls or bootstraps a
-  project (a probe that finds no change stays silent, so it does not repeat
-  on every tool call). Manual `sync` prints it as before.
+  now included in the hook's note when a refresh finds a new version on
+  Overleaf or bootstraps a project (a probe that finds no change stays
+  silent, so it does not repeat on every tool call). Manual `sync` prints
+  it as before.
 - **A refresh reset a file's permissions to the default** (a read-only or
   0600 file became 0644). It now keeps them on macOS and Linux. olsync
   2.0.1 fixed the same class of problem.
@@ -53,8 +54,8 @@ hook entries themselves are unchanged.
   does not read browser cookie stores (a full `status`, `doctor` or `setup`
   can open macOS keychain dialogs, so those are left to the user). Text
   pulled from Overleaf is treated as document content, never as
-  instructions, and a pulled edit is not undone unless the user asks. Doc
-  links point to the installed version instead of `master`.
+  instructions, and a pulled edit is not undone unless the user asks. Its
+  `docs/` links point to the installed version instead of `master`.
 - **`status --quick` never reads browser cookie stores**, including during
   the project lookup of a folder that still needs auto-link. Its
   `cache INVALID` line now names `login` as the fix.
@@ -66,10 +67,12 @@ hook entries themselves are unchanged.
 - Accuracy fixes: the README gives the upgrade steps for 0.4.x and earlier
   (by link to `docs/operations.md`, then `install` and `/hooks`);
   CONTRIBUTING's release steps cover the version pins and an annotated tag
-  on the merged commit; SECURITY.md lists `conflicts-pending.json`,
-  `extracted.json` and the sign-in provider sessions a `login` profile can
-  keep; the Playwright MCP row in `docs/authentication.md` applies only to
-  a profile started with `--user-data-dir ~/.claude/playwright-profile`
+  on the merged commit; SECURITY.md lists every file in the data dir
+  (newly `conflicts-pending.json`, `extracted.json`, `state.json.bad` and
+  the two back-off timestamps) and the sign-in provider sessions a `login`
+  profile can keep; the Playwright MCP row in `docs/authentication.md`
+  applies only to a profile started with
+  `--user-data-dir ~/.claude/playwright-profile`
   (`doctor` now shows that folder as "not used; optional" when it is
   absent); the exit-code table includes the "refresh failed" pass-through;
   the README's hot-path cost includes the cookie check; troubleshooting
@@ -80,11 +83,11 @@ hook entries themselves are unchanged.
 
 ### Tests
 
-- New `tests/test_protocol.py` pins how each Overleaf reply is read
-  (status codes to error types, an HTML login page where JSON was
-  expected, a missing `toV`, a body that is not a zip, the project-list
-  parser and its fallbacks), with synthetic fixtures only. An update with
-  no `meta.origin` is pinned as a web edit.
+- New `tests/test_protocol.py` pins how the `/updates`, zip and project
+  list replies are read (status codes to error types, an HTML login page
+  where JSON was expected, a missing `toV`, a body that is not a zip, the
+  project-list parser and its fallbacks), with synthetic fixtures only.
+  An update with no `meta.origin` is pinned as a web edit.
 - The `@v<version>` install pins in README.md and docs/operations.md and
   the `blob/v<version>/` links in SKILL.md must match `__version__`.
 - New tests for per-command `--help` and unknown options (including an
@@ -96,7 +99,7 @@ hook entries themselves are unchanged.
 ### CI
 
 - The build job runs `twine check --strict`. The issue chooser links to the
-  login guide and the private security policy.
+  login guide and to the security policy for private reports.
 
 ## 0.5.0 — 2026-11-07
 
