@@ -173,6 +173,7 @@ The Overleaf-AI integration space is crowded. Each of these solves a different s
 | [`overleaf-sync` (olsync)](https://github.com/moritzgloeckl/overleaf-sync) | ❌ replaces it | ❌ manual `olsync download` | partial — same as above |
 | [Overleaf Git integration](https://www.overleaf.com/learn/how-to/Using_Git_and_GitHub) (Premium) | ❌ replaces it | ❌ manual `git pull` | partial — same as above |
 | [Overleaf Workshop (VS Code)](https://github.com/overleaf-workshop/Overleaf-Workshop) | ❌ no Dropbox | ❌ different model (live WebSocket) | n/a — you're not editing local files |
+| [Sundial](https://sundial.md) | ❌ no Dropbox needed (different model) | ✅ continuous op-level sync, not per-tool-call | ✅ concurrent web + agent edits merge instead of last-writer-wins |
 | MCP servers ([OverleafMCP](https://github.com/mjyoo2/OverleafMCP), [overleaf-claude-mcp](https://github.com/Junfei-Z/overleaf-claude-mcp), [Overleaf-mcp](https://github.com/GhoshSrinjoy/Overleaf-mcp), [overleafMCP-rw](https://github.com/hiufungleung/overleafMCP-rw)) | ❌ go via Git | ❌ Claude calls a tool | n/a — different model |
 | [`pyoverleaf`](https://github.com/jkulhanek/pyoverleaf) | n/a | n/a | a library, not a product |
 
