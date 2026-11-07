@@ -2,7 +2,7 @@
 
 All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://semver.org/).
 
-## 0.5.0 — 2026-11-06
+## 0.5.0 — 2026-11-07
 
 Hardening release from a second audit. The tool's one job is to stop an AI
 agent from editing a stale local copy, and the audit found several paths
