@@ -1780,6 +1780,20 @@ def _autolink_resolve(name, folder, *, verbose=True, allow_disambig_network=True
                     print(f"[overleaf-sync-now] auto-link: marker write failed ({e}); proceeding without marker", file=sys.stderr)
         return pid
     if status == "none":
+        truncated = _index_truncation()
+        if truncated:
+            outcome["detail"] = (
+                f"Overleaf listed only {truncated['listed']} of your {truncated['total']} "
+                f"projects, so this folder could not be matched by name"
+            )
+            if verbose:
+                print(
+                    f"[overleaf-sync-now] auto-link: {outcome['detail']}.\n"
+                    f"  Ask the user for the project id from the Overleaf URL and run "
+                    f"`overleaf-sync-now link <project_id> \"{folder}\"`.",
+                    file=sys.stderr,
+                )
+            return None
         if verbose:
             print(
                 f"[overleaf-sync-now] auto-link: no Overleaf project named {name!r}.\n"
@@ -2220,10 +2234,19 @@ def _refresh_projects_records(strict=False, require_fresh=False):
         return cached
     m = re.search(r'name="ol-prefetchedProjectsBlob"[^>]*\scontent="([^"]+)"', r.text)
     records = []
+    truncated = None
     if m:
         import html
         try:
             blob = json.loads(html.unescape(m.group(1)))
+            # Overleaf's dashboard blob is one page of a paged API (page size
+            # 20 in ProjectListController; pagination is still a TODO there
+            # and it returns everything today). Record it if that changes,
+            # so an unmatched name is reported as such, not as "no project".
+            listed = len(blob.get("projects", []))
+            total = blob.get("totalSize")
+            if isinstance(total, int) and not isinstance(total, bool) and total > listed:
+                truncated = {"listed": listed, "total": total}
             for proj in blob.get("projects", []):
                 pid = proj.get("id")
                 name = proj.get("name")
@@ -2260,11 +2283,27 @@ def _refresh_projects_records(strict=False, require_fresh=False):
     if not records:
         # Don't overwrite a previously-good cached index with an empty one.
         return _load_cached_projects_records()
-    _atomic_write_text(INDEX_FILE, json.dumps(
-        {"version": INDEX_FORMAT_VERSION, "ts": time.time(), "projects": records},
-        indent=2,
-    ))
+    index = {"version": INDEX_FORMAT_VERSION, "ts": time.time(), "projects": records}
+    if truncated:
+        index["truncated"] = truncated
+    _atomic_write_text(INDEX_FILE, json.dumps(index, indent=2))
     return records
+
+
+def _index_truncation():
+    """{"listed": N, "total": M} when the cached project index holds only
+    part of the user's projects (Overleaf paged the list), else None."""
+    try:
+        with open(INDEX_FILE) as f:
+            cached = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(cached, dict) or cached.get("version") != INDEX_FORMAT_VERSION:
+        return None
+    t = cached.get("truncated")
+    if isinstance(t, dict) and isinstance(t.get("listed"), int) and isinstance(t.get("total"), int):
+        return t
+    return None
 
 
 # Back-compat helper kept for any external callers / tests that imported the
@@ -2585,6 +2624,9 @@ def cmd_projects(args):
         f"({n_trashed} trashed, {n_archived} archived). Cached at {INDEX_FILE}."
     )
     print("Flags: T=trashed, A=archived, DUP=name shared with another project.")
+    truncated = _index_truncation()
+    if truncated:
+        print(f"Note: Overleaf listed only {truncated['listed']} of {truncated['total']} projects.")
 
 
 def cmd_status(args):
@@ -3109,6 +3151,14 @@ def _hook_unresolved_message(res, tool):
         lines.append(f"    overleaf-sync-now link <project_id> \"{folder}\"")
         lines.append("  Do not pick a project id on the user's behalf.")
         return "\n".join(lines)
+    if reason == "none" and res.get("detail"):
+        # The project list was cut short (see _index_truncation).
+        return (
+            f"{head}: {res['detail']}.\n"
+            f"  Ask the user for the project id from the Overleaf URL (the 24-character\n"
+            f"  hex in https://www.overleaf.com/project/<id>) and run:\n"
+            f"    overleaf-sync-now link <project_id> \"{folder}\""
+        )
     return (
         f"{head}: no living (non-trashed, non-archived) Overleaf project is named "
         f"{res.get('name')!r}.\n"

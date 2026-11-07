@@ -86,6 +86,14 @@ Overleaf's `/project/{id}/...` endpoints aren't publicly documented. The two use
 
 `/download/zip` does **not** support HTTP `Range` requests (tested: returns `200` with the full body regardless of the `Range` header; `Transfer-Encoding: chunked`, no `Accept-Ranges`). So the zip is always full-project. The version-match probe is what stops us from downloading unless something genuinely changed.
 
+### Overleaf sources this relies on
+
+Checked against [overleaf/overleaf at `e039ad2`](https://github.com/overleaf/overleaf/tree/e039ad26c5bf5422eb57b89fc7e57c75055e631d) (2026-09-17). These are links only; no Overleaf code is copied (Overleaf is AGPL-3.0). If Overleaf changes one of these, `tests/test_protocol.py` pins what the client expects.
+
+- [`SummarizedUpdatesManager.js`](https://github.com/overleaf/overleaf/blob/e039ad26c5bf5422eb57b89fc7e57c75055e631d/services/project-history/app/js/SummarizedUpdatesManager.js#L249-L274) (project-history): builds the `/updates` history and never merges updates of different `meta.origin`, so a Dropbox round-trip stays its own entry with `origin.kind == "dropbox"`.
+- [`UpdateMerger.mjs`](https://github.com/overleaf/overleaf/blob/e039ad26c5bf5422eb57b89fc7e57c75055e631d/services/web/app/src/Features/ThirdPartyDataStore/UpdateMerger.mjs) (third-party data store): applies a file that arrives from Dropbox to the project as a doc or a binary file.
+- [`ProjectListController.mjs`](https://github.com/overleaf/overleaf/blob/e039ad26c5bf5422eb57b89fc7e57c75055e631d/services/web/app/src/Features/Project/ProjectListController.mjs#L732-L764) (web): renders the dashboard's `ol-prefetchedProjectsBlob` as `{totalSize, projects}` with a default page size of 20; [pagination is still a TODO](https://github.com/overleaf/overleaf/blob/e039ad26c5bf5422eb57b89fc7e57c75055e631d/services/web/app/src/Features/Project/ProjectListController.mjs#L860), so every project is listed today. If that changes, `projects.json` records `"truncated"` and an unmatched folder says so instead of "no project named X".
+
 ## End-to-end latency budget
 
 | Path | Cost | When it's hit |

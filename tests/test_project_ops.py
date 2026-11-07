@@ -198,6 +198,28 @@ class ProjectOpsRefreshTests(unittest.TestCase):
         self.assertEqual(self.dl_calls, 0)
         self.assertEqual(cli.web_removed_paths(self.pid, self.folder), {})
 
+    def test_update_without_origin_is_treated_as_web(self):
+        # Only origin.kind == "dropbox" marks our own round-trip. An update
+        # with no meta.origin (or no meta at all) is pulled like a web edit.
+        for upd in ({"toV": 11, "meta": {}, "pathnames": ["main.tex"],
+                     "project_ops": [{"add": {"pathname": "new.tex"}, "atV": 10}]},
+                    {"toV": 11, "pathnames": ["main.tex"],
+                     "project_ops": [{"add": {"pathname": "new.tex"}, "atV": 10}]}):
+            with self.subTest(upd=upd):
+                self._seed(10)
+                self._old_file("main.tex", "OLD")
+                self.dl_calls = 0
+                self._updates([upd, {"toV": 10}])
+                self.zip_files = {"main.tex": "WEB", "new.tex": "NEW", "other.tex": "X"}
+                status = cli.refresh_project(self.pid, self.folder)
+                self.assertNotIn("dropbox_echo", status)
+                self.assertEqual(self.dl_calls, 1)
+                self.assertEqual((self.folder / "main.tex").read_text(), "WEB")
+                self.assertEqual((self.folder / "new.tex").read_text(), "NEW")
+                self.assertFalse((self.folder / "other.tex").exists())
+                self.assertEqual(self._cached(), 11)
+                (self.folder / "new.tex").unlink()
+
     # ---- ordering across updates ----
     def test_remove_then_readd_ends_present(self):
         # Newest-first page: the re-add (toV 13) is newer than the remove.

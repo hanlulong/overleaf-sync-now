@@ -39,6 +39,24 @@ All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://sem
 - **An existing marker below `Apps/Overleaf/<name>/` is now ignored**, and
   the project folder is used. `sync`, `status` and `doctor` print a warning
   that names the marker to delete.
+- **If Overleaf ever lists projects in pages**, an unmatched folder name now
+  says so ("Overleaf listed only N of your M projects") instead of "no
+  project named X", and `projects` prints a note. Writes to that folder
+  stay blocked until it is linked. Today Overleaf lists every project, so
+  nothing changes yet.
+
+### Docs
+
+- `docs/architecture.md` lists the Overleaf source files the client relies
+  on, pinned to an upstream commit (links only).
+
+### Tests
+
+- New `tests/test_protocol.py` pins how each Overleaf reply is read
+  (status codes to error types, an HTML login page where JSON was
+  expected, a missing `toV`, a body that is not a zip, the project-list
+  parser and its fallbacks), with synthetic fixtures only. An update with
+  no `meta.origin` is pinned as a web edit.
 
 ## 0.5.0 — 2026-11-07
 
