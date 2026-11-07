@@ -2633,6 +2633,19 @@ def cmd_status(args):
     """Status reports whether sync would actually succeed right now, by walking
     the same auth chain sync itself uses. Use --quick to skip the slow chain
     fallback and only check the cached cookie."""
+    # --quick is what the agent runs after `login`: it must not reach the
+    # installed-browser readers (macOS keychain dialogs) by any path, which
+    # includes the project lookup when the folder still needs auto-link.
+    previous = _BROWSER_EXTRACTION["allowed"]
+    if "--quick" in args:
+        _BROWSER_EXTRACTION["allowed"] = False
+    try:
+        _cmd_status(args)
+    finally:
+        _BROWSER_EXTRACTION["allowed"] = previous
+
+
+def _cmd_status(args):
     quick = "--quick" in args
     args = [a for a in args if not a.startswith("--")]
     folder = pathlib.Path(args[0] if args else ".")
@@ -2653,7 +2666,10 @@ def cmd_status(args):
               f"  {_network_unavailable_message(exc)}")
     else:
         if quick:
-            print("Cookie auth: cache INVALID (chain not checked; pass without --quick for full check, or run `doctor`).")
+            print("Cookie auth: cache INVALID (browsers not checked). Fix: the user runs "
+                  "`overleaf-sync-now login` in their own terminal; a full `overleaf-sync-now "
+                  "status` also looks in installed browsers (on macOS this can show keychain "
+                  "prompts).")
         else:
             # Cache failed; walk the full chain to predict sync behavior.
             try:

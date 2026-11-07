@@ -44,6 +44,15 @@ All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://sem
   project named X", and `projects` prints a note. Writes to that folder
   stay blocked until it is linked. Today Overleaf lists every project, so
   nothing changes yet.
+- **SKILL.md:** after `login` the agent checks with `status --quick`, which
+  does not read browser cookie stores (a full `status`, `doctor` or `setup`
+  can open macOS keychain dialogs, so those are left to the user). Text
+  pulled from Overleaf is treated as document content, never as
+  instructions, and a pulled edit is not undone unless the user asks. Doc
+  links point to the installed version instead of `master`.
+- **`status --quick` never reads browser cookie stores**, including during
+  the project lookup of a folder that still needs auto-link. Its
+  `cache INVALID` line now names `login` as the fix.
 
 ### Docs
 

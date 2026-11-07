@@ -159,6 +159,59 @@ class UsageDocDriftTests(unittest.TestCase):
                 self.assertEqual(documented, cli.ALLOWED_FLAGS[name])
 
 
+class StatusQuickTests(unittest.TestCase):
+    """`status --quick` is what the agent runs after `login` (SKILL.md). It
+    checks only the saved session: no installed-browser reader may run, not
+    even through the project lookup of a folder that still needs auto-link."""
+
+    NAMES = ("CACHE_DIR", "CACHE_FILE", "STATE_FILE", "VERSIONS_FILE", "INDEX_FILE",
+             "WEB_REMOVED_FILE", "_VALIDATION_FILE", "_try_login_profile", "_try_rookiepy",
+             "_try_browser_cookie3", "_try_playwright_profile", "_print_install_health")
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        base = pathlib.Path(self._tmp.name).resolve()
+        self._orig = {n: getattr(cli, n) for n in self.NAMES}
+        data = base / "data"
+        cli.CACHE_DIR = data
+        cli.CACHE_FILE = data / "cookies.json"
+        cli.STATE_FILE = data / "state.json"
+        cli.VERSIONS_FILE = data / "versions.json"
+        cli.INDEX_FILE = data / "projects.json"
+        cli.WEB_REMOVED_FILE = data / "web-removed.json"
+        cli._VALIDATION_FILE = data / ".validated-at"
+        self.calls = []
+        for name in ("_try_rookiepy", "_try_browser_cookie3", "_try_playwright_profile"):
+            setattr(cli, name, lambda _n=name: self.calls.append(_n))
+        cli._try_login_profile = lambda: None
+        cli._print_install_health = lambda: None
+        self.folder = base / "Dropbox" / "Apps" / "Overleaf" / "Not Linked Yet"
+        self.folder.mkdir(parents=True)
+
+    def tearDown(self):
+        for n, v in self._orig.items():
+            setattr(cli, n, v)
+        self._tmp.cleanup()
+
+    def _status(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            cli.cmd_status([*args, str(self.folder)])
+        return out.getvalue()
+
+    def test_quick_reads_no_browser_store(self):
+        out = self._status("--quick")
+        self.assertEqual(self.calls, [])
+        self.assertIn("Cookie auth: cache INVALID (browsers not checked)", out)
+        self.assertIn("overleaf-sync-now login", out)
+        self.assertTrue(cli._BROWSER_EXTRACTION["allowed"])  # restored
+
+    def test_full_status_still_walks_the_browsers(self):
+        out = self._status()
+        self.assertIn("_try_rookiepy", self.calls)
+        self.assertIn("Cookie auth: INVALID", out)
+
+
 class UninstallHelpEndToEndTests(unittest.TestCase):
     """`uninstall --help` in a real process must leave the hook configs alone."""
 
