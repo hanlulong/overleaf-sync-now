@@ -4,19 +4,28 @@ How `overleaf-sync-now` is wired together, and where it puts things.
 
 ## Files written by `install`
 
-Everything is **user-global**. Nothing is written into your project directory.
+Everything `install` writes is **user-global**. The only file the tool ever writes into a project folder is the `.overleaf-project` marker that auto-link drops there (see [Auto-link](#auto-link)); because it sits in the Dropbox folder, it also syncs into the Overleaf project.
 
 | Path | Purpose |
 |---|---|
 | `~/.local/bin/overleaf-sync-now` | CLI binary (on PATH) |
 | `~/.claude/skills/overleaf/SKILL.md` | Skill description for Claude Code |
-| `~/.codex/skills/overleaf/SKILL.md` | Skill description for Codex CLI |
-| `~/.claude/settings.json` | PreToolUse hook entry (Claude Code only) |
+| `~/.agents/skills/overleaf/SKILL.md` | Skill description for Codex CLI (user skills folder; since 0.5.0) |
+| `~/.claude/settings.json` | Claude Code PreToolUse hook entry (written through a symlink; the previous content is kept once as `settings.json.bak-overleaf-sync-now`). `$CLAUDE_CONFIG_DIR` replaces `~/.claude` when set. |
+| `~/.codex/hooks.json` | Codex CLI PreToolUse hook entry (since 0.5.0; the previous file is backed up as `hooks.json.bak-<timestamp>` when install changes it). `$CODEX_HOME` replaces `~/.codex` when set. |
 | `<DATA_DIR>/cookies.json` | Cached `overleaf_session2` cookie (POSIX `0o600`) |
 | `<DATA_DIR>/state.json` | Per-project debounce timestamps (POSIX `0o600`) |
 | `<DATA_DIR>/versions.json` | Per-project last-synced Overleaf `toV` (since 0.1.0; POSIX `0o600`) |
 | `<DATA_DIR>/projects.json` | 24-hour-cached project records (id, name, trashed, archived, lastUpdated, ownerId — since 0.3.0; POSIX `0o600`) |
-| `<DATA_DIR>/browser-profile/` | Persistent Playwright profile created by `login` (Chromium with the Overleaf session) |
+| `<DATA_DIR>/web-removed.json` | Paths deleted or renamed on overleaf.com whose local copy still exists (since 0.5.0; POSIX `0o600`) |
+| `<DATA_DIR>/conflicts-pending.json` | Kept newer local files whose next AI write is blocked once, with the path of Overleaf's saved copy (since 0.5.0; POSIX `0o600`) |
+| `<DATA_DIR>/extracted.json` | Size and mtime of the files the tool itself last wrote, so they don't count as local saves (since 0.5.0; POSIX `0o600`) |
+| `<DATA_DIR>/browser-profile/` | Persistent browser profile created by `login` (holds the Overleaf session; opened with the installed Chrome or Edge when available) |
+| `<DATA_DIR>/backups/<project>/<timestamp>/` | Previous local version of every file a refresh overwrote (since 0.5.0; pruned after 30 days) |
+| `<DATA_DIR>/conflicts/<project>/<timestamp>/` | Overleaf's version of a file kept locally because it had newer local edits (since 0.5.0; never pruned) |
+| `<DATA_DIR>/.browser-cookies-failed-at` | One-hour back-off after the installed-browser cookie readers failed (since 0.5.0) |
+
+Versions up to 0.4.x copied the skill to `~/.codex/skills/overleaf/`. Codex documents `~/.agents/skills` as the user skills location, and a second copy makes it list the skill twice, so `install` removes that copy (only if it is ours). `install` and `uninstall` never delete a skill folder whose `SKILL.md` doesn't mention `overleaf-sync-now`.
 
 `<DATA_DIR>` resolution order: (1) `$OVERLEAF_SYNC_DATA_DIR` if set; (2) `~/.claude/overleaf-data/` if it exists (legacy installs); (3) `~/.overleaf-sync/` (default for new installs).
 
@@ -24,27 +33,38 @@ Everything is **user-global**. Nothing is written into your project directory.
 
 ## The PreToolUse hook
 
-The hook intercepts every `Read` / `Edit` / `Write` / `MultiEdit` of `.tex`, `.bib`, `.cls`, `.sty`, and `.bst` files. Other tools and other file types pass through untouched. (Read was added in 0.1.0 — the cheap `/updates` probe makes refresh-on-read affordable, and it keeps Claude's reasoning grounded in current content.)
+The hook runs before tool calls that touch `.tex`, `.bib`, `.cls`, `.sty`, or `.bst` files. Other tools and other file types pass through untouched.
+
+| Client | Tools (matcher) | Where the paths come from |
+|---|---|---|
+| Claude Code (`~/.claude/settings.json`) | `Read\|Edit\|Write\|Bash\|PowerShell` | `tool_input.file_path`; for Bash/PowerShell, LaTeX paths found in `tool_input.command` |
+| Codex CLI (`~/.codex/hooks.json`) | `apply_patch\|Bash` | the `*** Update File:` / `*** Add File:` / `*** Delete File:` / `*** Move to:` lines of the patch in `tool_input.command`; for Bash, LaTeX paths in the command |
+
+The Claude Code entry is written in exec form (`"command": "<abs path>", "args": ["hook"]`), so no shell parses it; shell form (`"<path>" hook`) is a parse error under PowerShell, which Claude Code uses on Windows without Git Bash. It sets `"timeout": 180` so a first-use bootstrap pull isn't killed (a longer timeout you set yourself is kept). The Codex entry is a shell command string (`command`, plus a `commandWindows` variant), which is the only form Codex supports; Codex runs it only after you trust it with `/hooks`.
+
+Shell commands are classified as reads when every command in them is a known read-only program (`cat`, `grep`, `sed -n`, `git diff`, `latexmk`, …) and nothing is redirected into a LaTeX file. Anything else counts as a write. Relative paths resolve against the payload `cwd` and any `cd <dir>` in the command; `*.tex`-style globs are expanded; and a command run inside a project folder that mentions a LaTeX extension counts as touching that project.
 
 | Step | What happens |
 |---|---|
-| **1. Tool + path filter** | Reject if `tool_name` isn't `Read`/`Edit`/`Write`/`MultiEdit`, or path doesn't end in a LaTeX extension. Exit 0. |
-| **2. Auto-link** | Walk the path upward to find `…/Apps/Overleaf/<name>/`. Map `<name>` → project ID via the cached project index (refreshed every 24 h). A `.overleaf-project` marker file in any folder overrides the auto-link. |
-| **3. Debounce** | If we've synced this project within the last 30 s, exit 0 without contacting Overleaf. |
-| **4. Cookie resolve** | Use the cached cookie if valid. Otherwise walk the [auth chain](authentication.md). |
-| **5. Version-match probe** | `GET /project/<id>/updates` (~30 KB, ~0.3 s). Compare latest `toV` to the cached `toV` in `versions.json`. |
-| **6. Decide** | • Latest `toV` matches cache → no-op. • All new updates are `origin.kind == "dropbox"` (echoes of our own local saves round-tripping) → no-op, advance cache. • A web-origin update exists → continue. |
-| **7. Conditional zip pull** | `GET /project/<id>/download/zip`, hash-compare each entry against local, write only the files whose contents actually differ. |
-| **8. Recent-mtime guard** | Files modified locally in the last 30 s are skipped (with a `SKIP <path>` warning to stderr) — protects an in-progress local save not yet propagated Dropbox → Overleaf. `--force` disables. |
+| **1. Tool + path filter** | Not one of the tools above, or no LaTeX path → exit 0. |
+| **2. Resolve** | Walk each path upward to a `.overleaf-project` marker or `…/Apps/Overleaf/<name>/` (a folder listed in `$OVERLEAF_SYNC_IGNORE` is opted out; a `.overleaf-sync-ignore` file opts a folder out only when no marker links it and its name matches no project, because that file syncs to Overleaf). A project folder that does not exist yet is left alone (no marker is written). Map `<name>` → project ID via the cached project index (refreshed every 24 h, and once more before concluding that no project has that name or that a numbered folder like `Problem Set 5` has no exact match). |
+| **3. Fail closed** | Under `Apps/Overleaf/<name>/` but unresolved (not logged in, no living project with that name, several, a numbered duplicate, or an unexpected error while resolving) → **writes exit 2** with the reason and the exact fix; reads get a warning and proceed. Network/sandbox failures pass through, including a failed re-fetch of a stale project list. |
+| **4. Debounce** | Reads: skip the probe if this project was probed in the last 30 s. Writes: skip only within 3 s. |
+| **5. Cookie resolve** | Use the cached cookie if it was validated in the last 60 s; otherwise re-validate. Overleaf refused it → try the `login` profile (the hook never reads installed browsers or the keychain). No answer from Overleaf (offline, sandbox) → `NetworkUnavailable`: the call proceeds with a note, never an auth block. |
+| **6. Version-match probe** | `GET /project/<id>/updates` (~30 KB, ~0.3 s). Compare latest `toV` to the cached `toV` in `versions.json`. |
+| **7. Decide** | • Latest `toV` matches cache → no-op. • All new updates are `origin.kind == "dropbox"` (echoes of our own local saves round-tripping) → no-op, advance cache. • A web-origin update exists (text edits, or file adds/renames/deletes in `project_ops`) → continue. |
+| **8. Conditional zip pull** | `GET /project/<id>/download/zip`, hash-compare each entry against local, write only the files whose contents actually differ (including files added or renamed on the web), after copying the previous local bytes to `backups/`. On a bootstrap or full pull, a local file changed after Overleaf's last change to it (per `/updates` `meta.end_ts`) is kept and Overleaf's copy goes to `conflicts/`. Web-side deletes and rename sources go to `web-removed.json`; local files are never deleted. A local file that can't be read (so can't be backed up) is skipped. `.overleaf-project` and `.overleaf-sync-ignore` entries in the zip are never extracted. The hook reports a one-line summary of what was written, kept or skipped (exit codes below). |
+| **9. Recent-mtime guard** | Files modified locally in the last 30 s are skipped (with a `SKIP <path>` warning to stderr) — protects an in-progress local save not yet propagated Dropbox → Overleaf. A file still carrying the size and mtime of the tool's own last write is not a local save. `sync --wait` waits for the window to pass, `--force` disables it. |
+| **10. Write guards** | For writes only: if step 8 just rewrote a file this call is about to change → exit 2, "re-read first". If step 9 had to skip a target that also changed on the web → exit 2, "conflict" with the exact steps (`sync --wait`). If a pull (this call's or an earlier one, such as a Read's) kept a newer local target → exit 2 once, "compare with Overleaf's copy and ask the user" (pending ones are in `<DATA_DIR>/conflicts-pending.json`). Any block clears the project's write debounce, so the retry probes again. If the target was deleted or renamed on the web and the local copy still exists → exit 2, unless the call only deletes it (`rm`, `git rm`, `Remove-Item`, `del`, `*** Delete File:`). |
 
 ## Exit codes (hook)
 
 | Code | Meaning | Effect on the AI agent |
 |---|---|---|
-| `0` | Refresh succeeded, nothing changed, debounced, or transient error | Tool call proceeds. |
-| `2` | Auth chain exhausted | Tool call is **blocked**. The agent surfaces "re-auth required" to the user. |
+| `0` | Refresh succeeded, nothing changed, debounced, a read, or Overleaf could not be reached (offline, 429, 5xx, a sandbox without network access) | Tool call proceeds. When there is something to report (the refresh summary, a kept file, an offline note), the hook prints one JSON object on stdout: `systemMessage` (shown to the user) and `hookSpecificOutput.additionalContext` (added to the model's context). Both clients document these fields; Claude Code never shows exit-0 stderr to the model, and Codex ignores plain stdout. The same text also goes to stderr (Claude Code's debug log). |
+| `2` | A write that must not proceed: auth missing, folder unresolved (no project with that name, several, or a numbered duplicate such as `Paper (1)`), project resolution crashed, target refreshed under the agent, the 30 s protect-window conflict, a kept newer local file (once), or target deleted/renamed on the web | Tool call is **blocked**; Claude Code and Codex show the stderr reason to the model, which can fix it (re-read, `link`, ask the user to `login`). |
 
-The choice to exit 0 on transient errors (network blip, 429, 500, sandbox-blocked socket) is deliberate: blocking your AI session over a momentary problem is worse than risking one stale read. Exit 2 is reserved for real auth failures, where blocking is the correct answer.
+The choice to exit 0 on transient errors is deliberate: blocking your AI session over a momentary problem is worse than risking one stale read. A hook that fails to start or times out also lets the call through by default; Claude Code 2.1.295 and later accept `"onFailure": "block"` on the hook entry if you prefer the opposite.
 
 ## Auto-link
 
@@ -74,4 +94,4 @@ Overleaf's `/project/{id}/...` endpoints aren't publicly documented. The two use
 | Walk + zip + extract (typical paper) | ~5–10 s | A real web-origin edit happened. Bandwidth dominates. |
 | Bootstrap on first edit per project | ~10–30 s | No cached `toV` yet. Full zip + hash-compare against local. One-time. |
 
-Repeat fires within the 30-second debounce window cost nothing (debounce check + exit 0). Manual `sync --force` always pulls the zip and re-extracts.
+Repeat reads within 30 s (writes within 3 s) of the last probe cost nothing (debounce check + exit 0). Manual `sync --force` always pulls the zip and re-extracts.

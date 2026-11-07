@@ -4,6 +4,15 @@ on:
   push:
     branches: [master]
   pull_request:
+  # Weekly run so a dependency release (playwright, patchright, requests,
+  # browser-cookie3, rookiepy) that breaks install or the suite is noticed
+  # even when nothing is pushed.
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -13,11 +22,10 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        # Full version sweep on Linux — the requires-python >=3.8 claim and the
-        # marker gymnastics (playwright <1.49 vs >=1.49, rookiepy/patchright
-        # python_version + platform markers) only get exercised by a real
+        # Full version sweep on Linux: the requires-python >=3.10 claim and the
+        # rookiepy python_version/platform marker only get exercised by a real
         # multi-version install.
-        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
+        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
         include:
           # The tool is developed on Windows and macOS/Linux are under-tested;
           # smoke the install + suite on each at one version.
@@ -26,8 +34,8 @@ jobs:
           - os: macos-latest
             python-version: '3.12'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
       # Editable install pulls the runtime deps so `import overleaf_sync_now`
@@ -43,12 +51,36 @@ jobs:
     name: build & metadata check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.1.0
         with:
           python-version: '3.12'
       - run: python -m pip install build twine
-      # Validates the dynamic-version wiring ([tool.setuptools.dynamic] attr)
-      # and the SKILL.md package-data inclusion before a release tag.
+      # Validates the dynamic-version wiring ([tool.setuptools.dynamic] attr),
+      # the PEP 639 license metadata, and the SKILL.md package-data inclusion
+      # before a release tag.
       - run: python -m build
       - run: python -m twine check dist/*
+      - name: Wheel ships SKILL.md
+        shell: bash
+        run: python -c "import sys, zipfile, glob; names = zipfile.ZipFile(glob.glob('dist/*.whl')[0]).namelist(); sys.exit(0 if 'overleaf_sync_now/SKILL.md' in names else 1)"
+
+  links:
+    name: link check (weekly)
+    # External sites flake, so this runs on the weekly schedule and on
+    # demand only; it never gates a pull request.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: lycheeverse/lychee-action@v2.9.0
+        with:
+          # Code blocks are skipped by default (install commands such as
+          # git+https://...@v0.5.0 are not links); '@v' excludes them anyway.
+          args: >-
+            --no-progress --max-retries 3 --retry-wait-time 5
+            --accept 200,206,429
+            --exclude '@v[0-9]'
+            README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md 'docs/*.md'
+            src/overleaf_sync_now/SKILL.md
+          fail: true

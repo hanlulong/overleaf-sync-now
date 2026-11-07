@@ -29,17 +29,17 @@ uv tool install --reinstall --from . overleaf-sync-now
 
 ## Running the unit tests
 
-The unit test suite under `tests/` covers the project resolver, marker handling, atomic-write concurrency, POSIX file perms, the version-match refresh decision, the zip-slip + recent-mtime guards in `_extract_files`, the `cmd_hook` exit-code contract, `get_session` auth/retry behavior, and `save-cookie` normalization. No external dependencies — just `unittest` (HTTP/cookie paths are monkeypatched):
+The unit test suite under `tests/` covers the project resolver, marker handling, atomic-write concurrency, POSIX file perms, the version-match refresh decision, the zip-slip + recent-mtime guards in `_extract_files`, the `cmd_hook` exit-code contract and fail-closed resolution, Bash/PowerShell/apply_patch path extraction, the write guards, `project_ops` handling, install/uninstall against a fake HOME (Claude settings, `~/.agents/skills`, Codex `hooks.json`, `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, symlinked settings, the absolute hook path, the leftover report), `get_session` auth/retry behavior, offline and Codex-sandbox handling (built from real requests/urllib3 exception shapes), backups and keep-both on a first sync, the keychain-free hook path, `login`'s browser choice, `save-cookie` input modes, and the SKILL.md frontmatter and size budget. No external dependencies — just `unittest` (HTTP/cookie paths are monkeypatched):
 
 ```bash
 python -m unittest discover tests
 ```
 
-Tests must pass before opening a PR; CI (`.github/workflows/ci.yml`) runs them across Python 3.8–3.13. Anything touching `_atomic_write_text`, `_extract_files`, the resolver (`_resolve_by_name`, `_autolink_resolve`, `_disambiguate_by_fingerprint`), `refresh_project`, `cmd_hook`, the install/uninstall hook surgery, or the index format should add a test.
+Tests must pass before opening a PR; CI (`.github/workflows/ci.yml`) runs them across Python 3.10–3.14, on every push and pull request and once a week. Anything touching `_atomic_write_text`, `_extract_files`, the resolver (`_resolve_by_name`, `_autolink_resolve`, `_disambiguate_by_fingerprint`), `refresh_project`, `cmd_hook`, the install/uninstall hook surgery, or the index format should add a test.
 
 ## Style
 
-- Python 3.8+ compatible. Avoid 3.9+ syntax/stdlib (`match`, `|` type unions, `str.removeprefix`/`removesuffix`, `Path.is_relative_to` without a 3.8 fallback, etc.).
+- Python 3.10+ compatible (the floor set by current playwright/patchright). Avoid 3.11+ only syntax/stdlib (`except*`, `tomllib`, `typing.Self`, etc.).
 - Standard library where possible. New runtime deps need a justification in the PR.
 - Errors raised by `refresh_project` / `fetch_updates` / `download_zip` should be one of: `AuthExpired`, `RateLimited`, or a `RuntimeError` with a user-actionable message including the path / URL / next step.
 - Anything written to disk should go through `_atomic_write_text` (writes to `.tmp` + `os.replace`) — particularly `~/.claude/settings.json`.

@@ -66,8 +66,9 @@ class RefreshDecisionTests(unittest.TestCase):
             self.dl_calls.append(pid)
             return b"ZIPBYTES"
 
-        def fake_extract(zip_bytes, folder, paths, protect_recent_seconds=30):
-            self.extract_calls.append({"paths": paths, "protect": protect_recent_seconds})
+        def fake_extract(zip_bytes, folder, paths, protect_recent_seconds=30, **kw):
+            self.extract_calls.append({"paths": paths, "protect": protect_recent_seconds,
+                                       "change_times": kw.get("change_times")})
             return self.extract_ret
 
         cli.download_zip = fake_download
@@ -199,8 +200,11 @@ class ExtractFilesSafetyTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.folder = pathlib.Path(self._tmp.name) / "proj"
         self.folder.mkdir()
+        self._orig_cache_dir = cli.CACHE_DIR
+        cli.CACHE_DIR = pathlib.Path(self._tmp.name) / "data"  # backups land here
 
     def tearDown(self):
+        cli.CACHE_DIR = self._orig_cache_dir
         self._tmp.cleanup()
 
     def _zip(self, files):
@@ -274,17 +278,26 @@ class HookExitCodeTests(unittest.TestCase):
         self.folder = pathlib.Path(self._tmp.name)
         self.pid = "b" * 24
         self._orig = {
-            "find_linked_folder": cli.find_linked_folder,
+            "resolve_project": cli.resolve_project,
             "refresh_project": cli.refresh_project,
             "is_debounced": cli.is_debounced,
             "mark_synced": cli.mark_synced,
+            "WEB_REMOVED_FILE": cli.WEB_REMOVED_FILE,
         }
+        cli.WEB_REMOVED_FILE = self.folder / "web-removed.json"
         self.link = (self.folder, self.pid)
         self.debounced = False
         self.refresh_outcome = lambda pid, folder: "ok"
         self.marked = []
-        cli.find_linked_folder = lambda fp, verbose=True, **kw: self.link
-        cli.is_debounced = lambda pid: self.debounced
+
+        def fake_resolve(fp, verbose=True, **kw):
+            folder, pid = self.link
+            return {"folder": folder, "project_id": pid,
+                    "reason": "ok" if pid else "unmanaged",
+                    "name": None, "candidates": [], "detail": None}
+
+        cli.resolve_project = fake_resolve
+        cli.is_debounced = lambda pid, window=cli.DEBOUNCE_SECONDS: self.debounced
         cli.mark_synced = lambda pid: self.marked.append(pid)
         cli.refresh_project = lambda pid, folder, **kw: self.refresh_outcome(pid, folder)
         self._stdin = sys.stdin
@@ -303,7 +316,10 @@ class HookExitCodeTests(unittest.TestCase):
         return 0 if code is None else code
 
     def test_non_allowlisted_tool_passes(self):
+        self.assertEqual(self._run({"tool_name": "NotebookEdit", "tool_input": {"file_path": "a.tex"}}), 0)
+        # Bash is covered now, but only via tool_input.command.
         self.assertEqual(self._run({"tool_name": "Bash", "tool_input": {"file_path": "a.tex"}}), 0)
+        self.assertEqual(self.marked, [])
 
     def test_non_tex_extension_passes(self):
         self.assertEqual(self._run({"tool_name": "Edit", "tool_input": {"file_path": "a.png"}}), 0)
@@ -337,6 +353,30 @@ class HookExitCodeTests(unittest.TestCase):
         self.assertEqual(self._run({"tool_name": "Read", "tool_input": {"file_path": "a.bib"}}), 0)
         self.assertEqual(self.marked, [self.pid])
 
+    def test_ratelimited_write_passes_without_marking(self):
+        # A write must not be recorded as "fresh" on a 429: the next write
+        # has to probe again instead of riding a 30 s debounce.
+        def boom(pid, folder):
+            raise cli.RateLimited(5)
+        self.refresh_outcome = boom
+        self.assertEqual(self._run({"tool_name": "Write", "tool_input": {"file_path": "a.tex"}}), 0)
+        self.assertEqual(self.marked, [])
+
+    def test_authexpired_on_read_warns_but_passes(self):
+        def boom(pid, folder):
+            raise cli.AuthExpired("no cookies")
+        self.refresh_outcome = boom
+        err = io.StringIO()
+        orig_err = sys.stderr
+        sys.stderr = err
+        try:
+            code = self._run({"tool_name": "Read", "tool_input": {"file_path": "a.tex"}})
+        finally:
+            sys.stderr = orig_err
+        self.assertEqual(code, 0)
+        self.assertIn("Read allowed", err.getvalue())
+        self.assertEqual(self.marked, [])
+
     def test_generic_error_passes_and_marks(self):
         def boom(pid, folder):
             raise RuntimeError("network blip")
@@ -358,7 +398,7 @@ class GetSessionAuthTests(unittest.TestCase):
         self._orig = {
             "_load_cache": cli._load_cache,
             "_resolve_cookies": cli._resolve_cookies,
-            "_validate_cookies": cli._validate_cookies,
+            "_check_cookies": cli._check_cookies,
         }
 
     def tearDown(self):
@@ -370,34 +410,29 @@ class GetSessionAuthTests(unittest.TestCase):
         # the hook BLOCKS the edit), not a plain RuntimeError (which the hook's
         # generic handler would pass through, editing a stale copy).
         cli._load_cache = lambda: None
-        cli._resolve_cookies = lambda interactive=False: None
+        cli._resolve_cookies = lambda interactive=False, **kw: None
         with self.assertRaises(cli.AuthExpired):
             cli.get_session()
 
-    def test_sandbox_block_stays_plain_runtimeerror(self):
-        # A blocked outbound socket must NOT become AuthExpired — auth is
+    def test_sandbox_block_is_network_unavailable_not_authexpired(self):
+        # A blocked outbound socket must NOT become AuthExpired: auth is
         # probably fine and the hook should pass the edit through, not block.
+        # (Real exception shapes are covered in test_network_unavailable.py.)
         import requests
         cli._load_cache = lambda: {cli.SESSION_COOKIE: "v"}
-        cli._validate_cookies = lambda c, use_cache=True: False
-        cli._resolve_cookies = lambda interactive=False: None
-        orig_get = requests.get
-
-        def fake_get(*a, **k):
-            raise requests.exceptions.ConnectionError("[Errno 13] Permission denied")
-
-        requests.get = fake_get
-        try:
-            with self.assertRaises(RuntimeError) as cm:
-                cli.get_session()
-        finally:
-            requests.get = orig_get
+        cli._check_cookies = lambda c, use_cache=True: (
+            "unreachable", requests.exceptions.ConnectionError("[Errno 13] Permission denied"))
+        called = []
+        cli._resolve_cookies = lambda interactive=False, **kw: called.append(1)
+        with self.assertRaises(cli.NetworkUnavailable) as cm:
+            cli.get_session()
         self.assertNotIsInstance(cm.exception, cli.AuthExpired)
         self.assertEqual(str(cm.exception), cli._SANDBOX_HINT)
+        self.assertEqual(called, [])  # browser extraction skipped
 
     def test_retry_adapter_is_mounted(self):
         cli._load_cache = lambda: {cli.SESSION_COOKIE: "v"}
-        cli._validate_cookies = lambda c, use_cache=True: True
+        cli._check_cookies = lambda c, use_cache=True: ("ok", None)
         s = cli.get_session()
         adapter = s.get_adapter("https://www.overleaf.com")
         self.assertEqual(adapter.max_retries.total, 3)
@@ -479,9 +514,9 @@ class FindLinkedFolderTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class SaveCookieNormalizationTests(unittest.TestCase):
     def setUp(self):
-        self._orig = {"_validate_cookies": cli._validate_cookies, "_save_cache": cli._save_cache}
+        self._orig = {"_check_cookies": cli._check_cookies, "_save_cache": cli._save_cache}
         self.saved = {}
-        cli._validate_cookies = lambda c, use_cache=True: True
+        cli._check_cookies = lambda c, use_cache=True: ("ok", None)
         cli._save_cache = lambda c: self.saved.update(c)
 
     def tearDown(self):
@@ -503,8 +538,14 @@ class SaveCookieNormalizationTests(unittest.TestCase):
         self.assertEqual(self.saved, {})
 
     def test_no_args_usage(self):
-        with self.assertRaises(SystemExit) as cm:
-            cli.cmd_save_cookie([])
+        # No argument + non-interactive stdin with nothing on it -> usage.
+        orig_in = sys.stdin
+        sys.stdin = io.StringIO("")
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                cli.cmd_save_cookie([])
+        finally:
+            sys.stdin = orig_in
         self.assertEqual(cm.exception.code, 2)
 
 
@@ -581,14 +622,20 @@ class HookInstallTests(unittest.TestCase):
         self._orig = {
             "CLAUDE_SETTINGS": cli.CLAUDE_SETTINGS,
             "SKILL_TARGETS": cli.SKILL_TARGETS,
+            "LEGACY_SKILL_TARGETS": cli.LEGACY_SKILL_TARGETS,
+            "CODEX_HOME": cli.CODEX_HOME,
+            "CODEX_HOOKS": cli.CODEX_HOOKS,
             "cmd_setup": cli.cmd_setup,
-            "_validate_cookies": cli._validate_cookies,
+            "_check_cookies": cli._check_cookies,
             "_load_cache": cli._load_cache,
         }
         cli.CLAUDE_SETTINGS = self.settings
         cli.SKILL_TARGETS = {}                              # skip the SKILL.md copy loop
+        cli.LEGACY_SKILL_TARGETS = {}
+        cli.CODEX_HOME = pathlib.Path(self._tmp.name) / "no-codex"   # absent -> skipped
+        cli.CODEX_HOOKS = cli.CODEX_HOME / "hooks.json"
         cli.cmd_setup = lambda *a, **k: None                # skip the auth wizard
-        cli._validate_cookies = lambda *a, **k: True        # skip the final auth probe/network
+        cli._check_cookies = lambda *a, **k: ("ok", None)   # skip the final auth probe/network
         cli._load_cache = lambda: {cli.SESSION_COOKIE: "x"}
 
     def tearDown(self):
@@ -599,11 +646,14 @@ class HookInstallTests(unittest.TestCase):
     def _entries(self):
         return json.loads(self.settings.read_text())["hooks"]["PreToolUse"]
 
+    def _handlers(self):
+        return [h for e in self._entries() for h in e.get("hooks", [])]
+
     def _commands(self):
-        return [h.get("command", "") for e in self._entries() for h in e.get("hooks", [])]
+        return [h.get("command", "") for h in self._handlers()]
 
     def _our_count(self):
-        return sum(1 for c in self._commands() if cli._is_our_hook(c))
+        return sum(1 for h in self._handlers() if cli._is_our_hook(h))
 
     def test_install_adds_one_hook_and_preserves_user_hooks(self):
         self.settings.write_text(json.dumps({"hooks": {"PreToolUse": [

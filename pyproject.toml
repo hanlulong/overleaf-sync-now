@@ -1,9 +1,6 @@
 [build-system]
-# 68+ supports the table-form `license = { text = "MIT" }`. We avoid the
-# newer SPDX `license = "MIT"` (PEP 639) form because it requires
-# setuptools >= 77, which has no Python 3.8 release on PyPI - and we want
-# to keep 3.8 in the support matrix.
-requires = ["setuptools>=68"]
+# 77+ is needed for the PEP 639 SPDX `license = "MIT"` + `license-files` form.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -14,13 +11,12 @@ name = "overleaf-sync-now"
 dynamic = ["version"]
 description = "Stops Claude Code and Codex CLI from silently overwriting Overleaf web edits with a stale local Dropbox copy. PreToolUse hook + CLI + agent skill that probes Overleaf's version history and refreshes local .tex/.bib files before every AI Read/Edit."
 readme = "README.md"
-# Old-form license metadata. Don't switch to PEP 639 SPDX (`license = "MIT"`
-# + `license-files = [...]`) without first dropping Python 3.8 support — see
-# the [build-system] note above.
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Lu Han", email = "hanlulong@gmail.com" }]
 maintainers = [{ name = "OpenEcon.ai" }]
-requires-python = ">=3.8"
+# Current playwright and patchright releases need Python >= 3.10.
+requires-python = ">=3.10"
 keywords = [
     # skill-discovery keywords (high-intent search terms in agent ecosystems)
     "overleaf-skill", "claude-skill", "claude-code-skill", "codex-skill",
@@ -40,15 +36,13 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Science/Research",
     "Intended Audience :: Education",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Text Processing :: Markup :: LaTeX",
     "Topic :: Utilities",
 ]
@@ -60,21 +54,16 @@ dependencies = [
     # gracefully when rookiepy is absent.
     "rookiepy>=0.5; python_version < '3.13' and platform_system != 'Linux'",
     # Bundled (small, ~10MB) so `overleaf-sync-now login` works in uv-managed
-    # tool venvs (which ship without pip and so can't lazy-install). The big
-    # ~150MB Chromium download is still on-demand at first `login`. playwright
-    # dropped Python 3.8 at 1.49.0, so pin a 3.8-compatible range there and
-    # let 3.9+ take a current build — keeping the marker-per-dep convention the
-    # rest of this table uses, rather than leaving 3.8 resolution to backtracking.
-    "playwright>=1.40,<1.49; python_version < '3.9'",
-    "playwright>=1.49; python_version >= '3.9'",
+    # tool venvs (which ship without pip and so can't lazy-install). `login`
+    # uses the installed Chrome or Edge; only if neither starts does it
+    # download Chromium (~300 MB with its headless shell).
+    "playwright>=1.49",
     # patchright is a maintained Playwright fork that patches the CDP
     # Runtime.Enable leak and command-flag fingerprints that Google's
     # `disallowed_useragent` gate detects. Same `sync_playwright` API, so the
     # adapter in cli.py just prefers it when present. Vanilla playwright stays
-    # as a fallback. Conditional on Python >= 3.9 — patchright's wheel does
-    # not support 3.8, but the auth chain degrades gracefully to playwright
-    # for that minority install base.
-    "patchright>=1.40; python_version >= '3.9'",
+    # as a fallback.
+    "patchright>=1.40",
 ]
 
 [project.urls]
