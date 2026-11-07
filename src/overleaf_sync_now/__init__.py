@@ -4,7 +4,7 @@
 # `--version` reads it, so the three can never drift (the 0.3.1-vs-0.3.2 skew
 # this replaced). Bump here on release; CITATION.cff is the only other place
 # that needs a manual bump (a test pins the two together).
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 from .cli import main
 

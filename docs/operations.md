@@ -31,7 +31,7 @@ Install the release you want by tag, then re-run `install` so the skill copies a
 
 ```bash
 uv tool install --reinstall --force --refresh \
-  --from git+https://github.com/hanlulong/overleaf-sync-now@v0.5.0 overleaf-sync-now
+  --from git+https://github.com/hanlulong/overleaf-sync-now@v0.5.1 overleaf-sync-now
 overleaf-sync-now install
 ```
 

@@ -1,0 +1,7 @@
+contact_links:
+  - name: Login or cookie problems
+    url: https://github.com/hanlulong/overleaf-sync-now/blob/master/docs/authentication.md
+    about: Most login questions are answered here. Never paste your session cookie into an issue.
+  - name: Security vulnerability
+    url: https://github.com/hanlulong/overleaf-sync-now/security/policy
+    about: Report privately as described in SECURITY.md, not in a public issue.

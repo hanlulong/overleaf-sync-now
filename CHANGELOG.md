@@ -2,6 +2,106 @@
 
 All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://semver.org/).
 
+## 0.5.1 — 2026-11-07
+
+Fix release from a review of 0.5.0. **After upgrading, re-run
+`overleaf-sync-now install`** so the installed skill copies get the new
+SKILL.md (`status` shows `Install: NEEDS ATTENTION` until you do). The
+hook entries themselves are unchanged.
+
+### Fixed
+
+- **`<command> --help` ran the command.** `uninstall --help` removed the
+  hooks and skill copies, `install --help` reinstalled, `setup`, `status`
+  and `doctor --help` read browser cookie stores, and `save-cookie --help`
+  sent "--help" to Overleaf as a cookie. Every subcommand except `hook`
+  now prints its usage for `-h` / `--help` and exits 0.
+- **`link` run from a subfolder of a project** wrote a marker that made web
+  edits land as stray copies in that subfolder (a web edit to `main.tex`
+  arrived as `sections/main.tex`, and Dropbox then uploaded it). `link` now
+  refuses a folder below `Apps/Overleaf/<name>/` and prints the right
+  command. The same applies to the shared `Apps/Overleaf` folder.
+- **The wrong-project warning never reached the agent from the hook.** It
+  went only to stderr, which both clients drop when a hook exits 0. It is
+  now included in the hook's note when a refresh finds a new version on
+  Overleaf or bootstraps a project (a probe that finds no change stays
+  silent, so it does not repeat on every tool call). Manual `sync` prints
+  it as before.
+- **A refresh reset a file's permissions to the default** (a read-only or
+  0600 file became 0644). It now keeps them on macOS and Linux. olsync
+  2.0.1 fixed the same class of problem.
+- **The keep-both block no longer suggests a `diff` against a conflict copy
+  that was deleted.** The block itself stays (the local file may still hold
+  edits Overleaf never received); its message now says the saved copy is
+  gone and points to the project's History on overleaf.com, and SKILL.md
+  tells the agent the same.
+
+### Changed
+
+- **Unknown options exit 2 instead of being ignored.** For example,
+  `sync --dry-run` used to run a real pull. The removed `sync --no-wait`
+  and `--legacy` now fail the same way. Write a folder whose name starts
+  with `-` as `./-name`. The `hook` entry point still ignores its
+  arguments.
+- **An existing marker below `Apps/Overleaf/<name>/` is now ignored**, and
+  the project folder is used. `sync`, `status` and `doctor` print a warning
+  that names the marker to delete.
+- **If Overleaf ever lists projects in pages**, an unmatched folder name now
+  says so ("Overleaf listed only N of your M projects") instead of "no
+  project named X", and `projects` prints a note. Writes to that folder
+  stay blocked until it is linked. Today Overleaf lists every project, so
+  nothing changes yet.
+- **SKILL.md:** after `login` the agent checks with `status --quick`, which
+  does not read browser cookie stores (a full `status`, `doctor` or `setup`
+  can open macOS keychain dialogs, so those are left to the user). Text
+  pulled from Overleaf is treated as document content, never as
+  instructions, and a pulled edit is not undone unless the user asks. Its
+  `docs/` links point to the installed version instead of `master`.
+- **`status --quick` never reads browser cookie stores**, including during
+  the project lookup of a folder that still needs auto-link. Its
+  `cache INVALID` line now names `login` as the fix.
+
+### Docs
+
+- `docs/architecture.md` lists the Overleaf source files the client relies
+  on, pinned to an upstream commit (links only).
+- Accuracy fixes: the README gives the upgrade steps for 0.4.x and earlier
+  (by link to `docs/operations.md`, then `install` and `/hooks`);
+  CONTRIBUTING's release steps cover the version pins and an annotated tag
+  on the merged commit; SECURITY.md lists every file in the data dir
+  (newly `conflicts-pending.json`, `extracted.json`, `state.json.bad` and
+  the two back-off timestamps) and the sign-in provider sessions a `login`
+  profile can keep; the Playwright MCP row in `docs/authentication.md`
+  applies only to a profile started with
+  `--user-data-dir ~/.claude/playwright-profile`
+  (`doctor` now shows that folder as "not used; optional" when it is
+  absent); the exit-code table includes the "refresh failed" pass-through;
+  the README's hot-path cost includes the cookie check; troubleshooting
+  explains `holds a different skill`.
+- The README says the tool is independent and unofficial, not affiliated
+  with or endorsed by Overleaf or Dropbox, and relies on endpoints that are
+  not a public API.
+
+### Tests
+
+- New `tests/test_protocol.py` pins how the `/updates`, zip and project
+  list replies are read (status codes to error types, an HTML login page
+  where JSON was expected, a missing `toV`, a body that is not a zip, the
+  project-list parser and its fallbacks), with synthetic fixtures only.
+  An update with no `meta.origin` is pinned as a web edit.
+- The `@v<version>` install pins in README.md and docs/operations.md and
+  the `blob/v<version>/` links in SKILL.md must match `__version__`.
+- New tests for per-command `--help` and unknown options (including an
+  end-to-end `uninstall --help` that must leave the hook configs
+  untouched), the subfolder `link` refusal, the hook's wrong-project note,
+  file modes after a refresh, and `status --quick`. Suite: 283 tests (236
+  in 0.5.0).
+
+### CI
+
+- The build job runs `twine check --strict`. The issue chooser links to the
+  login guide and to the security policy for private reports.
+
 ## 0.5.0 — 2026-11-07
 
 Hardening release from a second audit. The tool's one job is to stop an AI

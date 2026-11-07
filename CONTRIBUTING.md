@@ -68,7 +68,7 @@ Small focused PRs are easier to review than large ones. If you're touching the a
 
 ## Releasing (maintainers)
 
-1. Bump `__version__` in `src/overleaf_sync_now/__init__.py` (single source) and the `version`/`date-released` in `CITATION.cff`.
+1. Bump `__version__` in `src/overleaf_sync_now/__init__.py` (single source) and the `version`/`date-released` in `CITATION.cff`. Also bump the `@v<version>` install pins in `README.md` and `docs/operations.md`, and the versioned `blob/v<version>/` doc links in `src/overleaf_sync_now/SKILL.md` (a test checks all three against `__version__`).
 2. Update CHANGELOG.md with the date.
-3. `git tag v<version> && git push --tags`.
-4. CI runs the test + build matrix; users get the new version with `uv tool install --reinstall --refresh`.
+3. Right after the release PR is merged, tag the merged master commit with an annotated tag and push it: `git tag -a v<version> -m 'v<version>'`, then `git push origin v<version>`.
+4. CI runs the test + build matrix; users upgrade as described in [docs/operations.md](docs/operations.md#upgrading).

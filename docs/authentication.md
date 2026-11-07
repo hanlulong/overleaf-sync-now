@@ -10,7 +10,7 @@
 | 2 | **Browser via `login` profile** | everything | Persistent browser profile created by `overleaf-sync-now login` (patchright preferred since 0.3.2; vanilla Playwright fallback). **The recommended path on every OS.** |
 | 3 | **`rookiepy`** | setup, install, status, doctor; `sync` (then backs off for an hour after a failure) | Rust cookie reader for your installed browsers. Defeated by Chrome 127+ App-Bound Encryption on Windows. |
 | 4 | **`browser_cookie3`** | same as 3 | Chrome / Edge / Firefox / Brave / Vivaldi / Opera / Chromium / LibreWolf / Arc / Safari. Defeated by Chrome 127+ on Windows without admin. |
-| 5 | **Claude Code Playwright MCP profile** (`~/.claude/playwright-profile/`) | same as 3 | If you've used the [Playwright MCP](https://github.com/microsoft/playwright-mcp) and logged into overleaf.com there. |
+| 5 | **Playwright MCP profile** | same as 3 | Only when you started the [Playwright MCP](https://github.com/microsoft/playwright-mcp) with `--user-data-dir ~/.claude/playwright-profile` and logged into overleaf.com there. The tool looks in that folder only. |
 | 6 | **Hidden prompt** | interactive `setup` only | You type the cookie yourself (input hidden). Last resort. |
 
 The PreToolUse hook only uses steps 1 and 2. Steps 3-5 read your browsers' own cookie stores, which on macOS goes through the keychain (see below), so they never run on every AI read or edit.

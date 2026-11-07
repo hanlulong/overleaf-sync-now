@@ -387,6 +387,26 @@ class HookSummaryTests(_Env):
         code, err = self.run_hook("Edit", main)
         self.assertEqual(code, 0, err)
 
+    def test_kept_file_whose_saved_copy_is_gone_still_blocks_once(self):
+        # The conflicts/ copy was deleted (or the data dir moved). The local
+        # file may still hold edits Overleaf never received, so the block
+        # stays, but it must not suggest a diff against a missing file.
+        main = self.local("main.tex", "LOCAL NEWER\n", minutes_ago=10)
+        self.zip_files = {"main.tex": "OVERLEAF\n"}
+        self.updates([upd(9, 10, ["main.tex"], minutes_ago=60)])
+        code, err = self.run_hook("Read", main)
+        self.assertEqual(code, 0, err)
+        copy = pathlib.Path(cli.pending_conflicts(PID)["main.tex"])
+        copy.unlink()
+        code, err = self.run_hook("Edit", main)
+        self.assertEqual(code, 2, err)
+        self.assertIn("Conflict: main.tex differs from Overleaf's copy", err)
+        self.assertIn("is no longer there", err)
+        self.assertIn("History on overleaf.com", err)
+        self.assertNotIn("diff ", err)
+        code, err = self.run_hook("Edit", main)
+        self.assertEqual(code, 0, err)
+
     def test_write_after_pull_blocks_with_reread_and_summary(self):
         main = self.local("main.tex", "STALE\n", minutes_ago=60)
         self.zip_files = {"main.tex": "WEB\n"}
@@ -395,6 +415,43 @@ class HookSummaryTests(_Env):
         self.assertEqual(code, 2)
         self.assertIn("Re-read the file(s) before editing", err)
         self.assertIn("pulled newer Overleaf content into main.tex", err)
+
+
+
+@unittest.skipIf(os.name != "posix", "POSIX file modes")
+class FileModeTests(_Env):
+    """A refresh replaces a file through a temp file; it must keep the
+    existing file's permission bits (0.5.1)."""
+
+    def _pull_main(self, mode):
+        main = self.local("main.tex", "STALE\n", minutes_ago=60)
+        os.chmod(main, mode)
+        cli._save_versions({PID: 9})
+        self.zip_files = {"main.tex": "WEB\n", "new.tex": "NEW\n"}
+        self.updates([upd(9, 10, ["main.tex", "new.tex"], minutes_ago=5)])
+        cli.refresh_project(PID, self.folder)
+        return main
+
+    def test_existing_0640_file_keeps_its_mode(self):
+        main = self._pull_main(0o640)
+        self.assertEqual(main.read_text(), "WEB\n")
+        self.assertEqual(main.stat().st_mode & 0o777, 0o640)
+
+    def test_read_only_file_keeps_its_mode_and_gets_the_new_content(self):
+        main = self._pull_main(0o444)
+        try:
+            self.assertEqual(main.read_text(), "WEB\n")
+            self.assertEqual(main.stat().st_mode & 0o777, 0o444)
+        finally:
+            os.chmod(main, 0o644)
+
+    def test_new_file_gets_the_default_mode(self):
+        self._pull_main(0o600)
+        umask = os.umask(0)
+        os.umask(umask)
+        new = self.folder / "new.tex"
+        self.assertEqual(new.read_text(), "NEW\n")
+        self.assertEqual(new.stat().st_mode & 0o777, 0o666 & ~umask)
 
 
 if __name__ == "__main__":
