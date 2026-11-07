@@ -83,6 +83,11 @@ All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://sem
 - The `@v<version>` install pins in README.md and docs/operations.md and
   the `blob/v<version>/` links in SKILL.md must match `__version__`.
 
+### CI
+
+- The build job runs `twine check --strict`. The issue chooser links to the
+  login guide and the private security policy.
+
 ## 0.5.0 — 2026-11-07
 
 Hardening release from a second audit. The tool's one job is to stop an AI
