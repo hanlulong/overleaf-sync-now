@@ -69,6 +69,9 @@ All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://sem
   absent); the exit-code table includes the "refresh failed" pass-through;
   the README's hot-path cost includes the cookie check; troubleshooting
   explains `holds a different skill`.
+- The README says the tool is independent and unofficial, not affiliated
+  with or endorsed by Overleaf or Dropbox, and relies on endpoints that are
+  not a public API.
 
 ### Tests
 

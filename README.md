@@ -186,6 +186,8 @@ The Overleaf-AI integration space is crowded. Each of these solves a different s
 
 [MIT](LICENSE)
 
+overleaf-sync-now is an independent, unofficial tool. It is not affiliated with or endorsed by Overleaf or Dropbox, and it relies on overleaf.com endpoints that are not a public API and can change without notice.
+
 ## Credits
 
 Created by **[Lu Han](https://luhan.io/)**. Published by **[OpenEcon.ai](https://openecon.ai/)**.
