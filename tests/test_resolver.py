@@ -7,12 +7,16 @@ network paths; HTTP calls are out of scope for unit tests.
 
 Run with: python -m unittest discover tests
 """
+import contextlib
+import io
 import json
 import os
 import pathlib
 import sys
 import tempfile
+import time
 import unittest
+import zipfile
 
 # Tests run against the in-repo source without installation.
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -516,6 +520,175 @@ class ConcurrencyTests(unittest.TestCase):
         self.assertEqual(errors, [])
         data = json.loads((folder / cli.PROJECT_MARKER).read_text())
         self.assertEqual(data["project_id"], pid_value)
+
+
+class SubfolderMarkerTests(unittest.TestCase):
+    """0.5.1: Overleaf maps a project only to Apps/Overleaf/<name>/. `link`
+    refuses a subfolder (and the shared Apps/Overleaf folder), and a marker
+    already sitting in a subfolder is ignored in favour of the project
+    folder."""
+
+    PID_A = "a" * 24
+    PID_B = "b" * 24
+    NAMES = ("CACHE_DIR", "CACHE_FILE", "STATE_FILE", "VERSIONS_FILE", "INDEX_FILE",
+             "WEB_REMOVED_FILE", "_VALIDATION_FILE", "get_session", "fetch_updates",
+             "download_zip")
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base = pathlib.Path(self._tmp.name).resolve()
+        self._orig = {n: getattr(cli, n) for n in self.NAMES}
+        data = self.base / "data"
+        data.mkdir()
+        cli.CACHE_DIR = data
+        cli.CACHE_FILE = data / "cookies.json"
+        cli.STATE_FILE = data / "state.json"
+        cli.VERSIONS_FILE = data / "versions.json"
+        cli.INDEX_FILE = data / "projects.json"
+        cli.WEB_REMOVED_FILE = data / "web-removed.json"
+        cli._VALIDATION_FILE = data / ".validated-at"
+
+        def no_network(*a, **k):
+            raise AssertionError("unexpected network call")
+
+        cli.get_session = cli.fetch_updates = cli.download_zip = no_network
+        self.apps = self.base / "Dropbox" / "Apps" / "Overleaf"
+        self.project = self.apps / "Paper"
+        self.sections = self.project / "sections"
+        self.sections.mkdir(parents=True)
+        self._stderr = sys.stderr
+
+    def tearDown(self):
+        sys.stderr = self._stderr
+        for n, v in self._orig.items():
+            setattr(cli, n, v)
+        self._tmp.cleanup()
+
+    def _marker(self, folder, pid):
+        (folder / cli.PROJECT_MARKER).write_text(json.dumps({"project_id": pid}))
+
+    def _link(self, folder):
+        sys.stderr = err = io.StringIO()
+        out = io.StringIO()
+        code = None
+        try:
+            with contextlib.redirect_stdout(out):
+                cli.cmd_link([self.PID_A, str(folder)])
+        except SystemExit as e:
+            code = e.code
+        finally:
+            sys.stderr = self._stderr
+        return code, out.getvalue(), err.getvalue()
+
+    def _markers(self):
+        return sorted(str(p.relative_to(self.base)) for p in self.base.rglob(cli.PROJECT_MARKER))
+
+    def test_link_refuses_a_project_subfolder(self):
+        code, _, err = self._link(self.sections)
+        self.assertEqual(code, 1)
+        self.assertIn("inside the Overleaf project folder", err)
+        self.assertIn(f'overleaf-sync-now link {self.PID_A} "{self.project}"', err)
+        self.assertEqual(self._markers(), [])
+
+    def test_link_refuses_the_shared_apps_overleaf_folder(self):
+        code, _, err = self._link(self.apps)
+        self.assertEqual(code, 1)
+        self.assertIn("shared Apps/Overleaf folder", err)
+        self.assertEqual(self._markers(), [])
+
+    def test_link_accepts_the_project_folder_and_outside_folders(self):
+        code, out, _ = self._link(self.project)
+        self.assertIsNone(code)
+        self.assertIn("Linked", out)
+        self.assertTrue((self.project / cli.PROJECT_MARKER).exists())
+        outside = self.base / "elsewhere" / "paper"
+        outside.mkdir(parents=True)
+        code, out, _ = self._link(outside)
+        self.assertIsNone(code)
+        self.assertTrue((outside / cli.PROJECT_MARKER).exists())
+
+    def test_nested_marker_is_ignored_for_the_project_folder(self):
+        self._marker(self.project, self.PID_A)
+        self._marker(self.sections, self.PID_B)
+        target = self.sections / "intro.tex"
+        target.write_text("intro")
+        res = cli.resolve_project(target, verbose=False)
+        self.assertEqual((res["reason"], res["folder"], res["project_id"]),
+                         ("ok", self.project, self.PID_A))
+        sys.stderr = err = io.StringIO()
+        try:
+            res = cli.resolve_project(target, verbose=True)
+        finally:
+            sys.stderr = self._stderr
+        self.assertEqual((res["folder"], res["project_id"]), (self.project, self.PID_A))
+        self.assertIn(f"WARN: ignoring {self.sections / cli.PROJECT_MARKER}", err.getvalue())
+        self.assertIn("Overleaf maps a project only to", err.getvalue())
+
+    def test_nested_marker_is_silent_when_not_verbose(self):
+        self._marker(self.project, self.PID_A)
+        self._marker(self.sections, self.PID_B)
+        sys.stderr = err = io.StringIO()
+        try:
+            cli.resolve_project(self.sections / "intro.tex", verbose=False)
+        finally:
+            sys.stderr = self._stderr
+        self.assertEqual(err.getvalue(), "")
+
+    def test_nested_ignore_file_behaves_as_before(self):
+        # A valid project marker still wins over an opt-out file below it...
+        self._marker(self.project, self.PID_A)
+        (self.sections / cli.IGNORE_MARKER).write_text("")
+        res = cli.resolve_project(self.sections / "intro.tex", verbose=False)
+        self.assertEqual((res["reason"], res["folder"], res["project_id"]),
+                         ("ok", self.project, self.PID_A))
+        # ...and without a marker, an unmatched name stays opted out.
+        (self.project / cli.PROJECT_MARKER).unlink()
+        cli.INDEX_FILE.write_text(json.dumps({
+            "version": cli.INDEX_FORMAT_VERSION, "ts": time.time(),
+            "projects": [_rec(self.PID_B, "Some Other Paper")],
+        }))
+        res = cli.resolve_project(self.sections / "intro.tex", verbose=False)
+        self.assertEqual((res["reason"], res["folder"]), ("ignored", self.sections))
+
+    def test_web_edit_lands_in_the_project_folder_not_the_subfolder(self):
+        # A marker left in sections/ by `link` before 0.5.1. A web edit to
+        # main.tex used to be extracted as sections/main.tex.
+        self._marker(self.project, self.PID_A)
+        self._marker(self.sections, self.PID_A)
+        (self.project / "main.tex").write_text("old main")
+        (self.sections / "intro.tex").write_text("old intro")
+        old = time.time() - 3600
+        for f in (self.project / "main.tex", self.sections / "intro.tex"):
+            os.utime(f, (old, old))
+        cli.VERSIONS_FILE.write_text(json.dumps({self.PID_A: 5}))
+        updates = {"updates": [
+            {"fromV": 5, "toV": 6, "pathnames": ["main.tex"],
+             "meta": {"origin": {"kind": "web"}, "end_ts": time.time() * 1000}},
+            {"fromV": 4, "toV": 5, "pathnames": ["main.tex"], "meta": {"end_ts": old * 1000}},
+        ]}
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("main.tex", "NEW main from web")
+            z.writestr("sections/intro.tex", "old intro")
+        cli.fetch_updates = lambda pid: updates
+        cli.download_zip = lambda pid: buf.getvalue()
+        cli.get_session = lambda force_refresh=False: None
+        payload = {"tool_name": "Edit",
+                   "tool_input": {"file_path": str(self.sections / "intro.tex")},
+                   "cwd": str(self.project)}
+        stdin, stdout = sys.stdin, sys.stdout
+        sys.stdin = io.StringIO(json.dumps(payload))
+        sys.stderr = io.StringIO()
+        sys.stdout = io.StringIO()
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                cli.cmd_hook([])
+        finally:
+            sys.stdin, sys.stdout, sys.stderr = stdin, stdout, self._stderr
+        self.assertIn(cm.exception.code, (0, None))
+        self.assertEqual((self.project / "main.tex").read_text(), "NEW main from web")
+        self.assertFalse((self.sections / "main.tex").exists())
+        self.assertFalse((self.sections / "sections").exists())
 
 
 if __name__ == "__main__":

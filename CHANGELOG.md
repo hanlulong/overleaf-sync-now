@@ -11,6 +11,11 @@ All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://sem
   and `doctor --help` read browser cookie stores, and `save-cookie --help`
   sent "--help" to Overleaf as a cookie. Every subcommand now prints its
   usage for `-h` / `--help` and exits 0.
+- **`link` run from a subfolder of a project** wrote a marker that made web
+  edits land as stray copies in that subfolder (a web edit to `main.tex`
+  arrived as `sections/main.tex`, and Dropbox then uploaded it). `link` now
+  refuses a folder below `Apps/Overleaf/<name>/` and prints the right
+  command. The same applies to the shared `Apps/Overleaf` folder.
 
 ### Changed
 
@@ -19,6 +24,9 @@ All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://sem
   and `--legacy` now fail the same way. Write a folder whose name starts
   with `-` as `./-name`. The `hook` entry point still ignores its
   arguments.
+- **An existing marker below `Apps/Overleaf/<name>/` is now ignored**, and
+  the project folder is used. `sync`, `status` and `doctor` print a warning
+  that names the marker to delete.
 
 ## 0.5.0 — 2026-11-07
 

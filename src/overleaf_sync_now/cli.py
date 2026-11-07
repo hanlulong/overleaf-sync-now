@@ -1574,6 +1574,7 @@ def resolve_project(start, *, verbose=True, allow_disambig_network=True, read_on
                         file=sys.stderr,
                     )
                 pid = None
+            apps_root = _apps_overleaf_folder(cur) if pid else None
             if pid:
                 # Reject markers placed at the shared `Apps/Overleaf/` level.
                 # A marker there would silently shadow every project under it
@@ -1589,6 +1590,21 @@ def resolve_project(start, *, verbose=True, allow_disambig_network=True, read_on
                             f"project under it. Move it into a specific project "
                             f"subfolder (e.g. {cur / 'YourProject' / PROJECT_MARKER}), "
                             f"or delete it and let auto-link handle each project.",
+                            file=sys.stderr,
+                        )
+                elif apps_root is not None and apps_root != cur:
+                    # Overleaf maps a project only to Apps/Overleaf/<name>/;
+                    # a marker below it (written by `link` from a subfolder
+                    # before 0.5.1) would make refreshes extract project-root
+                    # paths relative to the subfolder. Skip it and keep
+                    # walking up to the project folder.
+                    if verbose:
+                        print(
+                            f"[overleaf-sync-now] WARN: ignoring {marker}: Overleaf maps a "
+                            f"project only to {apps_root}{os.sep}, so a marker in a subfolder "
+                            f"would put pulled files in the wrong place. Delete it (it has "
+                            f"synced to Overleaf and to collaborators); {apps_root} is used "
+                            f"instead.",
                             file=sys.stderr,
                         )
                 else:
@@ -2355,6 +2371,27 @@ def cmd_link(args):
     folder = pathlib.Path(args[1] if len(args) > 1 else ".").resolve()
     if not folder.is_dir():
         print(f"ERROR: {folder} is not a directory", file=sys.stderr)
+        sys.exit(1)
+    # Overleaf's Dropbox sync maps a project only to Apps/Overleaf/<name>/.
+    # A marker in a subfolder made refreshes extract project-root paths
+    # relative to that subfolder (stray copies that Dropbox then uploads),
+    # and the resolver ignores one at the shared level, so refuse both.
+    apps = _apps_overleaf_folder(folder)
+    if _is_marker_at_shared_level(folder):
+        print(
+            f"ERROR: {folder} is the shared Apps/Overleaf folder; a link here would shadow "
+            f"every project. Link the project's own folder instead:\n"
+            f"  overleaf-sync-now link {project_id} \"{folder / '<ProjectName>'}\"",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if apps is not None and folder != apps:
+        print(
+            f"ERROR: {folder} is inside the Overleaf project folder {apps}. Overleaf syncs "
+            f"a project only to Apps/Overleaf/<name>/, so link that folder:\n"
+            f"  overleaf-sync-now link {project_id} \"{apps}\"",
+            file=sys.stderr,
+        )
         sys.exit(1)
     # Look up the project name from the cached index for the marker's
     # name_at_link_time field (debug aid; not load-bearing). Also surface
