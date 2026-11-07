@@ -34,7 +34,7 @@ If you only ever edit locally *or* only ever edit on the web, your local copy is
 In Claude Code or Codex CLI, paste this prompt:
 
 ```text
-Install overleaf-sync-now v0.5.0 with `uv tool install --from git+https://github.com/hanlulong/overleaf-sync-now@v0.5.0 overleaf-sync-now` (install uv first from https://docs.astral.sh/uv/ if `uv` is missing), then run `overleaf-sync-now install`.
+Install overleaf-sync-now v0.5.1 with `uv tool install --from git+https://github.com/hanlulong/overleaf-sync-now@v0.5.1 overleaf-sync-now` (install uv first from https://docs.astral.sh/uv/ if `uv` is missing), then run `overleaf-sync-now install`.
 ```
 
 The agent installs everything and runs setup. **Restart the agent afterward** (`/exit` then `claude` in Claude Code; equivalent in Codex). In **Codex CLI**, also run `/hooks` once and trust the `overleaf-sync-now` hook: Codex skips new hooks until you do.
@@ -50,7 +50,7 @@ If install ends with **AUTH NOT YET CAPTURED** (on any OS), run `overleaf-sync-n
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh && \
   export PATH="$HOME/.local/bin:$PATH" && \
-  uv tool install --from git+https://github.com/hanlulong/overleaf-sync-now@v0.5.0 overleaf-sync-now && \
+  uv tool install --from git+https://github.com/hanlulong/overleaf-sync-now@v0.5.1 overleaf-sync-now && \
   overleaf-sync-now install
 ```
 
@@ -60,7 +60,7 @@ If uv says `~/.local/bin` is not on your PATH, run `uv tool update-shell` and op
 ```powershell
 irm https://astral.sh/uv/install.ps1 | iex
 $env:PATH = "$env:USERPROFILE\.local\bin;$env:PATH"
-uv tool install --from git+https://github.com/hanlulong/overleaf-sync-now@v0.5.0 overleaf-sync-now
+uv tool install --from git+https://github.com/hanlulong/overleaf-sync-now@v0.5.1 overleaf-sync-now
 overleaf-sync-now install
 ```
 
