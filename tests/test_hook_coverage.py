@@ -25,6 +25,7 @@ import sys
 import tempfile
 import time
 import unittest
+import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -952,3 +953,71 @@ class NumberedAndIgnoreHookTests(_HookHarness):
         code, err = self._write(folder)
         self.assertEqual(code, 2)
         self.assertIn(cli.IGNORE_MARKER, err)
+
+
+# ---------------------------------------------------------------------------
+# the wrong-project warning reaches the hook's JSON note (0.5.1)
+# ---------------------------------------------------------------------------
+class FingerprintNoteTests(_HookHarness):
+    """The Layer 6b WARN used to go only to stderr, which both clients drop
+    when the hook exits 0. It now rides in the JSON note whenever a refresh
+    pulls or bootstraps, and stays out of no-change probes."""
+
+    def setUp(self):
+        super().setUp()
+        cli.refresh_project = self._orig["refresh_project"]
+        self._orig_download = cli.download_zip
+        cli.get_session = lambda force_refresh=False: None
+        self.folder = self.project("My Paper")
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("main.tex", "ORIGINAL main.tex")
+        cli.download_zip = lambda pid: buf.getvalue()
+        self.updates = {"updates": [{
+            "fromV": 9, "toV": 10, "pathnames": ["other-paper.tex", "refs-x.bib"],
+            "meta": {"origin": {"kind": "dropbox"}, "end_ts": (time.time() - 7200) * 1000},
+        }]}
+        cli.fetch_updates = lambda pid: self.updates
+
+    def tearDown(self):
+        cli.download_zip = self._orig_download
+        super().tearDown()
+
+    def _read(self):
+        return self.run_hook({"tool_name": "Read",
+                              "tool_input": {"file_path": str(self.folder / "main.tex")}})
+
+    def _note(self):
+        if not self.last_stdout.strip():
+            return None
+        out = json.loads(self.last_stdout)
+        self.assertEqual(out["systemMessage"], out["hookSpecificOutput"]["additionalContext"])
+        return out["systemMessage"]
+
+    def test_bootstrap_note_carries_the_warning_and_no_change_is_silent(self):
+        code, _ = self._read()
+        self.assertEqual(code, 0)
+        self.assertIn("may point to the wrong project", self._note() or "")
+        self.assertEqual(json.loads(cli.VERSIONS_FILE.read_text())[PID], 10)
+        # Same toV again (no_change) after the debounce is cleared: no note.
+        cli.clear_synced([PID])
+        code, _ = self._read()
+        self.assertEqual(code, 0)
+        self.assertIsNone(self._note())
+
+    def test_no_dropbox_pathnames_means_no_note(self):
+        self.updates["updates"][0]["meta"]["origin"] = {"kind": "web"}
+        code, _ = self._read()
+        self.assertEqual(code, 0)
+        self.assertIsNone(self._note())
+
+    def test_manual_sync_still_prints_the_warning_when_unchanged(self):
+        cli.VERSIONS_FILE.write_text(json.dumps({PID: 10}))
+        sys.stderr = err = io.StringIO()
+        sys.stdout = out = io.StringIO()
+        try:
+            cli.cmd_sync([str(self.folder)])
+        finally:
+            sys.stderr, sys.stdout = self._stderr, self._stdout
+        self.assertIn("no_change", out.getvalue())
+        self.assertIn("may point to the wrong project", err.getvalue())

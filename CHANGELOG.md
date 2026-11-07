@@ -16,6 +16,11 @@ All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://sem
   arrived as `sections/main.tex`, and Dropbox then uploaded it). `link` now
   refuses a folder below `Apps/Overleaf/<name>/` and prints the right
   command. The same applies to the shared `Apps/Overleaf` folder.
+- **The wrong-project warning never reached the agent from the hook.** It
+  went only to stderr, which both clients drop when a hook exits 0. It is
+  now included in the hook's note whenever a refresh pulls or bootstraps a
+  project (a probe that finds no change stays silent, so it does not repeat
+  on every tool call). Manual `sync` prints it as before.
 
 ### Changed
 

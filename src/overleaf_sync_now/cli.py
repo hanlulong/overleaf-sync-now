@@ -1107,10 +1107,20 @@ def refresh_project(project_id, folder, *, force=False, report=None):
     # name-collision survivor that earlier defenses didn't catch). Warn but
     # proceed. Indeterminate outcomes (no dropbox-origin entries, no
     # pathnames) stay silent.
-    _fingerprint_sanity_warn(folder, updates, project_id)
+    fp_warn = _fingerprint_sanity_warn(folder, updates, project_id)
 
     if not force and not bootstrap and latest_toV == cached_toV:
         return "no_change"
+
+    # The hook prints only what reaches its JSON note (stderr is dropped on
+    # exit 0), so hand the wrong-project warning back through `report`
+    # whenever this refresh is about to pull or record changes. A probe with
+    # no change returned above, which keeps the note from repeating on
+    # every tool call.
+    if report is None:
+        report = {}
+    if fp_warn:
+        report.setdefault("warnings", []).append(fp_warn)
 
     # Decide what to extract. On bootstrap or force, pull everything (hash
     # compare will skip any file that already matches). Otherwise walk the
@@ -1173,8 +1183,6 @@ def refresh_project(project_id, folder, *, force=False, report=None):
     # offline edits, an Overleaf Dropbox outage): keep it and save Overleaf's
     # copy aside, instead of reverting it. --force always takes Overleaf's.
     change_times = _overleaf_change_times(updates) if (need_paths is None and not force) else None
-    if report is None:
-        report = {}
     n_written, n_unchanged, n_protected = _extract_files(
         zip_bytes, folder, need_paths, protect_recent_seconds=protect,
         project_id=project_id, change_times=change_times, report=report,
@@ -2079,26 +2087,28 @@ def _fingerprint_sanity_warn(folder, updates, project_id):
 
     Silent on indeterminate signals (no dropbox-origin entries, no pathnames
     on the entries, file lookups fail). Silent on file rename/move (basename
-    fallback in _count_pathname_hits). Never raises.
+    fallback in _count_pathname_hits). Never raises. Returns the warning
+    text when it printed one, else None.
     """
     try:
         seen = _collect_recent_dbx_pathnames(updates)
         if not seen:
-            return  # no signal — never warn
+            return None  # no signal — never warn
         if _count_pathname_hits(folder, seen) > 0:
-            return  # at least one path or basename matched — looks like the right project
+            return None  # at least one path or basename matched — looks like the right project
         sample = ", ".join(seen[:3])
-        print(
+        msg = (
             f"[overleaf-sync-now] WARN: project {project_id} has recent Dropbox-origin "
             f"updates touching files not present in {folder} (e.g. {sample}). The link "
             f"may point to the wrong project (a duplicate, a fork, or a typo). Run "
             f"`overleaf-sync-now status` and `overleaf-sync-now projects` to verify, then "
-            f"`overleaf-sync-now link <correct_id> {folder}` to fix.",
-            file=sys.stderr,
+            f"`overleaf-sync-now link <correct_id> {folder}` to fix."
         )
+        print(msg, file=sys.stderr)
+        return msg
     except Exception:
         # The sanity gate must never crash a sync. Swallow anything unexpected.
-        return
+        return None
 
 
 def _write_marker(folder, project_id, *, project_name=None, source="auto-link"):
@@ -3228,6 +3238,7 @@ def _cmd_hook(args, out=None):
                 summary = _refresh_summary(folder, report)
                 if summary:
                     warnings.append(summary)
+                warnings.extend(report.get("warnings", []))
             except RateLimited as e:
                 # Transient. Don't block, and don't claim the copy is fresh
                 # for writes (a later write must probe again). Reads still
