@@ -33,7 +33,8 @@ hook entries themselves are unchanged.
 - **The keep-both block no longer suggests a `diff` against a conflict copy
   that was deleted.** The block itself stays (the local file may still hold
   edits Overleaf never received); its message now says the saved copy is
-  gone and points to the project's History on overleaf.com.
+  gone and points to the project's History on overleaf.com, and SKILL.md
+  tells the agent the same.
 
 ### Changed
 
