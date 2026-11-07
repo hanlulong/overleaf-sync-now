@@ -66,6 +66,8 @@ overleaf-sync-now install
 
 </details>
 
+**Upgrading from 0.4.x or earlier:** upgrade with the command in [docs/operations.md](docs/operations.md#upgrading), then re-run `overleaf-sync-now install` (it rewrites the Claude Code hook with the Bash/PowerShell matcher and an explicit timeout, and adds the Codex hook), and in Codex run `/hooks` and trust the entry. Until you re-run install, `overleaf-sync-now status` shows `Install: NEEDS ATTENTION`.
+
 ### Verify
 
 After restart, edit any `.tex` file under `Dropbox/Apps/Overleaf/<project>/` — the hook fires automatically (in Codex, after you trust it with `/hooks`). Or check manually, from inside a project folder (or pass the folder):
@@ -92,7 +94,7 @@ The problem: Overleaf's Dropbox sync polls the **Overleaf-web → local** direct
 | **Overleaf web edit → local Dropbox** | **10–20 minutes** (next poll) | **~1 s probe; ~5–10 s if a real change must be pulled** |
 | AI agent reads a stale local file | yes, often | **no** |
 
-When nothing changed on the Overleaf side, the hot path is ~0.3–1 s (a single read-only probe, no zip download). When something changed, the tool downloads the project zip once and writes only the files whose content differs from local — typically 5–10 s for a normal paper.
+When nothing changed on the Overleaf side, the hot path is ~0.3–1 s (a single read-only probe, plus a quick cookie check (`GET /project`) when the last check is more than 60 s old; no zip download). When something changed, the tool downloads the project zip once and writes only the files whose content differs from local — typically 5–10 s for a normal paper.
 
 ---
 

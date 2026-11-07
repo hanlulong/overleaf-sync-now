@@ -4550,7 +4550,7 @@ def cmd_doctor(args):
     print(f"Cookie cache:       {CACHE_FILE} ({'present' if CACHE_FILE.exists() else 'MISSING'})")
     print(f"State file:         {STATE_FILE} ({'present' if STATE_FILE.exists() else 'MISSING'})")
     print(f"Project index:      {INDEX_FILE} ({'present' if INDEX_FILE.exists() else 'MISSING'})")
-    print(f"Playwright profile: {PLAYWRIGHT_PROFILE} ({'present' if PLAYWRIGHT_PROFILE.exists() else 'MISSING'})")
+    print(f"Playwright profile: {PLAYWRIGHT_PROFILE} ({'present' if PLAYWRIGHT_PROFILE.exists() else 'not used; optional'})")
     print()
 
     cached = _load_cache()

@@ -58,6 +58,17 @@ All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://sem
 
 - `docs/architecture.md` lists the Overleaf source files the client relies
   on, pinned to an upstream commit (links only).
+- Accuracy fixes: the README gives the upgrade steps for 0.4.x and earlier
+  (by link to `docs/operations.md`, then `install` and `/hooks`);
+  CONTRIBUTING's release steps cover the version pins and an annotated tag
+  on the merged commit; SECURITY.md lists `conflicts-pending.json`,
+  `extracted.json` and the sign-in provider sessions a `login` profile can
+  keep; the Playwright MCP row in `docs/authentication.md` applies only to
+  a profile started with `--user-data-dir ~/.claude/playwright-profile`
+  (`doctor` now shows that folder as "not used; optional" when it is
+  absent); the exit-code table includes the "refresh failed" pass-through;
+  the README's hot-path cost includes the cookie check; troubleshooting
+  explains `holds a different skill`.
 
 ### Tests
 
@@ -66,6 +77,8 @@ All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://sem
   expected, a missing `toV`, a body that is not a zip, the project-list
   parser and its fallbacks), with synthetic fixtures only. An update with
   no `meta.origin` is pinned as a web edit.
+- The `@v<version>` install pins in README.md and docs/operations.md and
+  the `blob/v<version>/` links in SKILL.md must match `__version__`.
 
 ## 0.5.0 — 2026-11-07
 

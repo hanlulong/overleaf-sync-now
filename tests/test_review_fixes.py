@@ -594,6 +594,22 @@ class VersionConsistencyTests(unittest.TestCase):
             self.assertIsNotNone(m2, "pyproject has neither dynamic nor literal version")
             self.assertEqual(m2.group(1), v, "pyproject version drifted from __init__")
 
+    def test_install_pins_and_skill_links_match_the_version(self):
+        # A forgotten bump would send new users to the previous release, or
+        # point the installed SKILL.md at docs for a different version.
+        v = overleaf_sync_now.__version__
+        semver = r"(\d+\.\d+\.\d+)"
+        for rel in ("README.md", "docs/operations.md"):
+            text = (ROOT / rel).read_text(encoding="utf-8")
+            pins = re.findall(r"@v" + semver, text)
+            self.assertTrue(pins, f"{rel} has no @v<version> install pin")
+            self.assertEqual(set(pins), {v}, f"{rel} pins {sorted(set(pins))}, expected {v}")
+        skill = (ROOT / "src" / "overleaf_sync_now" / "SKILL.md").read_text(encoding="utf-8")
+        links = re.findall(r"blob/v" + semver + "/", skill)
+        self.assertTrue(links, "SKILL.md has no blob/v<version>/ doc link")
+        self.assertEqual(set(links), {v})
+        self.assertNotIn("blob/master", skill)
+
 
 # ---------------------------------------------------------------------------
 # install/uninstall: ~/.claude/settings.json hook surgery (corruption-critical)
