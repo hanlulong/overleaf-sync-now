@@ -9,7 +9,7 @@
 | 1 | **Cached cookie** (`<DATA_DIR>/cookies.json` — default `~/.overleaf-sync/cookies.json`; legacy `~/.claude/overleaf-data/cookies.json`) | everything | After first successful auth. Re-validated against Overleaf at most once a minute (a successful check is cached for 60 s). Run `overleaf-sync-now status` to see the resolved data dir. |
 | 2 | **Browser via `login` profile** | everything | Persistent browser profile created by `overleaf-sync-now login` (patchright preferred since 0.3.2; vanilla Playwright fallback). **The recommended path on every OS.** |
 | 3 | **`rookiepy`** | setup, install, status, doctor; `sync` (then backs off for an hour after a failure) | Rust cookie reader for your installed browsers. Defeated by Chrome 127+ App-Bound Encryption on Windows. |
-| 4 | **`browser_cookie3`** | same as 3 | Chrome / Edge / Firefox / Brave / Vivaldi / Opera / Chromium / LibreWolf / Arc / Safari. Defeated by Chrome 127+ on Windows without admin. |
+| 4 | **`browser_cookie3`** | same as 3 | Chrome / Edge / Firefox / Brave / Vivaldi / Opera / Chromium / LibreWolf / Arc / Safari. Cannot read Chrome 127+ App-Bound-encrypted cookies on Windows, even as administrator. |
 | 5 | **Playwright MCP profile** | same as 3 | Only when you started the [Playwright MCP](https://github.com/microsoft/playwright-mcp) with `--user-data-dir ~/.claude/playwright-profile` and logged into overleaf.com there. The tool looks in that folder only. |
 | 6 | **Hidden prompt** | interactive `setup` only | You type the cookie yourself (input hidden). Last resort. |
 
@@ -51,7 +51,7 @@ Chrome 127 (July 2024) added **App-Bound Encryption (ABE)** on Windows: the cook
 
 ## What if Google blocks the sign-in?
 
-If your Overleaf account uses **"Sign in with Google"**, you may see Google's *"This browser or app may not be secure"* page when you click the Google button inside the `login` window. This is Google's anti-automation gate (`disallowed_useragent`). It fires against any browser launched under remote-control protocols — not specifically against this tool.
+If your Overleaf account uses **"Sign in with Google"**, you may see Google's *"This browser or app may not be secure"* page when you click the Google button inside the `login` window. This is Google's check that blocks sign-ins from some browsers: Google [says](https://support.google.com/accounts/answer/7675428) it might stop sign-ins from browsers that are "being controlled through software automation rather than a human". It can fire against any automated browser, not specifically against this tool. (`disallowed_useragent` is a different Google error: its OAuth error for a sign-in page shown inside an embedded user-agent, such as a webview.)
 
 Since 0.3.2 the `login` command uses [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python) (a maintained Playwright fork that patches the CDP `Runtime.Enable` leak Google's gate detects) when it's installed, with vanilla Playwright as a fallback. patchright improves the odds Google's gate doesn't fire, but Google iterates against bypasses, so the supported escape hatch is:
 

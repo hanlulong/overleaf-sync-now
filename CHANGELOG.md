@@ -2,6 +2,40 @@
 
 All notable changes to `overleaf-sync-now`. Versions follow [SemVer](https://semver.org/).
 
+## 0.5.2 — 2026-11-07
+
+Small fix release. **After upgrading, re-run `overleaf-sync-now install`**
+so the installed skill copies get the new SKILL.md, whose `blob/v0.5.2/`
+links changed (`status` shows `Install: NEEDS ATTENTION` until you do). The
+hook entries are unchanged.
+
+### Fixed
+
+- **`login` wrote `browser-profile/.overleaf-sync-channel` with default
+  permissions** (0644 under a 022 umask), not the 0600 that SECURITY.md
+  promises for files under the data dir. It is now written with the same
+  private, atomic helper as the tool's other data files.
+
+### Docs
+
+- README: the Windows uv install line is now
+  `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`,
+  as in uv's docs; the plain `irm ... | iex` stops under Windows' default
+  Restricted execution policy.
+- README: Dropbox does not give collaborators your copy. Overleaf's Dropbox
+  sync is a premium feature and the `Apps/Overleaf` folder cannot be shared.
+- `docs/authentication.md`: `browser_cookie3` cannot read Chrome 127+
+  App-Bound-encrypted cookies on Windows even as administrator (it has no
+  App-Bound support).
+- `docs/authentication.md`, a `pyproject.toml` comment and a `cli.py`
+  comment no longer call Google's "This browser or app may not be secure"
+  page `disallowed_useragent`, which is Google's OAuth error for a sign-in
+  page shown inside an embedded user-agent, such as a webview.
+
+### Tests
+
+- The channel file must be 0600. Suite: 284 tests.
+
 ## 0.5.1 — 2026-11-07
 
 Fix release from a review of 0.5.0. **After upgrading, re-run

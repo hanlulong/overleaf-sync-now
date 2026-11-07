@@ -34,7 +34,7 @@ If you only ever edit locally *or* only ever edit on the web, your local copy is
 In Claude Code or Codex CLI, paste this prompt:
 
 ```text
-Install overleaf-sync-now v0.5.1 with `uv tool install --from git+https://github.com/hanlulong/overleaf-sync-now@v0.5.1 overleaf-sync-now` (install uv first from https://docs.astral.sh/uv/ if `uv` is missing), then run `overleaf-sync-now install`.
+Install overleaf-sync-now v0.5.2 with `uv tool install --from git+https://github.com/hanlulong/overleaf-sync-now@v0.5.2 overleaf-sync-now` (install uv first from https://docs.astral.sh/uv/ if `uv` is missing), then run `overleaf-sync-now install`.
 ```
 
 The agent installs everything and runs setup. **Restart the agent afterward** (`/exit` then `claude` in Claude Code; equivalent in Codex). In **Codex CLI**, also run `/hooks` once and trust the `overleaf-sync-now` hook: Codex skips new hooks until you do.
@@ -50,7 +50,7 @@ If install ends with **AUTH NOT YET CAPTURED** (on any OS), run `overleaf-sync-n
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh && \
   export PATH="$HOME/.local/bin:$PATH" && \
-  uv tool install --from git+https://github.com/hanlulong/overleaf-sync-now@v0.5.1 overleaf-sync-now && \
+  uv tool install --from git+https://github.com/hanlulong/overleaf-sync-now@v0.5.2 overleaf-sync-now && \
   overleaf-sync-now install
 ```
 
@@ -58,9 +58,9 @@ If uv says `~/.local/bin` is not on your PATH, run `uv tool update-shell` and op
 
 **Windows (PowerShell):**
 ```powershell
-irm https://astral.sh/uv/install.ps1 | iex
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 $env:PATH = "$env:USERPROFILE\.local\bin;$env:PATH"
-uv tool install --from git+https://github.com/hanlulong/overleaf-sync-now@v0.5.1 overleaf-sync-now
+uv tool install --from git+https://github.com/hanlulong/overleaf-sync-now@v0.5.2 overleaf-sync-now
 overleaf-sync-now install
 ```
 
@@ -82,7 +82,7 @@ overleaf-sync-now sync     # trigger a sync, print latency
 
 ## Why
 
-You use Dropbox with Overleaf because it gives you **free multi-device sync** — an edit on your laptop is instantly readable on your desktop, your iPad, and your collaborator's machine. AI agents like Claude Code and Codex CLI plug into that setup naturally: they just read and write the local `.tex` file like you do.
+You use Dropbox with Overleaf because it gives you **multi-device sync** — an edit on your laptop is instantly readable on your desktop and your iPad. (Overleaf's Dropbox sync is a premium feature, and Dropbox does not let the `Apps/Overleaf` folder be shared, so your collaborators don't get your copy; to sync to their own Dropbox they need their own premium subscription.) AI agents like Claude Code and Codex CLI plug into that setup naturally: they just read and write the local `.tex` file like you do.
 
 The problem: Overleaf's Dropbox sync polls the **Overleaf-web → local** direction every 10–20 minutes. So if you've edited the paper on overleaf.com and then ask the AI to keep working, it reads a stale local file and silently overwrites the changes you just made — restoring deleted paragraphs, undoing fresh edits, all while reporting a successful tool call.
 
